@@ -18,15 +18,18 @@ So we never combine the two, and we never send `think: false`:
                        mathematics happens here, so losing thinking costs
                        nothing.
 
-The prover skips extraction altogether: its only payload is the proof text, so
-we take the reasoning stage's content verbatim rather than round-tripping it
-through a second model call that might abridge it.
+All four agent prompts (planner.md, prover.md, verifier_a.md, verifier_b.md)
+instruct the model to emit strict JSON directly, so each response is first
+parsed as-is; the extraction stage only runs as a fallback when the model
+fails to comply. The prover never round-trips through a second model call at
+all: its JSON is parsed locally and, failing that, the reasoning content is
+taken verbatim, so the proof text can't be abridged or paraphrased.
 
 Usage
 -----
     python main.py                       # verbose, defaults
     python main.py --no-verbose          # silent
-    python main.py --max-iterations 25 --no-traces
+    python main.py --max-iterations 25
     python main.py --model qwen3.6:27b --conjecture other.md
 """
 
@@ -34,7 +37,6 @@ import argparse
 import json
 import os
 import re
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -51,7 +53,6 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL_NAME = "qwen3.6:35b"
 CONJECTURE_FILE = "conjecture.md"
 DAG_FILE = "dag.json"
-TRACE_DIR = "traces"         # Chain-of-thought transcripts land here
 MAX_ITERATIONS = 10
 LLM_MAX_RETRIES = 3
 REQUEST_TIMEOUT = 1800       # Thinking models are slow; give them room
@@ -60,7 +61,14 @@ REQUEST_TIMEOUT = 1800       # Thinking models are slow; give them room
 # Reasoning tokens are drawn from the same budget as the answer, so a thinking
 # prover needs a much larger allowance than a one-shot one.
 NUM_CTX = 40960              # model supports 256K; raise if VRAM allows
-NUM_PREDICT_REASONING = 12288  # ~3B active params => generation is cheap
+# Per-role generation budgets. Thinking and answer share this stream, so the
+# prover — which must think *and* then write a full proof — needs the most.
+# reason() grows these on truncation, clamped to whatever num_ctx allows.
+NUM_PREDICT_REASONING = {
+    "planner": 8192,
+    "prover": 24576,
+    "verifier": 12288,
+}
 NUM_PREDICT_EXTRACT = 1024
 
 # Thinking level: True, or "low"/"medium"/"high"/"max" on models that support
@@ -84,7 +92,7 @@ REASONING_OPTIONS: Dict[str, Any] = {
     "presence_penalty": 0.4,     # Down from 1.5: proofs reuse notation.
     "min_p": 0.0,
     "num_ctx": NUM_CTX,
-    "num_predict": NUM_PREDICT_REASONING,
+    # num_predict is set per role by reason(); see NUM_PREDICT_REASONING.
 }
 
 EXTRACT_OPTIONS: Dict[str, Any] = {
@@ -101,9 +109,6 @@ TEMPERATURES = {
     "prover": 0.6,     # Slightly tighter: rigour over exploration.
     "verifier": 0.8,   # Looser, so the two reviews don't collapse into one.
 }
-
-DEBUG_RAW = True     # Dump raw output when JSON parsing fails
-SAVE_TRACES = True   # Write per-call reasoning transcripts to TRACE_DIR
 
 # Set at runtime if schema-constrained extraction proves incompatible with the
 # model's default thinking (empty content, output stranded in .thinking).
@@ -173,32 +178,77 @@ def save_dag(dag: Dict[str, Any]) -> None:
         json.dump(dag, f, indent=2)
 
 
-def save_trace(iteration: int, role: str, thinking: str, output: str) -> None:
-    """Persist a call's chain of thought. Invaluable for working out *why* a
-    verifier rejected something, or where a proof went off the rails."""
-    if not SAVE_TRACES:
-        return
-    os.makedirs(TRACE_DIR, exist_ok=True)
-    path = os.path.join(TRACE_DIR, f"iter{iteration:02d}_{role}.md")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(f"# {role} — iteration {iteration}\n")
-        f.write(f"_{datetime.now().isoformat(timespec='seconds')}_\n\n")
-        if thinking:
-            f.write(f"## Reasoning\n\n{thinking}\n\n")
-        f.write(f"## Output\n\n{output}\n")
-
-
 # ----------------------------------------------------------------------------
 # JSON repair (fallback path; the schema grammar should make it unnecessary)
 # ----------------------------------------------------------------------------
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _OPEN_THINK_RE = re.compile(r"<think>.*", re.DOTALL)
-_BAD_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
-# \frac, \times, \to, \nabla begin with legal JSON escape chars, so a naive
-# repair silently turns them into formfeeds and tabs. Trailing lowercase means
-# it was a LaTeX command, not a control character.
-_LATEX_ESCAPE_RE = re.compile(r"\\([bfnrtu][a-z]+)")
+_HEX = set("0123456789abcdefABCDEF")
+
+
+def _repair_escapes(text: str) -> str:
+    """Fix backslash escapes inside JSON strings, without corrupting text
+    that is already correctly escaped.
+
+    A regex can't do this: in `\\\\subset` (a valid escaped backslash followed
+    by 's'), a lookahead-based pattern matches the *second* backslash of the
+    pair and doubles it, turning valid JSON into an invalid `\\s` escape.
+    The scanner consumes `\\\\` pairs atomically so that can't happen.
+
+    Heuristics inside strings:
+      \\ + \\            -> valid pair, keep
+      \\ + " or /        -> valid escape, keep
+      \\u + 4 hex digits -> valid unicode escape, keep
+      \\ + bfnrtu + [a-z]-> LaTeX command (\\frac, \\neq, \\to), double it
+      \\ + bfnrtu        -> genuine control escape, keep
+      \\ + anything else -> invalid (\\alpha, \\subset, \\{), double it
+    """
+    out: List[str] = []
+    i, n = 0, len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if not in_str:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_str = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+
+        nxt = text[i + 1] if i + 1 < n else ""
+        if nxt == "\\":
+            out.append("\\\\")          # valid pair — consume both, untouchable
+            i += 2
+        elif nxt in '"/':
+            out.append("\\" + nxt)      # valid escape
+            i += 2
+        elif nxt == "u" and set(text[i + 2 : i + 6]) <= _HEX and len(text[i + 2 : i + 6]) == 4:
+            out.append(text[i : i + 6])  # valid \uXXXX
+            i += 6
+        elif nxt in "bfnrtu":
+            follow = text[i + 2 : i + 3]
+            if follow.islower() and follow.isalpha():
+                out.append("\\\\" + nxt)  # \frac, \neq, \to — LaTeX, not control
+            else:
+                out.append("\\" + nxt)    # genuine \n, \t, ...
+            i += 2
+        elif nxt == "":
+            out.append("\\\\")          # trailing backslash at end of text
+            i += 1
+        else:
+            out.append("\\\\" + nxt)    # \alpha, \subset, \{ — invalid, double
+            i += 2
+    return "".join(out)
 
 
 def _extract_json_object(text: str) -> str:
@@ -254,20 +304,48 @@ def _salvage_truncated(text: str) -> str:
 
 
 def clean_json_text(raw: str) -> str:
-    """Normalise model output into parseable JSON: strip fences, inline think
-    blocks and prose; repair LaTeX escapes; salvage truncation."""
+    """Normalise model output into parseable JSON.
+
+    Repairs escalate and each is tried only if the previous stage fails to
+    parse — text that is already valid JSON is returned byte-for-byte
+    untouched, so the repair heuristics can never corrupt a correct reply.
+    """
     text = _THINK_RE.sub("", raw)
     if "<think>" in text:
         text = _OPEN_THINK_RE.sub("", text)
     text = _FENCE_RE.sub("", text).strip()
     text = _extract_json_object(text)
-    text = _BAD_ESCAPE_RE.sub(r"\\\\", text)
-    text = _LATEX_ESCAPE_RE.sub(r"\\\\\1", text)
+
+    candidates = [text]
+    repaired = _repair_escapes(text)
+    if repaired != text:
+        candidates.append(repaired)
+    candidates.append(_salvage_truncated(repaired))
+
+    for candidate in candidates:
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            continue
+    return candidates[-1]  # let the caller surface the real parse error
+
+
+def parse_json_or_none(text: str) -> Optional[Dict[str, Any]]:
+    """Parse an agent reply that already complies with its prompt file.
+
+    planner.md, prover.md, verifier_a.md and verifier_b.md all end with
+    "Output strictly valid JSON ... no markdown fences and no extra text", so
+    the reasoning stage's content is usually the JSON object itself. When it
+    parses, we use it directly and skip the extraction call entirely.
+    """
+    if not text:
+        return None
     try:
-        json.loads(text)
+        obj = json.loads(clean_json_text(text))
     except json.JSONDecodeError:
-        text = _salvage_truncated(text)
-    return text
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 # ----------------------------------------------------------------------------
@@ -279,6 +357,17 @@ def _post(payload: Dict[str, Any]) -> Dict[str, Any]:
     return response.json()
 
 
+def _headroom(payload: Dict[str, Any]) -> int:
+    """Tokens available for generation after the prompt, with a safety margin.
+
+    num_ctx caps prompt + generation together, so doubling num_predict past
+    this point buys nothing: the model would be cut off by the context window
+    instead of by the budget, after a long generation.
+    """
+    chars = sum(len(m["content"]) for m in payload["messages"])
+    return max(payload["options"]["num_ctx"] - chars // 4 - 512, 0)
+
+
 def reason(
     system_prompt: str,
     user_prompt: str,
@@ -288,9 +377,13 @@ def reason(
 ) -> Tuple[str, str]:
     """Stage 1: free-form reasoning. No `format`, so thinking is preserved.
 
-    Returns (content, thinking). Ollama puts the chain of thought in
-    `message.thinking` when the model supports separated thinking; models that
-    inline <think> tags are handled by the fallback strip.
+    Returns (content, status). status is "" on success, or "ceiling" when the
+    role exhausted the context window without finishing — a signal that the
+    task is too large, not that the call failed.
+
+    Truncated output is never returned as if it were complete: `done_reason ==
+    "length"` means the model was cut off mid-sentence, so we grow the budget
+    and retry rather than shipping a stump downstream.
     """
     payload: Dict[str, Any] = {
         "model": MODEL_NAME,
@@ -302,12 +395,14 @@ def reason(
         "options": {
             **REASONING_OPTIONS,
             "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
+            "num_predict": NUM_PREDICT_REASONING.get(role, 12288),
         },
     }
     # Only send `think` when we actually want it on. Never send False.
     if think is not None and think is not False:
         payload["think"] = think
 
+    last_partial = ""
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
             body = _post(payload)
@@ -316,39 +411,45 @@ def reason(
             thinking = msg.get("thinking", "") or ""
 
             hit_ceiling = body.get("done_reason") == "length"
-            if hit_ceiling:
-                budget = payload["options"]["num_predict"]
-                log(
-                    f"  ⚠️  {role} hit the token ceiling (num_predict={budget}, "
-                    f"thinking used ~{len(thinking) // 4} tokens).",
-                    verbose,
-                )
             if not thinking and "<think>" in content:
                 # Model inlined its reasoning instead of separating it.
                 m = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
                 if m:
                     thinking = m.group(1).strip()
                 content = _THINK_RE.sub("", content).strip()
-            if content.strip():
-                return content.strip(), thinking.strip()
 
-            # Empty content + length: the model spent the entire budget
-            # thinking and never reached the answer. Retrying at the same
-            # size is guaranteed to fail the same way, so grow the budget.
+            if content.strip() and not hit_ceiling:
+                return content.strip(), ""
+
             if hit_ceiling:
-                old = payload["options"]["num_predict"]
-                payload["options"]["num_predict"] = old * 2
+                budget = payload["options"]["num_predict"]
                 log(
-                    f"  ⚠️  {role}'s thinking consumed the whole budget; "
-                    f"retrying with num_predict={old * 2}.",
+                    f"  ⚠️  {role} was cut off at num_predict={budget} "
+                    f"(thinking used ~{len(thinking) // 4} tokens).",
                     verbose,
                 )
-            else:
-                log(f"  ⚠️  {role} returned empty content (attempt {attempt}).", verbose)
+                if content.strip():
+                    last_partial = content.strip()
+                room = _headroom(payload)
+                new = min(budget * 2, room)
+                if new > budget and attempt < LLM_MAX_RETRIES:
+                    payload["options"]["num_predict"] = new
+                    log(f"     retrying with num_predict={new}.", verbose)
+                    continue
+                # No headroom left: the window itself is the limit.
+                log(
+                    f"  ⛔ {role} exhausted the context window "
+                    f"(num_ctx={payload['options']['num_ctx']}, room={room}).",
+                    verbose,
+                )
+                return "", "ceiling"
+
+            log(f"  ⚠️  {role} returned empty content (attempt {attempt}).", verbose)
         except (requests.RequestException, ValueError, KeyError) as e:
             log(f"  ⚠️  {role} transport error (attempt {attempt}): {e}", verbose)
 
-    return "", ""
+    # Retries exhausted. A truncated draft beats nothing, but flag it as such.
+    return (last_partial, "ceiling") if last_partial else ("", "")
 
 
 def extract(
@@ -436,9 +537,8 @@ def extract(
             log(f"  ⚠️  {role} extraction transport error (attempt {attempt}): {e}", verbose)
         except json.JSONDecodeError as e:
             log(f"  ⚠️  {role} extraction parse error (attempt {attempt}): {e}", verbose)
-            if DEBUG_RAW and content is not None:
+            if content is not None:
                 log(f"     raw ({len(content)} chars) head: {content[:200]!r}", verbose)
-                log(f"     raw tail: {content[-200:]!r}", verbose)
             if content is not None and content.strip():
                 messages = messages[:2] + [
                     {"role": "assistant", "content": content[:1500]},
@@ -471,21 +571,36 @@ def planner_dag_view(dag: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def dependency_context(dag: Dict[str, Any], dep_ids: List[str]) -> Dict[str, Any]:
-    """Prover/verifiers see full proofs only for direct dependencies."""
-    return {
+def dependency_context(
+    dag: Dict[str, Any], dep_ids: List[str], include_proofs: bool = True
+) -> Dict[str, Any]:
+    """Context for the prover and verifiers.
+
+    Prompt tokens and generation tokens share num_ctx, so every token spent
+    here is a token the prover can't spend writing. The prover gets full
+    proofs of its direct dependencies (it may need to see how they were
+    established); the verifiers get statements only, since they are checking
+    the new proof, not re-auditing accepted ones.
+    """
+    ctx: Dict[str, Any] = {
         "dependency_lemmas": {
-            lid: {
-                "statement": dag["lemmas"][lid]["statement"],
-                "proof": dag["lemmas"][lid]["proof"],
-            }
+            lid: (
+                {
+                    "statement": dag["lemmas"][lid]["statement"],
+                    "proof": dag["lemmas"][lid]["proof"],
+                }
+                if include_proofs
+                else {"statement": dag["lemmas"][lid]["statement"]}
+            )
             for lid in dep_ids
             if lid in dag["lemmas"]
-        },
-        "all_proved_statements": {
-            lid: node["statement"] for lid, node in dag["lemmas"].items()
-        },
+        }
     }
+    if include_proofs:
+        ctx["all_proved_statements"] = {
+            lid: node["statement"] for lid, node in dag["lemmas"].items()
+        }
+    return ctx
 
 
 # ----------------------------------------------------------------------------
@@ -523,22 +638,27 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             f"Previously rejected attempts (avoid or decompose these):\n"
             f"{json.dumps(failed_attempts, indent=2)}"
         )
-        plan_text, plan_think = reason(
+        plan_text, plan_status = reason(
             planner_sys, planner_user, "planner", THINK["planner"], verbose
         )
-        save_trace(iteration, "planner", plan_think, plan_text)
+        if plan_status == "ceiling" and not plan_text:
+            log("Planner exhausted its token budget. Re-planning.", verbose)
+            continue
         if not plan_text:
             log("Planner produced nothing. Re-planning next iteration.", verbose)
             continue
 
-        planner_res = extract(
-            "Extract the plan. is_conjecture_proved must be true only if the "
-            "text explicitly concludes the conjecture is fully proved.",
-            plan_text,
-            PLANNER_SCHEMA,
-            "planner",
-            verbose,
-        )
+        # planner.md demands raw JSON output; extraction is only the fallback.
+        planner_res = parse_json_or_none(plan_text)
+        if planner_res is None:
+            planner_res = extract(
+                "Extract the plan. is_conjecture_proved must be true only if the "
+                "text explicitly concludes the conjecture is fully proved.",
+                plan_text,
+                PLANNER_SCHEMA,
+                "planner",
+                verbose,
+            )
 
         if planner_res.get("is_conjecture_proved"):
             log("\n🎉 Conjecture has been fully proved!", verbose)
@@ -570,8 +690,10 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         log(f"📌 Next Lemma [{lemma_id}]: {lemma_stmt}", verbose)
 
         # ---------------- Step 2: Prover ----------------
-        # No extraction stage: the proof text *is* the payload, and a second
-        # pass could only abridge or paraphrase it.
+        # prover.md instructs the model to reply with {"lemma_id", "proof"}.
+        # We parse that JSON locally rather than via a second model call, so
+        # the proof text can never be abridged or paraphrased; if the model
+        # ignored the format, its content is taken verbatim as the proof.
         deps_ctx = dependency_context(dag, dep_ids)
         prover_user = (
             f"Conjecture:\n{conjecture}\n\n"
@@ -580,10 +702,29 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             f"Feedback from previously rejected proofs of this lemma:\n"
             f"{json.dumps(failed_attempts.get(lemma_id, []), indent=2)}"
         )
-        proof, proof_think = reason(
+        proof_text, prover_status = reason(
             prover_sys, prover_user, "prover", THINK["prover"], verbose
         )
-        save_trace(iteration, f"prover_{lemma_id}", proof_think, proof)
+
+        if prover_status == "ceiling" and not proof_text:
+            log(
+                f"⛔ Lemma {lemma_id} is too large to prove in one call. "
+                f"Asking the planner to decompose it.",
+                verbose,
+            )
+            failed_attempts.setdefault(lemma_id, []).append(
+                "Lemma too large: the prover exhausted its entire token budget "
+                "without completing a proof. Decompose this into smaller, "
+                "independently provable lemmas rather than re-proposing it."
+            )
+            continue
+
+        proof = proof_text
+        prover_res = parse_json_or_none(proof_text)
+        if prover_res is not None:
+            candidate = prover_res.get("proof")
+            if isinstance(candidate, str) and candidate.strip():
+                proof = candidate.strip()
 
         if not proof:
             log(f"❌ Prover produced no proof for {lemma_id}.", verbose)
@@ -595,19 +736,30 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         # ---------------- Steps 3 & 4: Independent verifiers ----------------
         verifier_user = (
             f"Conjecture:\n{conjecture}\n\n"
-            f"Available proved lemmas:\n{json.dumps(deps_ctx, indent=2)}\n\n"
+            f"Available proved lemmas:\n"
+            f"{json.dumps(dependency_context(dag, dep_ids, include_proofs=False), indent=2)}\n\n"
             f"Target lemma:\n{json.dumps(next_lemma, indent=2)}\n\n"
             f"Proposed proof:\n{proof}"
         )
 
         verdicts: Dict[str, Dict[str, str]] = {}
         for tag, sys_prompt in (("A", verifier_a_sys), ("B", verifier_b_sys)):
-            review, review_think = reason(
+            review, review_status = reason(
                 sys_prompt, verifier_user, "verifier", THINK["verifier"], verbose
             )
-            save_trace(iteration, f"verifier{tag}_{lemma_id}", review_think, review)
-            res = (
-                extract(
+            if review_status == "ceiling" and not review:
+                verdicts[tag] = {
+                    "decision": "reject",
+                    "justification": (
+                        "Verifier exhausted its token budget without reaching a "
+                        "verdict; the proof is likely too long to review in one pass."
+                    ),
+                }
+                continue
+            # verifier_*.md demand raw JSON output; extraction is the fallback.
+            res = parse_json_or_none(review) if review else None
+            if res is None and review:
+                res = extract(
                     "Extract the verdict. decision is 'accept' only if the review "
                     "endorses the proof without unresolved objections.",
                     review,
@@ -615,9 +767,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                     f"verifier {tag}",
                     verbose,
                 )
-                if review
-                else {}
-            )
+            res = res or {}
             verdicts[tag] = {
                 "decision": str(res.get("decision", "")).strip().lower(),
                 "justification": res.get("justification", "(no justification)"),
@@ -661,8 +811,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 # CLI
 # ----------------------------------------------------------------------------
 def main() -> None:
-    global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, TRACE_DIR
-    global MAX_ITERATIONS, SAVE_TRACES, NUM_CTX
+    global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, MAX_ITERATIONS, NUM_CTX
 
     parser = argparse.ArgumentParser(
         description="Run the multi-agent theorem prover."
@@ -674,17 +823,9 @@ def main() -> None:
         default=True,
         help="Enable or disable console logging (default: --verbose)",
     )
-    parser.add_argument(
-        "--traces",
-        action=argparse.BooleanOptionalAction,
-        default=SAVE_TRACES,
-        help="Write chain-of-thought transcripts to the trace directory "
-             "(default: --traces). Independent of --verbose.",
-    )
     parser.add_argument("--model", default=MODEL_NAME, help="Ollama model tag")
     parser.add_argument("--conjecture", default=CONJECTURE_FILE, help="Conjecture file")
     parser.add_argument("--dag", default=DAG_FILE, help="DAG state file")
-    parser.add_argument("--trace-dir", default=TRACE_DIR, help="Trace output directory")
     parser.add_argument(
         "--max-iterations", type=int, default=MAX_ITERATIONS,
         help=f"Loop iterations before giving up (default: {MAX_ITERATIONS})",
@@ -698,9 +839,7 @@ def main() -> None:
     MODEL_NAME = args.model
     CONJECTURE_FILE = args.conjecture
     DAG_FILE = args.dag
-    TRACE_DIR = args.trace_dir
     MAX_ITERATIONS = args.max_iterations
-    SAVE_TRACES = args.traces
     NUM_CTX = args.num_ctx
     REASONING_OPTIONS["num_ctx"] = NUM_CTX
     EXTRACT_OPTIONS["num_ctx"] = NUM_CTX

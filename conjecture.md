@@ -1,1 +1,2 @@
-Let X be a smooth and projective variety of dimension d over the complex numbers. Prove that X embeds into $\mathbb{P}^{2d+1}$.
+Let X be a smooth and projective complex surface. Let E be an elliptic curve over the complex numbers.
+Then every class $\alpha$ of period $n$ in $\mathrm{Br}(X\times E)$ satisfies $\mathrm{ind}(\alpha) \mid n^2$.
