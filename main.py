@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 # Configuration
 # ----------------------------------------------------------------------------
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL_NAME = "qwen2.5:32b"  # Replace with your local model tag
+MODEL_NAME = "qwen3.6:35b"  # Replace with your local model tag
 DAG_FILE = "dag.json"
 MAX_ITERATIONS = 10
 LLM_MAX_RETRIES = 3          # Retries *inside* a single call_llm
