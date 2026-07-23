@@ -105,6 +105,10 @@ TEMPERATURES = {
 DEBUG_RAW = True     # Dump raw output when JSON parsing fails
 SAVE_TRACES = True   # Write per-call reasoning transcripts to TRACE_DIR
 
+# Set at runtime if schema-constrained extraction proves incompatible with the
+# model's default thinking (empty content, output stranded in .thinking).
+_SCHEMA_MODE_BROKEN = False
+
 
 def log(message: str, verbose: bool = True) -> None:
     """Single logging chokepoint, so --no-verbose silences everything."""
@@ -311,10 +315,12 @@ def reason(
             content = msg.get("content", "") or ""
             thinking = msg.get("thinking", "") or ""
 
-            if body.get("done_reason") == "length":
+            hit_ceiling = body.get("done_reason") == "length"
+            if hit_ceiling:
+                budget = payload["options"]["num_predict"]
                 log(
-                    f"  ⚠️  {role} hit the token ceiling "
-                    f"(num_predict={NUM_PREDICT_REASONING}). Reasoning may be cut off.",
+                    f"  ⚠️  {role} hit the token ceiling (num_predict={budget}, "
+                    f"thinking used ~{len(thinking) // 4} tokens).",
                     verbose,
                 )
             if not thinking and "<think>" in content:
@@ -325,7 +331,20 @@ def reason(
                 content = _THINK_RE.sub("", content).strip()
             if content.strip():
                 return content.strip(), thinking.strip()
-            log(f"  ⚠️  {role} returned empty content (attempt {attempt}).", verbose)
+
+            # Empty content + length: the model spent the entire budget
+            # thinking and never reached the answer. Retrying at the same
+            # size is guaranteed to fail the same way, so grow the budget.
+            if hit_ceiling:
+                old = payload["options"]["num_predict"]
+                payload["options"]["num_predict"] = old * 2
+                log(
+                    f"  ⚠️  {role}'s thinking consumed the whole budget; "
+                    f"retrying with num_predict={old * 2}.",
+                    verbose,
+                )
+            else:
+                log(f"  ⚠️  {role} returned empty content (attempt {attempt}).", verbose)
         except (requests.RequestException, ValueError, KeyError) as e:
             log(f"  ⚠️  {role} transport error (attempt {attempt}): {e}", verbose)
 
@@ -355,20 +374,63 @@ def extract(
         {"role": "user", "content": source_text},
     ]
 
+    # Schema-constrained first; drop to prompt-only if the grammar and the
+    # model's default thinking mode conflict (symptom: empty content, output
+    # stranded in message.thinking). The repair pipeline in clean_json_text
+    # reclaims JSON from free-form output on the fallback path. The conflict
+    # is a property of the model + Ollama version, not of one call, so once
+    # discovered it's remembered for the rest of the run.
+    global _SCHEMA_MODE_BROKEN
+    use_schema = not _SCHEMA_MODE_BROKEN
+
     for attempt in range(1, LLM_MAX_RETRIES + 1):
-        payload = {
+        payload: Dict[str, Any] = {
             "model": MODEL_NAME,
             "messages": messages,
-            "format": schema,
             "stream": False,
             "options": dict(EXTRACT_OPTIONS),
         }
+        if use_schema:
+            payload["format"] = schema
+        else:
+            # Free-form mode: the model may think first, so it needs a real
+            # budget, and the schema moves from grammar to prompt.
+            payload["options"]["num_predict"] = max(
+                NUM_PREDICT_EXTRACT * 4, 4096
+            )
+            payload["messages"] = [
+                {
+                    "role": "system",
+                    "content": system
+                    + " Respond with ONLY a JSON object matching this schema, "
+                    "no fences, no commentary: "
+                    + json.dumps(schema),
+                },
+            ] + messages[1:]
+
         content: Optional[str] = None
         try:
             body = _post(payload)
-            content = body.get("message", {}).get("content", "")
+            msg = body.get("message", {})
+            content = msg.get("content", "") or ""
             if body.get("done_reason") == "length":
                 log(f"  ⚠️  {role} extraction hit the token ceiling.", verbose)
+
+            if use_schema and not content.strip():
+                # Grammar/thinking conflict: qwen3.x thinks by default, the
+                # format grammar suppresses the answer, and the output lands
+                # in message.thinking. Deterministic, so don't retry same-mode.
+                stranded = len(msg.get("thinking", "") or "")
+                log(
+                    f"  ⚠️  {role} extraction returned empty content with format "
+                    f"set ({stranded} chars stranded in thinking). Falling back "
+                    f"to prompt-only JSON for the rest of the run.",
+                    verbose,
+                )
+                use_schema = False
+                _SCHEMA_MODE_BROKEN = True
+                continue
+
             return json.loads(clean_json_text(content))
         except (requests.RequestException, KeyError, TypeError) as e:
             log(f"  ⚠️  {role} extraction transport error (attempt {attempt}): {e}", verbose)
@@ -377,7 +439,7 @@ def extract(
             if DEBUG_RAW and content is not None:
                 log(f"     raw ({len(content)} chars) head: {content[:200]!r}", verbose)
                 log(f"     raw tail: {content[-200:]!r}", verbose)
-            if content is not None:
+            if content is not None and content.strip():
                 messages = messages[:2] + [
                     {"role": "assistant", "content": content[:1500]},
                     {
