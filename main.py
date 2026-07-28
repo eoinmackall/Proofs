@@ -62,6 +62,7 @@ import workspace
 # qwen3.6:35b — MoE, 36B total / ~3B active (a3b), Q4_K_M, ~24GB, 256K ctx,
 # arch qwen35moe. Same blob (07d35212591f) as :latest, :35b-a3b and
 # :35b-a3b-q4_K_M. NOT the same as :35b-mlx (Apple Silicon) or :35b-a3b-mtp-*.
+<<<<<<< HEAD
 DEFAULT_BACKEND = "ollama"
 MODEL_NAME = "qwen3.6:35b"
 DEFAULT_CONJECTURE = "curve_indices"
@@ -77,6 +78,13 @@ CONJECTURE_FILE = ""
 DAG_FILE = ""
 PROMPT_PATHS: Dict[str, str] = {name: name for name in workspace.PROMPT_FILES}
 
+=======
+# Same template family as qwen3.5, so `think: false` would break `format`
+# here; see the module docstring.
+MODEL_NAME = "qwen3.6:27b"
+CONJECTURE_FILE = "conjecture.md"
+DAG_FILE = "dag.json"
+>>>>>>> 4b9ebf8 (Going to work from laptop)
 MAX_ITERATIONS = 10
 LLM_MAX_RETRIES = 3
 REQUEST_TIMEOUT = 1800       # Thinking models are slow; give them room
