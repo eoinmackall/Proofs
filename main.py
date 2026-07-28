@@ -25,12 +25,24 @@ fails to comply. The prover never round-trips through a second model call at
 all: its JSON is parsed locally and, failing that, the reasoning content is
 taken verbatim, so the proof text can't be abridged or paraphrased.
 
+The paragraphs above describe Ollama. llama.cpp inverts the conflict: there
+it is *thinking that suppresses the grammar*, not the other way round, so the
+schema is silently unenforced unless reasoning is disabled for the call.
+Neither rule is expressed here any more — llm_backend.py owns both, and this
+module only asks for "a reply, optionally schema-shaped, optionally with
+thinking" without knowing which server is listening.
+
 Usage
 -----
-    python main.py                       # verbose, defaults
-    python main.py --no-verbose          # silent
-    python main.py --max-iterations 25
-    python main.py --model qwen3.6:27b --conjecture other.md
+    python main.py --conjecture curve_indices
+    python main.py --conjecture curve_indices --model gemma4:31b
+    python main.py --conjecture curve_indices --backend llamacpp \
+                   --model Qwen3.5-122B-Q4_K_M
+    python main.py --conjecture curve_indices --no-verbose --max-iterations 25
+
+--conjecture names a directory under conjectures/ holding a conjecture.md.
+The DAG is written beside it, tagged with backend and model so that runs of
+the same conjecture against different models never resume from each other.
 """
 
 import argparse
@@ -41,18 +53,30 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+import llm_backend
+import workspace
+
 # ----------------------------------------------------------------------------
 # Configuration (all overridable from the command line; see main())
 # ----------------------------------------------------------------------------
-OLLAMA_URL = "http://localhost:11434/api/chat"
 # qwen3.6:35b — MoE, 36B total / ~3B active (a3b), Q4_K_M, ~24GB, 256K ctx,
 # arch qwen35moe. Same blob (07d35212591f) as :latest, :35b-a3b and
 # :35b-a3b-q4_K_M. NOT the same as :35b-mlx (Apple Silicon) or :35b-a3b-mtp-*.
-# Same template family as qwen3.5, so `think: false` would break `format`
-# here; see the module docstring.
+DEFAULT_BACKEND = "ollama"
 MODEL_NAME = "qwen3.6:35b"
-CONJECTURE_FILE = "conjecture.md"
-DAG_FILE = "dag.json"
+DEFAULT_CONJECTURE = "curve_indices"
+
+# Set in main(). BACKEND owns the HTTP conversation; PROFILE is what the
+# capability probe found (context ceiling, thinking support, tokenizer ratio).
+BACKEND: Any = None
+PROFILE: Any = None
+
+# Resolved by workspace.resolve(): a prompt may be overridden per conjecture,
+# so these are paths rather than the bare filenames they used to be.
+CONJECTURE_FILE = ""
+DAG_FILE = ""
+PROMPT_PATHS: Dict[str, str] = {name: name for name in workspace.PROMPT_FILES}
+
 MAX_ITERATIONS = 10
 LLM_MAX_RETRIES = 3
 REQUEST_TIMEOUT = 1800       # Thinking models are slow; give them room
@@ -74,30 +98,41 @@ NUM_PREDICT_EXTRACT = 1024
 # Thinking level: True, or "low"/"medium"/"high"/"max" on models that support
 # levels. Set to None to omit the field entirely (the model's default).
 # Never set this to False — see the module docstring.
+#
+# These are requests, not guarantees. The backend checks them against the
+# probed capabilities and drops or downgrades: asking a non-thinking model to
+# think is a 400 from Ollama, and a level string sent to a model that only
+# understands booleans is ignored silently, which is worse.
 THINK = {
     "planner": True,
     "prover": True,
     "verifier": True,
 }
 
-# Sampling. qwen3.6's Modelfile defaults are min_p 0, presence_penalty 1.5,
-# repeat_penalty 1, temperature 1. The presence penalty is the problem: it
-# pushes the model off tokens it has already used. That suppresses repetition
-# loops in agentic coding, but mathematics *requires* hammering the same
-# symbols (\epsilon, n, x_i) over and over, and the extraction stage's whole
-# job is verbatim copying. Left at 1.5 the extractor paraphrases your proof.
-# So we damp it for reasoning and switch it off entirely for extraction.
+# Sampling. The presence penalty is the delicate one: it pushes the model off
+# tokens it has already used, which suppresses repetition loops in agentic
+# coding but is actively harmful here — mathematics *requires* hammering the
+# same symbols (\epsilon, n, x_i) over and over, and the extraction stage's
+# whole job is verbatim copying.
+#
+# The right value is model-specific, because it is a delta against whatever
+# the Modelfile ships: 0.4 is a large reduction for qwen3.6 (which defaults to
+# 1.5) and a penalty introduced from nothing for gemma4 (which sets none). So
+# the per-model baseline lives in llm_backend.OVERRIDES and the backend layers
+# these on top; anything set here wins, anything omitted takes the model's
+# recommended value. Keep the dict minimal for that reason.
 REASONING_OPTIONS: Dict[str, Any] = {
     "temperature": 0.7,          # Greedy decoding degrades thinking models.
-    "presence_penalty": 0.4,     # Down from 1.5: proofs reuse notation.
-    "min_p": 0.0,
     "num_ctx": NUM_CTX,
+    # presence_penalty: deliberately absent — see llm_backend.OVERRIDES.
     # num_predict is set per role by reason(); see NUM_PREDICT_REASONING.
 }
 
 EXTRACT_OPTIONS: Dict[str, Any] = {
     "temperature": 0.0,          # Mechanical, and grammar-constrained anyway.
-    "presence_penalty": 0.0,     # Must be 0: this stage copies, it doesn't write.
+    "presence_penalty": 0.0,     # Must be 0 on every model: this stage copies,
+                                 # it doesn't write. Stated explicitly so it
+                                 # overrides whatever OVERRIDES recommends.
     "min_p": 0.0,
     "num_ctx": NUM_CTX,
     "num_predict": NUM_PREDICT_EXTRACT,
@@ -156,9 +191,9 @@ VERIFIER_SCHEMA: Dict[str, Any] = {
 # ----------------------------------------------------------------------------
 # File helpers
 # ----------------------------------------------------------------------------
-def load_file(filepath: str) -> str:
-    """Read prompt or markdown file contents."""
-    if not os.path.exists(filepath):
+def load_file(filepath: Any) -> str:
+    """Read prompt or markdown file contents. Accepts str or Path."""
+    if not filepath or not os.path.exists(filepath):
         return ""
     with open(filepath, "r", encoding="utf-8") as f:
         return f.read().strip()
@@ -351,21 +386,24 @@ def parse_json_or_none(text: str) -> Optional[Dict[str, Any]]:
 # ----------------------------------------------------------------------------
 # LLM plumbing
 # ----------------------------------------------------------------------------
-def _post(payload: Dict[str, Any]) -> Dict[str, Any]:
-    response = requests.post(OLLAMA_URL, json=payload, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    return response.json()
-
-
-def _headroom(payload: Dict[str, Any]) -> int:
+def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
     """Tokens available for generation after the prompt, with a safety margin.
 
     num_ctx caps prompt + generation together, so doubling num_predict past
     this point buys nothing: the model would be cut off by the context window
     instead of by the budget, after a long generation.
+
+    The prompt size used to be estimated as chars // 4. That is optimistic for
+    LaTeX-dense text and, worse, it is tokenizer-specific — the whole point of
+    this project is now to run the same conjecture through four different
+    tokenizers. PROFILE.estimate_tokens() uses a ratio calibrated from the
+    prompt_eval_count of calls already made, so the estimate converges on the
+    truth for whichever model is loaded.
     """
-    chars = sum(len(m["content"]) for m in payload["messages"])
-    return max(payload["options"]["num_ctx"] - chars // 4 - 512, 0)
+    chars = sum(len(m["content"]) for m in messages)
+    ratio = PROFILE.chars_per_token if PROFILE else 4.0
+    used = int(chars / max(ratio, 1.0)) + 1
+    return max(num_ctx - used - 512, 0)
 
 
 def reason(
@@ -385,32 +423,28 @@ def reason(
     "length"` means the model was cut off mid-sentence, so we grow the budget
     and retry rather than shipping a stump downstream.
     """
-    payload: Dict[str, Any] = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "options": {
-            **REASONING_OPTIONS,
-            "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
-            "num_predict": NUM_PREDICT_REASONING.get(role, 12288),
-        },
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    options: Dict[str, Any] = {
+        **REASONING_OPTIONS,
+        "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
+        "num_predict": NUM_PREDICT_REASONING.get(role, 12288),
     }
-    # Only send `think` when we actually want it on. Never send False.
-    if think is not None and think is not False:
-        payload["think"] = think
+    # `think` is passed through as a request. The backend reconciles it with
+    # the probed capabilities and never sends False, whatever we ask for.
+    want_think = think if (think is not None and think is not False) else None
 
     last_partial = ""
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
-            body = _post(payload)
-            msg = body.get("message", {})
-            content = msg.get("content", "") or ""
-            thinking = msg.get("thinking", "") or ""
+            reply = BACKEND.chat(messages, think=want_think, schema=None,
+                                 options=options)
+            content = reply.content or ""
+            thinking = reply.thinking or ""
 
-            hit_ceiling = body.get("done_reason") == "length"
+            hit_ceiling = reply.truncated
             if not thinking and "<think>" in content:
                 # Model inlined its reasoning instead of separating it.
                 m = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
@@ -422,24 +456,26 @@ def reason(
                 return content.strip(), ""
 
             if hit_ceiling:
-                budget = payload["options"]["num_predict"]
+                budget = options["num_predict"]
+                spent = reply.eval_tokens or (len(thinking) + len(content)) // 4
                 log(
                     f"  ⚠️  {role} was cut off at num_predict={budget} "
-                    f"(thinking used ~{len(thinking) // 4} tokens).",
+                    f"(generated {spent} tokens, "
+                    f"~{len(thinking) // 4} of them thinking).",
                     verbose,
                 )
                 if content.strip():
                     last_partial = content.strip()
-                room = _headroom(payload)
+                room = _headroom(messages, options["num_ctx"])
                 new = min(budget * 2, room)
                 if new > budget and attempt < LLM_MAX_RETRIES:
-                    payload["options"]["num_predict"] = new
+                    options["num_predict"] = new
                     log(f"     retrying with num_predict={new}.", verbose)
                     continue
                 # No headroom left: the window itself is the limit.
                 log(
                     f"  ⛔ {role} exhausted the context window "
-                    f"(num_ctx={payload['options']['num_ctx']}, room={room}).",
+                    f"(num_ctx={options['num_ctx']}, room={room}).",
                     verbose,
                 )
                 return "", "ceiling"
@@ -461,8 +497,11 @@ def extract(
 ) -> Dict[str, Any]:
     """Stage 2: convert stage-1 prose into schema-conformant JSON.
 
-    `think` is deliberately omitted (not set False) so the grammar constraint
-    is honoured on models whose templates use think tokens.
+    Thinking is never requested here. On Ollama that means the field is
+    omitted rather than set False, so the grammar constraint survives; on
+    llama.cpp the backend goes further and disables reasoning outright,
+    because there it is thinking that voids the grammar. Both are the
+    backend's problem, not this function's.
     """
     system = (
         "You convert a mathematician's written work into JSON. Copy the "
@@ -485,21 +524,13 @@ def extract(
     use_schema = not _SCHEMA_MODE_BROKEN
 
     for attempt in range(1, LLM_MAX_RETRIES + 1):
-        payload: Dict[str, Any] = {
-            "model": MODEL_NAME,
-            "messages": messages,
-            "stream": False,
-            "options": dict(EXTRACT_OPTIONS),
-        }
-        if use_schema:
-            payload["format"] = schema
-        else:
+        options = dict(EXTRACT_OPTIONS)
+        call_messages = messages
+        if not use_schema:
             # Free-form mode: the model may think first, so it needs a real
             # budget, and the schema moves from grammar to prompt.
-            payload["options"]["num_predict"] = max(
-                NUM_PREDICT_EXTRACT * 4, 4096
-            )
-            payload["messages"] = [
+            options["num_predict"] = max(NUM_PREDICT_EXTRACT * 4, 4096)
+            call_messages = [
                 {
                     "role": "system",
                     "content": system
@@ -511,17 +542,25 @@ def extract(
 
         content: Optional[str] = None
         try:
-            body = _post(payload)
-            msg = body.get("message", {})
-            content = msg.get("content", "") or ""
-            if body.get("done_reason") == "length":
+            # think is left as None throughout: whichever server we are on,
+            # this stage wants the grammar honoured, and the backend knows
+            # what that costs. No new mathematics happens here.
+            reply = BACKEND.chat(
+                call_messages,
+                think=None,
+                schema=schema if use_schema else None,
+                options=options,
+            )
+            content = reply.content or ""
+            if reply.truncated:
                 log(f"  ⚠️  {role} extraction hit the token ceiling.", verbose)
 
             if use_schema and not content.strip():
                 # Grammar/thinking conflict: qwen3.x thinks by default, the
                 # format grammar suppresses the answer, and the output lands
-                # in message.thinking. Deterministic, so don't retry same-mode.
-                stranded = len(msg.get("thinking", "") or "")
+                # in the thinking channel. Deterministic, so don't retry
+                # same-mode.
+                stranded = len(reply.thinking or "")
                 log(
                     f"  ⚠️  {role} extraction returned empty content with format "
                     f"set ({stranded} chars stranded in thinking). Falling back "
@@ -620,10 +659,20 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         log(f"{CONJECTURE_FILE} is empty — write your conjecture there first.", verbose)
         return load_dag()
 
-    planner_sys = load_file("planner.md")
-    prover_sys = load_file("prover.md")
-    verifier_a_sys = load_file("verifier_a.md")
-    verifier_b_sys = load_file("verifier_b.md")
+    planner_sys = load_file(PROMPT_PATHS["planner.md"])
+    prover_sys = load_file(PROMPT_PATHS["prover.md"])
+    verifier_a_sys = load_file(PROMPT_PATHS["verifier_a.md"])
+    verifier_b_sys = load_file(PROMPT_PATHS["verifier_b.md"])
+
+    empty = [name for name, text in (
+        ("planner.md", planner_sys), ("prover.md", prover_sys),
+        ("verifier_a.md", verifier_a_sys), ("verifier_b.md", verifier_b_sys),
+    ) if not text]
+    if empty:
+        # A missing system prompt does not crash — it produces an agent with
+        # no instructions, which fails in ways that look like model problems.
+        log(f"Missing or empty prompt files: {', '.join(empty)}. Aborting.", verbose)
+        return load_dag()
 
     failed_attempts: Dict[str, List[str]] = {}
 
@@ -812,6 +861,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 # ----------------------------------------------------------------------------
 def main() -> None:
     global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, MAX_ITERATIONS, NUM_CTX
+    global BACKEND, PROFILE, PROMPT_PATHS
 
     parser = argparse.ArgumentParser(
         description="Run the multi-agent theorem prover."
@@ -823,9 +873,29 @@ def main() -> None:
         default=True,
         help="Enable or disable console logging (default: --verbose)",
     )
-    parser.add_argument("--model", default=MODEL_NAME, help="Ollama model tag")
-    parser.add_argument("--conjecture", default=CONJECTURE_FILE, help="Conjecture file")
-    parser.add_argument("--dag", default=DAG_FILE, help="DAG state file")
+    parser.add_argument(
+        "--backend", choices=("ollama", "llamacpp"), default=DEFAULT_BACKEND,
+        help=f"Inference server to talk to (default: {DEFAULT_BACKEND})",
+    )
+    parser.add_argument(
+        "--host", default=None,
+        help="Server base URL. Defaults to localhost:11434 for ollama and "
+             "localhost:8081 for llamacpp (8080 is taken by open-webui).",
+    )
+    parser.add_argument(
+        "--model", default=MODEL_NAME,
+        help="Ollama model tag, or the label llama-server reports",
+    )
+    parser.add_argument(
+        "--conjecture", default=DEFAULT_CONJECTURE,
+        help=f"Directory under {workspace.CONJECTURES_ROOT}/ containing "
+             f"{workspace.CONJECTURE_FILENAME} (default: {DEFAULT_CONJECTURE})",
+    )
+    parser.add_argument(
+        "--dag", default=None,
+        help="Override the DAG path. By default it is written into the "
+             "conjecture directory, tagged with backend and model.",
+    )
     parser.add_argument(
         "--max-iterations", type=int, default=MAX_ITERATIONS,
         help=f"Loop iterations before giving up (default: {MAX_ITERATIONS})",
@@ -837,12 +907,32 @@ def main() -> None:
     args = parser.parse_args()
 
     MODEL_NAME = args.model
-    CONJECTURE_FILE = args.conjecture
-    DAG_FILE = args.dag
     MAX_ITERATIONS = args.max_iterations
-    NUM_CTX = args.num_ctx
+
+    # Backend first: the probe tells us the real context ceiling, which the
+    # requested --num-ctx is then clamped to. Doing this before resolving
+    # paths also means a dead server is reported before a missing directory.
+    BACKEND = llm_backend.make_backend(
+        args.backend, args.model, args.host, REQUEST_TIMEOUT
+    )
+    PROFILE = BACKEND.probe()
+    log(llm_backend.describe(PROFILE, args.num_ctx), args.verbose)
+
+    NUM_CTX = min(args.num_ctx, PROFILE.context_limit)
     REASONING_OPTIONS["num_ctx"] = NUM_CTX
     EXTRACT_OPTIONS["num_ctx"] = NUM_CTX
+
+    try:
+        paths = workspace.resolve(args.conjecture, args.backend, args.model,
+                                  args.dag)
+    except workspace.ConjectureNotFound as e:
+        parser.error(str(e))
+        return  # unreachable; parser.error exits, but keeps type checkers calm
+
+    CONJECTURE_FILE = str(paths.conjecture)
+    DAG_FILE = str(paths.dag)
+    PROMPT_PATHS = {name: str(p) for name, p in paths.prompts.items()}
+    log(workspace.describe(paths), args.verbose)
 
     run_loop(verbose=args.verbose)
 
