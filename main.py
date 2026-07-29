@@ -89,7 +89,7 @@ NUM_CTX = 40960              # model supports 256K; raise if VRAM allows
 # prover — which must think *and* then write a full proof — needs the most.
 # reason() grows these on truncation, clamped to whatever num_ctx allows.
 NUM_PREDICT_REASONING = {
-    "planner": 8192,
+    "planner": 16384,
     "prover": 24576,
     "verifier": 12288,
 }
