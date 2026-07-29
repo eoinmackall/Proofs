@@ -1,0 +1,10 @@
+{
+  "lemmas": {
+    "lemma_1": {
+      "statement": "For any smooth projective complex surface X, any abelian scheme E over X, and any E-torsor C over X, the period of C divides the index of C.",
+      "proof": "Asserted by the operator; not machine-proved.",
+      "dependencies": [],
+      "provenance": "operator"
+    }
+  }
+}

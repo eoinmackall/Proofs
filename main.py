@@ -49,12 +49,12 @@ the ordinary pipeline instead, for when you are confident it is the right next
 step but not that it is true. You can also write your own lemma ('w', or 'wp'
 to have it proved), or send the planner back to think again.
 
-You can cross between them mid-run without restarting. Pressing 'h' during an
-automated run queues manual control, which engages at the next planning step
-(the loop is usually blocked on a long HTTP call when the key is pressed, so
-it cannot engage sooner); 'a' at the menu hands control back. See
-interaction.py for why one direction is a single keystroke and the other is a
-line of input.
+You can cross between them mid-run, in either direction, without restarting.
+'h' toggles: press it during a planner, prover or verifier call and the mode
+flips at the next planning step, which is the earliest a change of mode can
+mean anything. 'a' at the menu does the same thing for the case where the
+menu is already up and the listener is therefore paused. See interaction.py
+for why one of these is a keystroke and the other is a line of input.
 
 Usage
 -----
@@ -66,8 +66,9 @@ Usage
     python main.py --conjecture curve_indices --mode human
 
 --conjecture names a directory under conjectures/ holding a conjecture.md.
-The DAG is written beside it, tagged with backend and model so that runs of
-the same conjecture against different models never resume from each other.
+The DAG is written beside it as dag.json and shared by every model: point a
+second model at a conjecture already under way and it continues from the
+lemmas the first one proved. Pass --dag to give a run its own file instead.
 """
 
 import argparse
@@ -204,14 +205,15 @@ def log(message: str, verbose: bool = True) -> None:
 # Response schemas (Ollama builds a grammar from these, so required keys and
 # enum values are guaranteed rather than hoped for).
 # ----------------------------------------------------------------------------
+# No dependencies field: the planner proposes statements, and which proved
+# lemmas a proof leans on is settled by the prover while it writes the proof.
 _LEMMA_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "id": {"type": "string"},
         "statement": {"type": "string"},
-        "dependencies": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["id", "statement", "dependencies"],
+    "required": ["id", "statement"],
 }
 
 # minItems/maxItems are deliberately absent: Ollama compiles this to a GBNF
@@ -660,36 +662,59 @@ def planner_dag_view(dag: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def dependency_context(
-    dag: Dict[str, Any], dep_ids: List[str], include_proofs: bool = True
-) -> Dict[str, Any]:
-    """Context for the prover and verifiers.
+def prover_context(dag: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything the prover is allowed to cite: every proved statement.
 
-    Prompt tokens and generation tokens share num_ctx, so every token spent
-    here is a token the prover can't spend writing. The prover gets full
-    proofs of its direct dependencies (it may need to see how they were
-    established); the verifiers get statements only, since they are checking
-    the new proof, not re-auditing accepted ones.
+    This used to be the direct dependencies' full proofs plus a statement
+    index, on the strength of the planner having declared which lemmas the
+    argument would need. With that declaration gone there is no way to know in
+    advance which proofs would be worth shipping, and shipping all of them
+    grows without bound — prompt tokens and generation tokens share num_ctx,
+    so by lemma thirty the prover would be paying to re-read every proof it
+    has ever written in order to have room to write one more.
+
+    The cost is real: the prover sees *that* a lemma holds, not how it was
+    established. If a conjecture turns out to need the latter, the fix is a
+    second prover call — one to ask which lemmas it wants, one to prove with
+    those proofs attached — not to widen this.
     """
-    ctx: Dict[str, Any] = {
+    return {
+        "proved_lemmas": {
+            lid: {"statement": node["statement"]}
+            for lid, node in dag["lemmas"].items()
+        }
+    }
+
+
+def verifier_context(dag: Dict[str, Any], cited: List[str]) -> Dict[str, Any]:
+    """Statements of exactly the lemmas the prover claims to have used.
+
+    Deliberately not the whole DAG. verifier_a.md is asked to reject "use of
+    results not present in the provided lemma set", which only bites if the
+    set is the prover's declared citations: a proof leaning on a lemma it
+    never declared then reads as an unjustified leap, which is what it is.
+    """
+    return {
         "dependency_lemmas": {
-            lid: (
-                {
-                    "statement": dag["lemmas"][lid]["statement"],
-                    "proof": dag["lemmas"][lid]["proof"],
-                }
-                if include_proofs
-                else {"statement": dag["lemmas"][lid]["statement"]}
-            )
-            for lid in dep_ids
+            lid: {"statement": dag["lemmas"][lid]["statement"]}
+            for lid in cited
             if lid in dag["lemmas"]
         }
     }
-    if include_proofs:
-        ctx["all_proved_statements"] = {
-            lid: node["statement"] for lid, node in dag["lemmas"].items()
-        }
-    return ctx
+
+
+def scan_citations(proof: str, dag: Dict[str, Any]) -> List[str]:
+    """Fallback edge recovery: which proved ids appear in the proof text.
+
+    Only used when the prover ignored its output format entirely, in which
+    case the alternative is a node with no edges at all — a lemma that silently
+    claims to stand on its own. Word-boundary matching, so lemma_1 does not
+    match inside lemma_10.
+    """
+    return [
+        lid for lid in dag["lemmas"]
+        if re.search(rf"\b{re.escape(lid)}\b", proof)
+    ]
 
 
 # ----------------------------------------------------------------------------
@@ -722,13 +747,10 @@ def planner_candidates(planner_res: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not lemma_id or not statement or lemma_id in seen:
             continue
         seen.add(lemma_id)
-        deps = item.get("dependencies")
-        out.append({
-            "id": lemma_id,
-            "statement": statement,
-            "dependencies": [str(d).strip() for d in deps if str(d).strip()]
-                            if isinstance(deps, list) else [],
-        })
+        # Any dependencies field is dropped rather than honoured: a planner
+        # that volunteers one (an old per-conjecture override, or a model
+        # embellishing the schema) must not get to pre-empt the prover.
+        out.append({"id": lemma_id, "statement": statement})
         if len(out) >= PLANNER_CANDIDATES:
             break
     return out
@@ -737,21 +759,18 @@ def planner_candidates(planner_res: Dict[str, Any]) -> List[Dict[str, Any]]:
 def screen_candidates(
     dag: Dict[str, Any], candidates: List[Dict[str, Any]]
 ) -> List[Tuple[Dict[str, Any], List[str]]]:
-    """Pair each candidate with the reasons it cannot be proved as it stands.
+    """Pair each candidate with the reasons it cannot be used as it stands.
 
-    The checks are the ones run_loop() used to apply to the single proposed
-    lemma; the difference is that failing one now disqualifies a candidate
-    instead of costing the whole iteration. An empty problem list means the
-    candidate is ready for the prover.
+    Only one check survives now that candidates carry no dependencies: an id
+    already in the DAG. Proving it again gains nothing, and writing it again
+    would overwrite a node that other lemmas may already cite. An empty
+    problem list means the candidate is ready for the prover.
     """
     screened: List[Tuple[Dict[str, Any], List[str]]] = []
     for cand in candidates:
         problems: List[str] = []
         if cand["id"] in dag["lemmas"]:
-            problems.append(f"{cand['id']} is already proved")
-        missing = [d for d in cand["dependencies"] if d not in dag["lemmas"]]
-        if missing:
-            problems.append(f"depends on unproved {', '.join(missing)}")
+            problems.append(f"{cand['id']} is already in the DAG")
         screened.append((cand, problems))
     return screened
 
@@ -768,6 +787,34 @@ def log_candidates(
     """
     log("🗺  Planner shortlist:", verbose)
     log(interaction.render(screened, plan_summary), verbose)
+
+
+def check_mode_toggle(verbose: bool = True) -> None:
+    """Apply a hotkey press, if one has landed since the last check.
+
+    Called at several points in an iteration rather than only before the menu,
+    because a press lands whenever the operator changes their mind and that is
+    usually somewhere in the middle of a long prover or verifier call. MODE is
+    still only *read* at the planning step, so checking early changes nothing
+    functionally — it means the log acknowledges the key at the moment you
+    press it instead of twenty minutes later, which is the difference between
+    a toggle that feels responsive and one you press twice because the first
+    press seemed not to register.
+
+    The press is a toggle, so it works from either mode: it is the way back to
+    automation from anywhere in the loop except the menu itself, where the
+    listener is paused and 'a' does the same job.
+    """
+    global MODE
+    if not HOTKEY.take():
+        return
+    MODE = "auto" if MODE == "human" else "human"
+    log(
+        "\n▶ Automation resumed; planning runs unattended from here."
+        if MODE == "auto"
+        else "\n⏸ Manual control engaged; you pick at the next planning step.",
+        verbose,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -808,6 +855,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 
     for iteration in range(1, MAX_ITERATIONS + 1):
         log(f"\n--- Iteration {iteration}/{MAX_ITERATIONS} ---", verbose)
+        check_mode_toggle(verbose)
         dag = load_dag()
 
         # ---------------- Step 1: Planner ----------------
@@ -820,6 +868,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         plan_text, plan_status = reason(
             planner_sys, planner_user, "planner", THINK["planner"], verbose
         )
+        check_mode_toggle(verbose)
         if plan_status == "ceiling" and not plan_text:
             log("Planner exhausted its token budget. Re-planning.", verbose)
             continue
@@ -857,13 +906,10 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         summary = str(planner_res.get("plan_summary") or "")
 
         # ---------------- Step 1b: Selection ----------------
-        # The one place the two modes differ. Everything after this block runs
-        # identically whether the lemma was chosen by a person or by the
-        # screener, which is what keeps --mode auto honest as a control.
-        if MODE != "human" and HOTKEY.take():
-            MODE = "human"
-            log("\n⏸  Manual control engaged at this planning step.", verbose)
-
+        # The one place the two modes differ, and so the one place MODE is
+        # read. Everything after this block runs identically whether the lemma
+        # was chosen by a person or by the screener, which is what keeps
+        # --mode auto honest as a control.
         next_lemma: Optional[Dict[str, Any]] = None
         if MODE == "human":
             choice = interaction.choose(
@@ -897,7 +943,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 dag["lemmas"][asserted["id"]] = {
                     "statement": asserted["statement"],
                     "proof": "Asserted by the operator; not machine-proved.",
-                    "dependencies": asserted["dependencies"],
+                    "dependencies": [],   # nothing was cited; nothing was proved
                     "provenance": "operator",
                 }
                 save_dag(dag)
@@ -934,19 +980,19 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 
         lemma_id = next_lemma["id"]
         lemma_stmt = next_lemma["statement"]
-        dep_ids = next_lemma["dependencies"]
 
         log(f"📌 Next Lemma [{lemma_id}]: {lemma_stmt}", verbose)
 
         # ---------------- Step 2: Prover ----------------
-        # prover.md instructs the model to reply with {"lemma_id", "proof"}.
-        # We parse that JSON locally rather than via a second model call, so
-        # the proof text can never be abridged or paraphrased; if the model
-        # ignored the format, its content is taken verbatim as the proof.
-        deps_ctx = dependency_context(dag, dep_ids)
+        # prover.md instructs the model to reply with {"lemma_id",
+        # "cited_lemmas", "proof"}. We parse that JSON locally rather than via
+        # a second model call, so the proof text can never be abridged or
+        # paraphrased; if the model ignored the format, its content is taken
+        # verbatim as the proof.
         prover_user = (
             f"Conjecture:\n{conjecture}\n\n"
-            f"Available proved lemmas:\n{json.dumps(deps_ctx, indent=2)}\n\n"
+            f"Available proved lemmas:\n"
+            f"{json.dumps(prover_context(dag), indent=2)}\n\n"
             f"Lemma to prove:\n{json.dumps(next_lemma, indent=2)}\n\n"
             f"Feedback from previously rejected proofs of this lemma:\n"
             f"{json.dumps(failed_attempts.get(lemma_id, []), indent=2)}"
@@ -954,6 +1000,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         proof_text, prover_status = reason(
             prover_sys, prover_user, "prover", THINK["prover"], verbose
         )
+        check_mode_toggle(verbose)
 
         if prover_status == "ceiling" and not proof_text:
             log(
@@ -969,24 +1016,58 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             continue
 
         proof = proof_text
+        declared: Optional[List[str]] = None
         prover_res = parse_json_or_none(proof_text)
         if prover_res is not None:
             candidate = prover_res.get("proof")
             if isinstance(candidate, str) and candidate.strip():
                 proof = candidate.strip()
+            raw_cited = prover_res.get("cited_lemmas")
+            if isinstance(raw_cited, list):
+                declared = [str(c).strip() for c in raw_cited if str(c).strip()]
 
         if not proof:
             log(f"❌ Prover produced no proof for {lemma_id}.", verbose)
             failed_attempts.setdefault(lemma_id, []).append("Prover returned nothing.")
             continue
 
-        log(f"✍️ Proof generated for {lemma_id} ({len(proof)} chars).", verbose)
+        # The DAG's edges now come from here. An empty declared list is taken
+        # at face value — a proof from first principles has no dependencies —
+        # but a missing one means the prover ignored its format, and scanning
+        # the text beats recording a lemma as standing on nothing.
+        if declared is None:
+            dep_ids = scan_citations(proof, dag)
+            if dep_ids:
+                log(
+                    f"  ℹ️  Prover declared no citations; recovered "
+                    f"{', '.join(dep_ids)} from the proof text.",
+                    verbose,
+                )
+        else:
+            dep_ids = [c for c in declared if c in dag["lemmas"]]
+            phantom = [c for c in declared if c not in dag["lemmas"]]
+            if phantom:
+                # Cited something that isn't in the DAG. Dropping it here is
+                # not a cover-up: the verifiers are about to see a proof that
+                # leans on a lemma absent from their context, which is exactly
+                # the unjustified step they are meant to catch.
+                log(
+                    f"  ⚠️  Prover cited lemmas not in the DAG: "
+                    f"{', '.join(phantom)}.",
+                    verbose,
+                )
+
+        log(
+            f"✍️ Proof generated for {lemma_id} ({len(proof)} chars"
+            f"{', cites ' + ', '.join(dep_ids) if dep_ids else ', no citations'}).",
+            verbose,
+        )
 
         # ---------------- Steps 3 & 4: Independent verifiers ----------------
         verifier_user = (
             f"Conjecture:\n{conjecture}\n\n"
             f"Available proved lemmas:\n"
-            f"{json.dumps(dependency_context(dag, dep_ids, include_proofs=False), indent=2)}\n\n"
+            f"{json.dumps(verifier_context(dag, dep_ids), indent=2)}\n\n"
             f"Target lemma:\n{json.dumps(next_lemma, indent=2)}\n\n"
             f"Proposed proof:\n{proof}"
         )
@@ -1021,6 +1102,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 "decision": str(res.get("decision", "")).strip().lower(),
                 "justification": res.get("justification", "(no justification)"),
             }
+
+        check_mode_toggle(verbose)
 
         labels = {"A": "logic", "B": "computation"}
         for tag in ("A", "B"):
@@ -1097,8 +1180,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--dag", default=None,
-        help="Override the DAG path. By default it is written into the "
-             "conjecture directory, tagged with backend and model.",
+        help="Override the DAG path. By default every run of a conjecture "
+             "shares conjectures/<name>/dag.json, whatever model wrote it.",
     )
     parser.add_argument(
         "--max-iterations", type=int, default=MAX_ITERATIONS,
@@ -1116,7 +1199,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--hotkey", default=HOTKEY_KEYS,
-        help=f"Key that takes manual control during an automated run "
+        help=f"Key that toggles between manual and automatic mid-run "
              f"(default: {HOTKEY_KEYS!r}). Pass '' to disable the listener.",
     )
     args = parser.parse_args()
@@ -1139,8 +1222,7 @@ def main() -> None:
     EXTRACT_OPTIONS["num_ctx"] = NUM_CTX
 
     try:
-        paths = workspace.resolve(args.conjecture, args.backend, args.model,
-                                  args.dag)
+        paths = workspace.resolve(args.conjecture, args.dag)
     except workspace.ConjectureNotFound as e:
         parser.error(str(e))
         return  # unreachable; parser.error exits, but keeps type checkers calm
@@ -1157,7 +1239,9 @@ def main() -> None:
         args.hotkey,
         enabled=bool(args.hotkey),
         on_press=lambda: print(
-            "\n⏸  Manual control queued; it engages at the next planning step."
+            f"\n⇄ Mode change queued: "
+            f"{'automatic' if MODE == 'human' else 'manual'} "
+            f"from the next planning step."
         ),
     ).start()
     if MODE == "auto" and HOTKEY.hint():

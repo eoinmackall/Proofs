@@ -10,12 +10,13 @@ Two mechanisms, kept separate because they solve opposite problems:
     a lemma of your own. "A couple of keystrokes" here means `2` then Enter,
     and that is the entire interaction: nothing downstream asks again.
 
-  * The HOTKEY is a single keystroke, for the opposite situation: an automated
-    run is 900 seconds into a prover call and you have decided you want the
-    wheel back. Nothing can be read line-wise there, so a daemon thread
-    watches stdin in cbreak mode and sets a flag that run_loop() checks at its
-    next decision point. Because the loop is blocked on HTTP, the press is
-    acknowledged immediately but takes effect at the next planning step.
+  * The HOTKEY is a single keystroke, for the opposite situation: a run is 900
+    seconds into a prover call and you have changed your mind about who should
+    be driving. Nothing can be read line-wise there, so a daemon thread
+    watches stdin in cbreak mode and sets a flag that run_loop() checks at
+    several points per iteration. It toggles, so it works in both directions;
+    because the loop is blocked on HTTP, the press is acknowledged as soon as
+    the current call returns and takes effect at the next planning step.
 
 The two cannot both own the terminal, which is what `HotKey.paused()` is for:
 it takes stdin out of cbreak mode, waits for the listener thread to actually
@@ -194,10 +195,10 @@ class HotKey:
             self._pause.clear()
 
     def hint(self) -> str:
-        keys = "/".join(sorted(self.keys))
         if not self.available:
             return ""
-        return f"(press '{keys}' at any time to take manual control)"
+        keys = "/".join(sorted(self.keys))
+        return f"(press '{keys}' at any time to switch between manual and auto)"
 
 
 class NullHotKey(HotKey):
@@ -268,9 +269,8 @@ def render(
     if plan_summary:
         out.append(_wrap(f"Strategy: {plan_summary}", indent="  "))
     for i, (cand, problems) in enumerate(screened, start=1):
-        deps = ", ".join(cand.get("dependencies") or []) or "none"
         flag = "  ⚠ " + "; ".join(problems) if problems else ""
-        out.append(f"  [{i}] {cand.get('id', '?')}   deps: {deps}{flag}")
+        out.append(f"  [{i}] {cand.get('id', '?')}{flag}")
         out.append(_wrap(cand.get("statement", "(no statement)")))
     return "\n".join(out)
 
@@ -331,28 +331,10 @@ def choose(
                     continue
                 return Choice(
                     "prove" if (match.group(1) or match.group(3)) else "assert",
-                    lemma=_prune_dependencies(cand, proved),
+                    lemma=cand,
                 )
 
             print("  ? unrecognised. " + _MENU)
-
-
-def _prune_dependencies(lemma: Dict[str, Any], proved: set) -> Dict[str, Any]:
-    """Drop dependency ids that name nothing in the DAG.
-
-    Done without asking, because there is no other defensible answer: on the
-    prove path the prover is handed dependency proofs by id and would be
-    citing a lemma it cannot see, and on the assert path the edge would point
-    at a node that does not exist. Reported rather than silent, since it means
-    the planner proposed the lemma out of order and you may want the missing
-    piece proved first.
-    """
-    deps = lemma.get("dependencies") or []
-    dropped = [d for d in deps if d not in proved]
-    if not dropped:
-        return lemma
-    print(f"  dropping unproved dependencies: {', '.join(dropped)}")
-    return {**lemma, "dependencies": [d for d in deps if d in proved]}
 
 
 def _write_own(proved: set) -> Optional[Dict[str, Any]]:
@@ -363,6 +345,9 @@ def _write_own(proved: set) -> Optional[Dict[str, Any]]:
     supplying the sixth one it didn't think of. Whether it is then asserted or
     proved is the caller's business — `w` vouches for it, `wp` sends it to the
     models, exactly as a digit and a digit with `p` do for a candidate.
+
+    Only an id and a statement are asked for, the same two fields the planner
+    supplies. You are standing in for the planner here, not for the prover.
     """
     lemma_id = _ask("  id (e.g. lemma_7): ")
     if not lemma_id or lemma_id == "q":
@@ -376,11 +361,4 @@ def _write_own(proved: set) -> Optional[Dict[str, Any]]:
         print("  empty statement; nothing added.")
         return None
 
-    raw_deps = _ask(f"  dependencies, comma-separated (proved: "
-                    f"{', '.join(sorted(proved)) or 'none'}): ")
-    lemma = {
-        "id": lemma_id,
-        "statement": statement,
-        "dependencies": [d.strip() for d in raw_deps.split(",") if d.strip()],
-    }
-    return _prune_dependencies(lemma, proved)
+    return {"id": lemma_id, "statement": statement}
