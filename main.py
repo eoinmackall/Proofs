@@ -32,6 +32,30 @@ Neither rule is expressed here any more — llm_backend.py owns both, and this
 module only asks for "a reply, optionally schema-shaped, optionally with
 thinking" without knowing which server is listening.
 
+Planning is a shortlist, not a decision
+---------------------------------------
+The planner proposes PLANNER_CANDIDATES (5) lemmas per iteration rather than
+one, ordered best-first, and something downstream picks exactly one. In
+--mode auto that picker is screen_candidates() plus "take the first survivor",
+which is why automation still behaves as it did when the planner returned a
+single lemma — with the difference that a candidate naming an unproved
+dependency now costs a candidate rather than a whole iteration.
+
+In --mode human the picker is a person, and picking is two decisions rather
+than one. A number and Enter accepts that candidate as true on your
+authority: it goes straight into the DAG, with no prover call and no verifier
+calls, marked "provenance": "operator". A trailing 'p' — "3p" — sends it down
+the ordinary pipeline instead, for when you are confident it is the right next
+step but not that it is true. You can also write your own lemma ('w', or 'wp'
+to have it proved), or send the planner back to think again.
+
+You can cross between them mid-run without restarting. Pressing 'h' during an
+automated run queues manual control, which engages at the next planning step
+(the loop is usually blocked on a long HTTP call when the key is pressed, so
+it cannot engage sooner); 'a' at the menu hands control back. See
+interaction.py for why one direction is a single keystroke and the other is a
+line of input.
+
 Usage
 -----
     python main.py --conjecture curve_indices
@@ -39,6 +63,7 @@ Usage
     python main.py --conjecture curve_indices --backend llamacpp \
                    --model Qwen3.5-122B-Q4_K_M
     python main.py --conjecture curve_indices --no-verbose --max-iterations 25
+    python main.py --conjecture curve_indices --mode human
 
 --conjecture names a directory under conjectures/ holding a conjecture.md.
 The DAG is written beside it, tagged with backend and model so that runs of
@@ -53,6 +78,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
+import interaction
 import llm_backend
 import workspace
 
@@ -81,6 +107,19 @@ MAX_ITERATIONS = 10
 LLM_MAX_RETRIES = 3
 REQUEST_TIMEOUT = 1800       # Thinking models are slow; give them room
 
+# How many lemmas the planner shortlists per iteration. Raising this costs
+# planner tokens and, in human mode, attention; five is about as many
+# candidates as can be compared without re-reading the conjecture.
+PLANNER_CANDIDATES = 5
+
+# "auto" reproduces the original behaviour end to end. "human" stops at every
+# planning step. Set from --mode, then mutated by the hotkey and the menu, so
+# it is genuinely a run-time toggle rather than a launch-time one.
+DEFAULT_MODE = "auto"
+MODE = DEFAULT_MODE
+HOTKEY_KEYS = "h"            # single keystroke; see interaction.HotKey
+HOTKEY: interaction.HotKey = interaction.NullHotKey()
+
 # Ollama defaults num_ctx low (2048/4096) regardless of model capability.
 # Reasoning tokens are drawn from the same budget as the answer, so a thinking
 # prover needs a much larger allowance than a one-shot one.
@@ -89,6 +128,11 @@ NUM_CTX = 40960              # model supports 256K; raise if VRAM allows
 # prover — which must think *and* then write a full proof — needs the most.
 # reason() grows these on truncation, clamped to whatever num_ctx allows.
 NUM_PREDICT_REASONING = {
+    # Five candidate statements is several times the old single-lemma answer,
+    # and the thinking that precedes it grows too — the planner is now
+    # comparing routes, not committing to one. reason() would discover this on
+    # its own by hitting the ceiling and doubling, but only after paying for a
+    # truncated generation first.
     "planner": 16384,
     "prover": 24576,
     "verifier": 12288,
@@ -160,22 +204,28 @@ def log(message: str, verbose: bool = True) -> None:
 # Response schemas (Ollama builds a grammar from these, so required keys and
 # enum values are guaranteed rather than hoped for).
 # ----------------------------------------------------------------------------
+_LEMMA_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "statement": {"type": "string"},
+        "dependencies": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["id", "statement", "dependencies"],
+}
+
+# minItems/maxItems are deliberately absent: Ollama compiles this to a GBNF
+# grammar and its schema support does not cover array cardinality, so writing
+# them here would look like an enforced guarantee while enforcing nothing. The
+# count is requested in planner.md and trimmed in planner_candidates().
 PLANNER_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "is_conjecture_proved": {"type": "boolean"},
         "plan_summary": {"type": "string"},
-        "next_lemma": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "statement": {"type": "string"},
-                "dependencies": {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["id", "statement", "dependencies"],
-        },
+        "candidate_lemmas": {"type": "array", "items": _LEMMA_SCHEMA},
     },
-    "required": ["is_conjecture_proved", "plan_summary", "next_lemma"],
+    "required": ["is_conjecture_proved", "plan_summary", "candidate_lemmas"],
 }
 
 VERIFIER_SCHEMA: Dict[str, Any] = {
@@ -643,6 +693,84 @@ def dependency_context(
 
 
 # ----------------------------------------------------------------------------
+# Candidate handling
+# ----------------------------------------------------------------------------
+def planner_candidates(planner_res: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Normalise a planner reply into a list of well-formed candidate lemmas.
+
+    Accepts the single-lemma shape as well, so a conjecture directory holding
+    an old per-conjecture planner.md override keeps working: it simply gets a
+    shortlist of length one, and every path below treats that as a shortlist
+    that happens to be short.
+
+    Candidates missing an id or a statement are dropped rather than passed on
+    as half-lemmas, and duplicate ids are collapsed — models asked for five
+    distinct routes will occasionally give the same lemma two numbers.
+    """
+    raw = planner_res.get("candidate_lemmas")
+    if not isinstance(raw, list):
+        single = planner_res.get("next_lemma")
+        raw = [single] if isinstance(single, dict) else []
+
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        lemma_id = str(item.get("id") or "").strip()
+        statement = str(item.get("statement") or "").strip()
+        if not lemma_id or not statement or lemma_id in seen:
+            continue
+        seen.add(lemma_id)
+        deps = item.get("dependencies")
+        out.append({
+            "id": lemma_id,
+            "statement": statement,
+            "dependencies": [str(d).strip() for d in deps if str(d).strip()]
+                            if isinstance(deps, list) else [],
+        })
+        if len(out) >= PLANNER_CANDIDATES:
+            break
+    return out
+
+
+def screen_candidates(
+    dag: Dict[str, Any], candidates: List[Dict[str, Any]]
+) -> List[Tuple[Dict[str, Any], List[str]]]:
+    """Pair each candidate with the reasons it cannot be proved as it stands.
+
+    The checks are the ones run_loop() used to apply to the single proposed
+    lemma; the difference is that failing one now disqualifies a candidate
+    instead of costing the whole iteration. An empty problem list means the
+    candidate is ready for the prover.
+    """
+    screened: List[Tuple[Dict[str, Any], List[str]]] = []
+    for cand in candidates:
+        problems: List[str] = []
+        if cand["id"] in dag["lemmas"]:
+            problems.append(f"{cand['id']} is already proved")
+        missing = [d for d in cand["dependencies"] if d not in dag["lemmas"]]
+        if missing:
+            problems.append(f"depends on unproved {', '.join(missing)}")
+        screened.append((cand, problems))
+    return screened
+
+
+def log_candidates(
+    screened: List[Tuple[Dict[str, Any], List[str]]],
+    plan_summary: str,
+    verbose: bool,
+) -> None:
+    """Print the shortlist in automation too, not just when a human is asked.
+
+    A run you walked away from should still leave a record of the four roads
+    not taken; without it the log shows a decision and none of the choice.
+    """
+    log("🗺  Planner shortlist:", verbose)
+    log(interaction.render(screened, plan_summary), verbose)
+
+
+# ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
 def run_loop(verbose: bool = True) -> Dict[str, Any]:
@@ -654,6 +782,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
     Returns:
         The final DAG, so callers running with --no-verbose still get a result.
     """
+    global MODE            # the hotkey and the menu both retarget it mid-run
+
     conjecture = load_file(CONJECTURE_FILE)
     if not conjecture:
         log(f"{CONJECTURE_FILE} is empty — write your conjecture there first.", verbose)
@@ -701,8 +831,10 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         planner_res = parse_json_or_none(plan_text)
         if planner_res is None:
             planner_res = extract(
-                "Extract the plan. is_conjecture_proved must be true only if the "
-                "text explicitly concludes the conjecture is fully proved.",
+                "Extract the plan. Copy every candidate lemma the text proposes "
+                "into candidate_lemmas, preserving the order it presents them "
+                "in. is_conjecture_proved must be true only if the text "
+                "explicitly concludes the conjecture is fully proved.",
                 plan_text,
                 PLANNER_SCHEMA,
                 "planner",
@@ -716,25 +848,93 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             save_dag(dag)
             return dag
 
-        next_lemma = planner_res.get("next_lemma") or {}
-        lemma_id = next_lemma.get("id")
-        lemma_stmt = next_lemma.get("statement")
-        dep_ids = next_lemma.get("dependencies") or []
-
-        if not lemma_id or not lemma_stmt:
-            log("Planner failed to produce a valid next lemma. Re-planning.", verbose)
-            continue
-        if lemma_id in dag["lemmas"]:
-            log(f"Planner re-proposed already-proved lemma {lemma_id}; skipping.", verbose)
+        candidates = planner_candidates(planner_res)
+        if not candidates:
+            log("Planner proposed no usable lemma. Re-planning.", verbose)
             continue
 
-        missing = [d for d in dep_ids if d not in dag["lemmas"]]
-        if missing:
-            log(f"Planner listed unproved dependencies {missing}; re-planning.", verbose)
-            failed_attempts.setdefault(lemma_id, []).append(
-                f"Planning error: depends on unproved lemmas {missing}."
+        screened = screen_candidates(dag, candidates)
+        summary = str(planner_res.get("plan_summary") or "")
+
+        # ---------------- Step 1b: Selection ----------------
+        # The one place the two modes differ. Everything after this block runs
+        # identically whether the lemma was chosen by a person or by the
+        # screener, which is what keeps --mode auto honest as a control.
+        if MODE != "human" and HOTKEY.take():
+            MODE = "human"
+            log("\n⏸  Manual control engaged at this planning step.", verbose)
+
+        next_lemma: Optional[Dict[str, Any]] = None
+        if MODE == "human":
+            choice = interaction.choose(
+                screened, dag["lemmas"].keys(), HOTKEY, summary
             )
-            continue
+            if choice.action == "quit":
+                log("\n⏹ Stopped by the operator; DAG kept as it stands.", verbose)
+                save_dag(dag)
+                return dag
+            if choice.action == "replan":
+                # Recorded against every candidate shown, because the channel
+                # the planner reads is keyed by lemma id and the point is that
+                # it should not come back with this same shortlist.
+                for cand, _ in screened:
+                    for note in choice.notes:
+                        failed_attempts.setdefault(cand["id"], []).append(note)
+                log("↩︎ Shortlist rejected; asking the planner again.", verbose)
+                continue
+            if choice.action == "auto":
+                MODE = "auto"
+                log(f"▶ Automation resumed. {HOTKEY.hint()}", verbose)
+            elif choice.action == "assert":
+                # The operator has vouched for it, so there is nothing for the
+                # prover or the verifiers to do: no proof is generated, no
+                # review is run, and the lemma is in the DAG before the next
+                # iteration reloads it. `provenance` marks it as resting on a
+                # person rather than on a machine-checked argument — absent on
+                # every node written by the pipeline, and on every DAG file
+                # that predates this, so read it with .get().
+                asserted = choice.lemma or {}
+                dag["lemmas"][asserted["id"]] = {
+                    "statement": asserted["statement"],
+                    "proof": "Asserted by the operator; not machine-proved.",
+                    "dependencies": asserted["dependencies"],
+                    "provenance": "operator",
+                }
+                save_dag(dag)
+                failed_attempts.pop(asserted["id"], None)
+                log(
+                    f"🖊  Lemma {asserted['id']} accepted on your authority "
+                    f"and added to the DAG unproved.",
+                    verbose,
+                )
+                continue
+            else:
+                next_lemma = choice.lemma
+
+        if next_lemma is None:
+            # Automatic selection. planner.md orders the shortlist best-first,
+            # so the first candidate that survives screening is the one the
+            # planner would have proposed alone — hence "as before".
+            log_candidates(screened, summary, verbose)
+            usable = [cand for cand, problems in screened if not problems]
+            if not usable:
+                log("No candidate is currently provable; re-planning.", verbose)
+                for cand, problems in screened:
+                    failed_attempts.setdefault(cand["id"], []).append(
+                        f"Planning error: {'; '.join(problems)}."
+                    )
+                continue
+            next_lemma = usable[0]
+            if next_lemma is not screened[0][0]:
+                log(
+                    f"↷ Skipped {screened[0][0]['id']} "
+                    f"({'; '.join(screened[0][1])}); took {next_lemma['id']}.",
+                    verbose,
+                )
+
+        lemma_id = next_lemma["id"]
+        lemma_stmt = next_lemma["statement"]
+        dep_ids = next_lemma["dependencies"]
 
         log(f"📌 Next Lemma [{lemma_id}]: {lemma_stmt}", verbose)
 
@@ -832,6 +1032,10 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             )
 
         # ---------------- Step 5: Consensus & DAG update ----------------
+        # No human intervention here, in either mode. Choosing 'p' at the menu
+        # *is* the decision to let the models settle it; asking again
+        # afterwards would put the operator back in the loop they just
+        # delegated out of. If you want a say over this lemma, assert it.
         if all(verdicts[t]["decision"] == "accept" for t in ("A", "B")):
             log(f"✅ Lemma {lemma_id} accepted by both verifiers! Adding to DAG.", verbose)
             dag["lemmas"][lemma_id] = {
@@ -861,7 +1065,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 # ----------------------------------------------------------------------------
 def main() -> None:
     global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, MAX_ITERATIONS, NUM_CTX
-    global BACKEND, PROFILE, PROMPT_PATHS
+    global BACKEND, PROFILE, PROMPT_PATHS, MODE, HOTKEY
 
     parser = argparse.ArgumentParser(
         description="Run the multi-agent theorem prover."
@@ -904,10 +1108,22 @@ def main() -> None:
         "--num-ctx", type=int, default=NUM_CTX,
         help=f"Context window in tokens (default: {NUM_CTX}). Lower it if VRAM is tight.",
     )
+    parser.add_argument(
+        "--mode", choices=("auto", "human"), default=DEFAULT_MODE,
+        help="auto: the loop picks a lemma from the planner's shortlist and "
+             "runs unattended (default). human: the shortlist is put to you at "
+             "every planning step. Switchable mid-run either way.",
+    )
+    parser.add_argument(
+        "--hotkey", default=HOTKEY_KEYS,
+        help=f"Key that takes manual control during an automated run "
+             f"(default: {HOTKEY_KEYS!r}). Pass '' to disable the listener.",
+    )
     args = parser.parse_args()
 
     MODEL_NAME = args.model
     MAX_ITERATIONS = args.max_iterations
+    MODE = args.mode
 
     # Backend first: the probe tells us the real context ceiling, which the
     # requested --num-ctx is then clamped to. Doing this before resolving
@@ -934,7 +1150,25 @@ def main() -> None:
     PROMPT_PATHS = {name: str(p) for name, p in paths.prompts.items()}
     log(workspace.describe(paths), args.verbose)
 
-    run_loop(verbose=args.verbose)
+    # The listener puts the terminal in cbreak mode, so it has to be stopped on
+    # every exit path — including a traceback — or the shell you return to has
+    # no echo. Hence try/finally rather than a stop() at the end of the run.
+    HOTKEY = interaction.HotKey(
+        args.hotkey,
+        enabled=bool(args.hotkey),
+        on_press=lambda: print(
+            "\n⏸  Manual control queued; it engages at the next planning step."
+        ),
+    ).start()
+    if MODE == "auto" and HOTKEY.hint():
+        log(f"mode=auto {HOTKEY.hint()}", args.verbose)
+    elif MODE == "human":
+        log("mode=human — you pick the lemma at every planning step.", args.verbose)
+
+    try:
+        run_loop(verbose=args.verbose)
+    finally:
+        HOTKEY.stop()
 
 
 if __name__ == "__main__":
