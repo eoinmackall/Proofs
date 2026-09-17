@@ -99,6 +99,11 @@ class Profile:
 # itself identifies as penalty-sensitive. Same number, opposite effect.
 # ----------------------------------------------------------------------------
 OVERRIDES: Dict[str, Dict[str, Any]] = {
+    # llama-server, so there is no Modelfile baseline: the reference launch
+    # line (below) sets no presence penalty, and there is nothing to correct
+    # against. These values just mirror that line so a request cannot drift
+    # from the server's own defaults.
+    "qwen3.8": {"top_p": 0.95, "top_k": 20, "min_p": 0.0},
     "qwen3.6": {"presence_penalty": 0.4, "top_p": 0.95, "top_k": 20, "min_p": 0.0},
     "qwen3.5": {"presence_penalty": 0.4, "top_p": 0.95, "top_k": 20, "min_p": 0.0},
     "gemma4":  {"presence_penalty": 0.0, "top_p": 0.95, "top_k": 64, "min_p": 0.0},
@@ -218,6 +223,24 @@ class OllamaBackend:
 # ----------------------------------------------------------------------------
 # llama.cpp (llama-server, OpenAI-compatible endpoint)
 # ----------------------------------------------------------------------------
+# Reference launch for Qwen3.8-27B. The alias is what --model must match:
+#
+#   llama-server -hf unsloth/Qwen3.8-27B-GGUF:UD-Q3_K_XL \
+#       --alias qwen3.8-27b --host 0.0.0.0 --port 8081 --no-mmproj \
+#       --parallel 1 -ngl 99 --flash-attn on \
+#       --cache-type-k q8_0 --cache-type-v q8_0 \
+#       -c 65536 -b 512 -ub 512 --no-context-shift -n -1 \
+#       --reasoning-format deepseek \
+#       --chat-template-kwargs '{"reasoning_effort":"xhigh"}' \
+#       --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
+#
+# What the probe leans on there: --port 8081 is this module's default host;
+# -c fixes the context at launch (hence context_is_fixed, and the banner
+# tells you to restart the server, not re-request, when --num-ctx is bigger);
+# --reasoning-format deepseek is what splits the trace into
+# message.reasoning_content; the sampler flags are mirrored in
+# OVERRIDES["qwen3.8"] so per-request options cannot drift from them.
+
 class LlamaCppBackend:
     kind = "llamacpp"
 
@@ -261,9 +284,16 @@ class LlamaCppBackend:
             prof.context_limit = n_ctx
 
         # Whether the loaded template has a reasoning section. llama.cpp
-        # reports the chat template; qwen3.5 thinks by default.
+        # reports the chat template; qwen3.5 thinks by default. qwen3.8 keys
+        # its thinking on the OpenAI-style reasoning_effort knob instead
+        # (launched with --chat-template-kwargs
+        # '{"reasoning_effort":"xhigh"}'), so that name marks it too.
         template = body.get("chat_template", "") or ""
-        prof.supports_thinking = "enable_thinking" in template or "<think>" in template
+        prof.supports_thinking = (
+            "enable_thinking" in template
+            or "<think>" in template
+            or "reasoning_effort" in template
+        )
         prof.thinking_levels = False
 
         prof.probe_ok = True

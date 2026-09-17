@@ -26,7 +26,7 @@
 
           shellHook = ''
             echo "------------------------------------------------"
-            echo "🤖 Multi-Agent Theorem Prover Shell"
+            echo "       Multi-Agent Theorem Prover Shell"
             echo "------------------------------------------------"
           '';
         };

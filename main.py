@@ -1,4 +1,4 @@
-"""Multi-agent proof loop: planner -> prover -> two verifiers -> DAG.
+"""Multi-agent proof loop: planner -> prover -> verifier -> reviser -> DAG.
 
 Design note on thinking vs. structured output
 ---------------------------------------------
@@ -18,7 +18,7 @@ So we never combine the two, and we never send `think: false`:
                        mathematics happens here, so losing thinking costs
                        nothing.
 
-All four agent prompts (planner.md, prover.md, verifier_a.md, verifier_b.md)
+All four agent prompts (planner.md, prover.md, verifier.md, reviser.md)
 instruct the model to emit strict JSON directly, so each response is first
 parsed as-is; the extraction stage only runs as a fallback when the model
 fails to comply. The prover never round-trips through a second model call at
@@ -41,6 +41,20 @@ which is why automation still behaves as it did when the planner returned a
 single lemma — with the difference that a candidate naming an unproved
 dependency now costs a candidate rather than a whole iteration.
 
+Proving is a loop, not a single pass
+------------------------------------
+A lemma enters the DAG only after VERIFY_PASSES independent passes of the
+verifier have all accepted the same proof (--verify-passes). The passes are
+the one verifier agent run repeatedly at a temperature that keeps them apart,
+not separate agents; any single reject ends the counting and sends the proof
+to the reviser with the verifier's reasoning about the failure. The reviser
+decides where the fault lies: a fault in the statement comes back as a
+revised statement, which becomes the prover's new target; a fault in the
+argument keeps the statement and sends the prover back with the verdict as
+feedback. The loop allows MAX_PROOF_ATTEMPTS prover rounds per lemma per
+iteration (--max-proof-attempts), then gives the lemma up and asks the
+planner again.
+
 In --mode human the picker is a person, and picking is two decisions rather
 than one. A number and Enter accepts that candidate as true on your
 authority: it goes straight into the DAG, with no prover call and no verifier
@@ -50,9 +64,9 @@ step but not that it is true. You can also write your own lemma ('w', or 'wp'
 to have it proved), or send the planner back to think again.
 
 You can cross between them mid-run, in either direction, without restarting.
-'h' toggles: press it during a planner, prover or verifier call and the mode
-flips at the next planning step, which is the earliest a change of mode can
-mean anything. 'a' at the menu does the same thing for the case where the
+'h' toggles: press it during a planner, prover, verifier or reviser call and
+the mode flips at the next planning step, which is the earliest a change of
+mode can mean anything. 'a' at the menu does the same thing for the case where the
 menu is already up and the listener is therefore paused. See interaction.py
 for why one of these is a keystroke and the other is a line of input.
 
@@ -62,8 +76,11 @@ Usage
     python main.py --conjecture curve_indices --model gemma4:31b
     python main.py --conjecture curve_indices --backend llamacpp \
                    --model Qwen3.5-122B-Q4_K_M
+    python main.py --conjecture curve_indices --backend llamacpp \
+                   --model qwen3.8-27b
     python main.py --conjecture curve_indices --no-verbose --max-iterations 25
     python main.py --conjecture curve_indices --mode human
+    python main.py --conjecture curve_indices --verify-passes 5
 
 --conjecture names a directory under conjectures/ holding a conjecture.md.
 The DAG is written beside it as dag.json and shared by every model: point a
@@ -113,6 +130,12 @@ REQUEST_TIMEOUT = 1800       # Thinking models are slow; give them room
 # candidates as can be compared without re-reading the conjecture.
 PLANNER_CANDIDATES = 5
 
+# The proof loop: how many independent verifier passes must all accept the
+# same proof before a lemma enters the DAG, and how many prover rounds one
+# iteration may spend on a lemma before giving it up and re-planning.
+VERIFY_PASSES = 3
+MAX_PROOF_ATTEMPTS = 12
+
 # "auto" reproduces the original behaviour end to end. "human" stops at every
 # planning step. Set from --mode, then mutated by the hotkey and the menu, so
 # it is genuinely a run-time toggle rather than a launch-time one.
@@ -137,6 +160,10 @@ NUM_PREDICT_REASONING = {
     "planner": 16384,
     "prover": 24576,
     "verifier": 12288,
+    # The reviser reads proof and verdict and comes back with a diagnosis
+    # plus, at most, one restated lemma — the verifier's job at a different
+    # temperature of scepticism.
+    "reviser": 12288,
 }
 NUM_PREDICT_EXTRACT = 1024
 
@@ -152,6 +179,7 @@ THINK = {
     "planner": True,
     "prover": True,
     "verifier": True,
+    "reviser": True,
 }
 
 # Sampling. The presence penalty is the delicate one: it pushes the model off
@@ -187,7 +215,9 @@ EXTRACT_OPTIONS: Dict[str, Any] = {
 TEMPERATURES = {
     "planner": 0.7,
     "prover": 0.6,     # Slightly tighter: rigour over exploration.
-    "verifier": 0.8,   # Looser, so the two reviews don't collapse into one.
+    "verifier": 0.8,   # Looser, so the repeated verification passes don't
+                       # collapse into one review of the first pass.
+    "reviser": 0.7,    # Diagnosing a failure is planning-scale judgement.
 }
 
 # Set at runtime if schema-constrained extraction proves incompatible with the
@@ -212,8 +242,12 @@ _LEMMA_SCHEMA: Dict[str, Any] = {
     "properties": {
         "id": {"type": "string"},
         "statement": {"type": "string"},
+        # Which end of the question the lemma works toward. planner.md writes
+        # it and planner_candidates() defaults a missing one to "proof", so
+        # an old per-conjecture override that predates aims keeps working.
+        "aim": {"type": "string", "enum": ["proof", "counterexample"]},
     },
-    "required": ["id", "statement"],
+    "required": ["id", "statement", "aim"],
 }
 
 # minItems/maxItems are deliberately absent: Ollama compiles this to a GBNF
@@ -224,10 +258,16 @@ PLANNER_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "is_conjecture_proved": {"type": "boolean"},
+        "is_conjecture_disproved": {"type": "boolean"},
         "plan_summary": {"type": "string"},
         "candidate_lemmas": {"type": "array", "items": _LEMMA_SCHEMA},
     },
-    "required": ["is_conjecture_proved", "plan_summary", "candidate_lemmas"],
+    "required": [
+        "is_conjecture_proved",
+        "is_conjecture_disproved",
+        "plan_summary",
+        "candidate_lemmas",
+    ],
 }
 
 VERIFIER_SCHEMA: Dict[str, Any] = {
@@ -237,6 +277,19 @@ VERIFIER_SCHEMA: Dict[str, Any] = {
         "justification": {"type": "string"},
     },
     "required": ["decision", "justification"],
+}
+
+# new_statement is a string, not a nullable: the reviser writes the empty
+# string when it keeps the statement, which a grammar can enforce but a
+# ["string", "null"] union is fiddlier to ask one for.
+REVISER_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "statement_revision": {"type": "boolean"},
+        "diagnosis": {"type": "string"},
+        "new_statement": {"type": "string"},
+    },
+    "required": ["statement_revision", "diagnosis", "new_statement"],
 }
 
 
@@ -421,7 +474,7 @@ def clean_json_text(raw: str) -> str:
 def parse_json_or_none(text: str) -> Optional[Dict[str, Any]]:
     """Parse an agent reply that already complies with its prompt file.
 
-    planner.md, prover.md, verifier_a.md and verifier_b.md all end with
+    planner.md, prover.md, verifier.md and reviser.md all end with
     "Output strictly valid JSON ... no markdown fences and no extra text", so
     the reasoning stage's content is usually the JSON object itself. When it
     parses, we use it directly and skip the extraction call entirely.
@@ -689,7 +742,7 @@ def prover_context(dag: Dict[str, Any]) -> Dict[str, Any]:
 def verifier_context(dag: Dict[str, Any], cited: List[str]) -> Dict[str, Any]:
     """Statements of exactly the lemmas the prover claims to have used.
 
-    Deliberately not the whole DAG. verifier_a.md is asked to reject "use of
+    Deliberately not the whole DAG. verifier.md is asked to reject "use of
     results not present in the provided lemma set", which only bites if the
     set is the prover's declared citations: a proof leaning on a lemma it
     never declared then reads as an unjustified leap, which is what it is.
@@ -749,8 +802,14 @@ def planner_candidates(planner_res: Dict[str, Any]) -> List[Dict[str, Any]]:
         seen.add(lemma_id)
         # Any dependencies field is dropped rather than honoured: a planner
         # that volunteers one (an old per-conjecture override, or a model
-        # embellishing the schema) must not get to pre-empt the prover.
-        out.append({"id": lemma_id, "statement": statement})
+        # embellishing the schema) must not get to pre-empt the prover. A
+        # missing or unrecognised aim defaults to "proof" for the same
+        # reason: the safe reading of a candidate that predates aims is the
+        # ordinary one.
+        aim = str(item.get("aim") or "").strip().lower()
+        if aim not in ("proof", "counterexample"):
+            aim = "proof"
+        out.append({"id": lemma_id, "statement": statement, "aim": aim})
         if len(out) >= PLANNER_CANDIDATES:
             break
     return out
@@ -794,7 +853,8 @@ def check_mode_toggle(verbose: bool = True) -> None:
 
     Called at several points in an iteration rather than only before the menu,
     because a press lands whenever the operator changes their mind and that is
-    usually somewhere in the middle of a long prover or verifier call. MODE is
+    usually somewhere in the middle of a long prover, verifier or reviser call.
+    MODE is
     still only *read* at the planning step, so checking early changes nothing
     functionally — it means the log acknowledges the key at the moment you
     press it instead of twenty minutes later, which is the difference between
@@ -838,12 +898,12 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 
     planner_sys = load_file(PROMPT_PATHS["planner.md"])
     prover_sys = load_file(PROMPT_PATHS["prover.md"])
-    verifier_a_sys = load_file(PROMPT_PATHS["verifier_a.md"])
-    verifier_b_sys = load_file(PROMPT_PATHS["verifier_b.md"])
+    verifier_sys = load_file(PROMPT_PATHS["verifier.md"])
+    reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
 
     empty = [name for name, text in (
         ("planner.md", planner_sys), ("prover.md", prover_sys),
-        ("verifier_a.md", verifier_a_sys), ("verifier_b.md", verifier_b_sys),
+        ("verifier.md", verifier_sys), ("reviser.md", reviser_sys),
     ) if not text]
     if empty:
         # A missing system prompt does not crash — it produces an agent with
@@ -882,8 +942,13 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             planner_res = extract(
                 "Extract the plan. Copy every candidate lemma the text proposes "
                 "into candidate_lemmas, preserving the order it presents them "
-                "in. is_conjecture_proved must be true only if the text "
-                "explicitly concludes the conjecture is fully proved.",
+                "in and each candidate's aim ('proof' or 'counterexample'); "
+                "where the text gives no aim, use 'proof'. "
+                "is_conjecture_proved must be true only if the text "
+                "explicitly concludes the conjecture is fully proved; "
+                "is_conjecture_disproved must be true only if the text "
+                "explicitly concludes that a full counterexample to the "
+                "conjecture has been established.",
                 plan_text,
                 PLANNER_SCHEMA,
                 "planner",
@@ -894,6 +959,17 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             log("\n🎉 Conjecture has been fully proved!", verbose)
             dag["conjecture"] = conjecture
             dag["status"] = "proved"
+            save_dag(dag)
+            return dag
+
+        if planner_res.get("is_conjecture_disproved"):
+            log(
+                "\n💥 Conjecture has been disproved: a counterexample to it "
+                "stands in the DAG.",
+                verbose,
+            )
+            dag["conjecture"] = conjecture
+            dag["status"] = "disproved"
             save_dag(dag)
             return dag
 
@@ -980,164 +1056,291 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 
         lemma_id = next_lemma["id"]
         lemma_stmt = next_lemma["statement"]
+        aim = str(next_lemma.get("aim") or "proof").strip().lower()
+        if aim not in ("proof", "counterexample"):
+            aim = "proof"
 
-        log(f"📌 Next Lemma [{lemma_id}]: {lemma_stmt}", verbose)
+        log(f"📌 Next Lemma [{lemma_id}] (aim: {aim}): {lemma_stmt}", verbose)
 
-        # ---------------- Step 2: Prover ----------------
-        # prover.md instructs the model to reply with {"lemma_id",
-        # "cited_lemmas", "proof"}. We parse that JSON locally rather than via
-        # a second model call, so the proof text can never be abridged or
-        # paraphrased; if the model ignored the format, its content is taken
-        # verbatim as the proof.
-        prover_user = (
-            f"Conjecture:\n{conjecture}\n\n"
-            f"Available proved lemmas:\n"
-            f"{json.dumps(prover_context(dag), indent=2)}\n\n"
-            f"Lemma to prove:\n{json.dumps(next_lemma, indent=2)}\n\n"
-            f"Feedback from previously rejected proofs of this lemma:\n"
-            f"{json.dumps(failed_attempts.get(lemma_id, []), indent=2)}"
-        )
-        proof_text, prover_status = reason(
-            prover_sys, prover_user, "prover", THINK["prover"], verbose
-        )
-        check_mode_toggle(verbose)
-
-        if prover_status == "ceiling" and not proof_text:
-            log(
-                f"⛔ Lemma {lemma_id} is too large to prove in one call. "
-                f"Asking the planner to decompose it.",
-                verbose,
-            )
-            failed_attempts.setdefault(lemma_id, []).append(
-                "Lemma too large: the prover exhausted its entire token budget "
-                "without completing a proof. Decompose this into smaller, "
-                "independently provable lemmas rather than re-proposing it."
-            )
-            continue
-
-        proof = proof_text
-        declared: Optional[List[str]] = None
-        prover_res = parse_json_or_none(proof_text)
-        if prover_res is not None:
-            candidate = prover_res.get("proof")
-            if isinstance(candidate, str) and candidate.strip():
-                proof = candidate.strip()
-            raw_cited = prover_res.get("cited_lemmas")
-            if isinstance(raw_cited, list):
-                declared = [str(c).strip() for c in raw_cited if str(c).strip()]
-
-        if not proof:
-            log(f"❌ Prover produced no proof for {lemma_id}.", verbose)
-            failed_attempts.setdefault(lemma_id, []).append("Prover returned nothing.")
-            continue
-
-        # The DAG's edges now come from here. An empty declared list is taken
-        # at face value — a proof from first principles has no dependencies —
-        # but a missing one means the prover ignored its format, and scanning
-        # the text beats recording a lemma as standing on nothing.
-        if declared is None:
-            dep_ids = scan_citations(proof, dag)
-            if dep_ids:
-                log(
-                    f"  ℹ️  Prover declared no citations; recovered "
-                    f"{', '.join(dep_ids)} from the proof text.",
-                    verbose,
-                )
-        else:
-            dep_ids = [c for c in declared if c in dag["lemmas"]]
-            phantom = [c for c in declared if c not in dag["lemmas"]]
-            if phantom:
-                # Cited something that isn't in the DAG. Dropping it here is
-                # not a cover-up: the verifiers are about to see a proof that
-                # leans on a lemma absent from their context, which is exactly
-                # the unjustified step they are meant to catch.
-                log(
-                    f"  ⚠️  Prover cited lemmas not in the DAG: "
-                    f"{', '.join(phantom)}.",
-                    verbose,
-                )
-
-        log(
-            f"✍️ Proof generated for {lemma_id} ({len(proof)} chars"
-            f"{', cites ' + ', '.join(dep_ids) if dep_ids else ', no citations'}).",
-            verbose,
-        )
-
-        # ---------------- Steps 3 & 4: Independent verifiers ----------------
-        verifier_user = (
-            f"Conjecture:\n{conjecture}\n\n"
-            f"Available proved lemmas:\n"
-            f"{json.dumps(verifier_context(dag, dep_ids), indent=2)}\n\n"
-            f"Target lemma:\n{json.dumps(next_lemma, indent=2)}\n\n"
-            f"Proposed proof:\n{proof}"
-        )
-
-        verdicts: Dict[str, Dict[str, str]] = {}
-        for tag, sys_prompt in (("A", verifier_a_sys), ("B", verifier_b_sys)):
-            review, review_status = reason(
-                sys_prompt, verifier_user, "verifier", THINK["verifier"], verbose
-            )
-            if review_status == "ceiling" and not review:
-                verdicts[tag] = {
-                    "decision": "reject",
-                    "justification": (
-                        "Verifier exhausted its token budget without reaching a "
-                        "verdict; the proof is likely too long to review in one pass."
-                    ),
-                }
-                continue
-            # verifier_*.md demand raw JSON output; extraction is the fallback.
-            res = parse_json_or_none(review) if review else None
-            if res is None and review:
-                res = extract(
-                    "Extract the verdict. decision is 'accept' only if the review "
-                    "endorses the proof without unresolved objections.",
-                    review,
-                    VERIFIER_SCHEMA,
-                    f"verifier {tag}",
-                    verbose,
-                )
-            res = res or {}
-            verdicts[tag] = {
-                "decision": str(res.get("decision", "")).strip().lower(),
-                "justification": res.get("justification", "(no justification)"),
-            }
-
-        check_mode_toggle(verbose)
-
-        labels = {"A": "logic", "B": "computation"}
-        for tag in ("A", "B"):
-            decision = verdicts[tag]["decision"].upper() or "???"
-            log(
-                f"🔍 Verifier {tag} ({labels[tag]}): {decision} — "
-                f"{verdicts[tag]['justification']}",
-                verbose,
-            )
-
-        # ---------------- Step 5: Consensus & DAG update ----------------
+        # ---------------- Steps 2-5: the proof loop ----------------
+        # prover -> verifier -> reviser, repeated within the iteration. The
+        # prover writes a proof of `target`; the verifier then checks it
+        # VERIFY_PASSES times, independently, and one reject ends the counting
+        # and sends the proof to the reviser with the verdict's reasoning. The
+        # reviser either keeps the statement (the prover re-tries with the
+        # verdict as feedback) or revises it (the revised statement becomes the
+        # new target). Only a proof that survives all VERIFY_PASSES passes
+        # enters the DAG; after MAX_PROOF_ATTEMPTS prover rounds the lemma is
+        # given up for this iteration and the planner is asked again.
+        #
         # No human intervention here, in either mode. Choosing 'p' at the menu
         # *is* the decision to let the models settle it; asking again
         # afterwards would put the operator back in the loop they just
         # delegated out of. If you want a say over this lemma, assert it.
-        if all(verdicts[t]["decision"] == "accept" for t in ("A", "B")):
-            log(f"✅ Lemma {lemma_id} accepted by both verifiers! Adding to DAG.", verbose)
-            dag["lemmas"][lemma_id] = {
-                "statement": lemma_stmt,
-                "proof": proof,
-                "dependencies": dep_ids,
-            }
-            save_dag(dag)
-            failed_attempts.pop(lemma_id, None)
-        else:
-            log(f"❌ Proof rejected for {lemma_id}. Recording feedback for retry.", verbose)
-            for tag in ("A", "B"):
-                if verdicts[tag]["decision"] != "accept":
-                    failed_attempts.setdefault(lemma_id, []).append(
-                        f"Verifier {tag}: {verdicts[tag]['justification']}"
+        target: Dict[str, Any] = {"id": lemma_id, "statement": lemma_stmt}
+        if aim != "proof":
+            target["aim"] = aim
+        # The prover sees only the most recent failure: feedback is rebuilt
+        # after each rejected round, so a retry reads the last verdict and
+        # diagnosis, not the history of every earlier attempt. That history
+        # is kept for the planner in failed_attempts — decomposing or
+        # rerouting is its job, not the prover's.
+        feedback: List[str] = []
+        attempt_notes: List[str] = list(failed_attempts.get(lemma_id, []))
+        proved = False
+
+        for attempt in range(1, MAX_PROOF_ATTEMPTS + 1):
+            log(
+                f"📝 Proof attempt {attempt}/{MAX_PROOF_ATTEMPTS} for {lemma_id}.",
+                verbose,
+            )
+
+            # ---------------- Step 2: Prover ----------------
+            # prover.md instructs the model to reply with {"lemma_id",
+            # "cited_lemmas", "proof"}. We parse that JSON locally rather than
+            # via a second model call, so the proof text can never be abridged
+            # or paraphrased; if the model ignored the format, its content is
+            # taken verbatim as the proof.
+            prover_user = (
+                f"Conjecture:\n{conjecture}\n\n"
+                f"Available proved lemmas:\n"
+                f"{json.dumps(prover_context(dag), indent=2)}\n\n"
+                f"Lemma to prove:\n{json.dumps(target, indent=2)}\n"
+                + (
+                    f"\nFeedback from the previous attempt "
+                    f"(the most recent rejection only):\n"
+                    f"{json.dumps(feedback, indent=2)}"
+                    if feedback
+                    else ""
+                )
+            )
+            proof_text, prover_status = reason(
+                prover_sys, prover_user, "prover", THINK["prover"], verbose
+            )
+            check_mode_toggle(verbose)
+
+            if prover_status == "ceiling" and not proof_text:
+                log(
+                    f"⛔ Lemma {lemma_id} is too large to prove in one call. "
+                    f"Asking the planner to decompose it.",
+                    verbose,
+                )
+                attempt_notes.append(
+                    "Lemma too large: the prover exhausted its entire token "
+                    "budget without completing a proof. Decompose this into "
+                    "smaller, independently provable lemmas rather than "
+                    "re-proposing it."
+                )
+                break
+
+            proof = proof_text
+            declared: Optional[List[str]] = None
+            prover_res = parse_json_or_none(proof_text)
+            if prover_res is not None:
+                candidate = prover_res.get("proof")
+                if isinstance(candidate, str) and candidate.strip():
+                    proof = candidate.strip()
+                raw_cited = prover_res.get("cited_lemmas")
+                if isinstance(raw_cited, list):
+                    declared = [str(c).strip() for c in raw_cited if str(c).strip()]
+
+            if not proof:
+                log(f"❌ Prover produced no proof for {lemma_id}.", verbose)
+                attempt_notes.append("Prover returned nothing.")
+                break
+
+            # The DAG's edges now come from here. An empty declared list is
+            # taken at face value — a proof from first principles has no
+            # dependencies — but a missing one means the prover ignored its
+            # format, and scanning the text beats recording a lemma as
+            # standing on nothing.
+            if declared is None:
+                dep_ids = scan_citations(proof, dag)
+                if dep_ids:
+                    log(
+                        f"  ℹ️  Prover declared no citations; recovered "
+                        f"{', '.join(dep_ids)} from the proof text.",
+                        verbose,
+                    )
+            else:
+                dep_ids = [c for c in declared if c in dag["lemmas"]]
+                phantom = [c for c in declared if c not in dag["lemmas"]]
+                if phantom:
+                    # Cited something that isn't in the DAG. Dropping it here
+                    # is not a cover-up: the verifier is about to see a proof
+                    # that leans on a lemma absent from its context, which is
+                    # exactly the unjustified step it is meant to catch.
+                    log(
+                        f"  ⚠️  Prover cited lemmas not in the DAG: "
+                        f"{', '.join(phantom)}.",
+                        verbose,
                     )
 
+            log(
+                f"✍️ Proof generated for {lemma_id} ({len(proof)} chars"
+                f"{', cites ' + ', '.join(dep_ids) if dep_ids else ', no citations'}).",
+                verbose,
+            )
+
+            # ---------------- Step 3: Verifier, VERIFY_PASSES passes --------
+            # The same proof is checked VERIFY_PASSES times, independently.
+            # One reject ends the counting and carries its reasoning to the
+            # reviser; only a proof that survives every pass is accepted.
+            verifier_user = (
+                f"Conjecture:\n{conjecture}\n\n"
+                f"Available proved lemmas:\n"
+                f"{json.dumps(verifier_context(dag, dep_ids), indent=2)}\n\n"
+                f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
+                f"Proposed proof:\n{proof}"
+            )
+            reject_just: Optional[str] = None
+            for pass_no in range(1, VERIFY_PASSES + 1):
+                review, review_status = reason(
+                    verifier_sys, verifier_user, "verifier",
+                    THINK["verifier"], verbose,
+                )
+                check_mode_toggle(verbose)
+                if review_status == "ceiling" and not review:
+                    decision = "reject"
+                    justification = (
+                        "Verifier exhausted its token budget without reaching "
+                        "a verdict; the proof is likely too long to review in "
+                        "one pass."
+                    )
+                else:
+                    # verifier.md demands raw JSON output; extraction is the
+                    # fallback.
+                    res = parse_json_or_none(review) if review else None
+                    if res is None and review:
+                        res = extract(
+                            "Extract the verdict. decision is 'accept' only if "
+                            "the review endorses the proof without unresolved "
+                            "objections.",
+                            review,
+                            VERIFIER_SCHEMA,
+                            "verifier",
+                            verbose,
+                        )
+                    res = res or {}
+                    decision = str(res.get("decision", "")).strip().lower()
+                    justification = str(
+                        res.get("justification") or "(no justification)"
+                    ).strip()
+                log(
+                    f"🔍 Verifier pass {pass_no}/{VERIFY_PASSES}: "
+                    f"{decision.upper() or '???'} — {justification}",
+                    verbose,
+                )
+                if decision != "accept":
+                    reject_just = justification
+                    break
+
+            if reject_just is None:
+                # ---------------- Step 4: DAG update ----------------
+                # All VERIFY_PASSES passes accepted the same proof.
+                log(
+                    f"✅ Lemma {lemma_id} passed {VERIFY_PASSES} verifier "
+                    f"passes. Adding to DAG.",
+                    verbose,
+                )
+                dag["lemmas"][lemma_id] = {
+                    "statement": target["statement"],
+                    "proof": proof,
+                    "dependencies": dep_ids,
+                }
+                save_dag(dag)
+                failed_attempts.pop(lemma_id, None)
+                proved = True
+                break
+
+            # ---------------- Step 5: Reviser ----------------
+            log(
+                f"❌ Proof rejected for {lemma_id}. Sending the proof and the "
+                f"verdict to the reviser.",
+                verbose,
+            )
+            reviser_user = (
+                f"Conjecture:\n{conjecture}\n\n"
+                f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
+                f"Rejected proof:\n{proof}\n\n"
+                f"Verifier's reasoning (why the proof failed):\n{reject_just}"
+            )
+            revision_text, _revision_status = reason(
+                reviser_sys, reviser_user, "reviser", THINK["reviser"], verbose
+            )
+            check_mode_toggle(verbose)
+
+            revision_res: Optional[Dict[str, Any]] = None
+            if revision_text:
+                # reviser.md demands raw JSON output; extraction is the
+                # fallback.
+                revision_res = parse_json_or_none(revision_text)
+                if revision_res is None:
+                    revision_res = extract(
+                        "Extract the revision decision. statement_revision is "
+                        "true only if the text proposes a changed statement. "
+                        "Copy new_statement verbatim; it is the empty string "
+                        "when the statement is kept.",
+                        revision_text,
+                        REVISER_SCHEMA,
+                        "reviser",
+                        verbose,
+                    )
+            else:
+                log(
+                    "⚠️  Reviser returned nothing; the verdict alone goes back "
+                    "to the prover.",
+                    verbose,
+                )
+            revision_res = revision_res or {}
+
+            diagnosis = str(revision_res.get("diagnosis") or "").strip()
+            new_stmt = str(revision_res.get("new_statement") or "").strip()
+            wants_revision = bool(revision_res.get("statement_revision", False))
+
+            feedback = [f"Verifier: {reject_just}"]
+            if diagnosis:
+                feedback.append(f"Reviser's diagnosis: {diagnosis}")
+
+            if wants_revision and new_stmt and new_stmt != target["statement"]:
+                target = {"id": lemma_id, "statement": new_stmt}
+                if aim != "proof":
+                    target["aim"] = aim
+                log(
+                    f"↻ Reviser revised the lemma; the prover starts again "
+                    f"from:\n{new_stmt}",
+                    verbose,
+                )
+                feedback.append(f"Revised statement proposed: {new_stmt}")
+            elif wants_revision:
+                log(
+                    "⚠️  Reviser flagged a statement revision but gave none "
+                    "usable; keeping the statement.",
+                    verbose,
+                )
+            else:
+                log(
+                    "↻ Reviser kept the statement; the prover re-tries with "
+                    "the verdict as feedback.",
+                    verbose,
+                )
+            attempt_notes.extend(feedback)
+            # Loop continues: the next prover round works on `target`, with
+            # only this round's feedback.
+
+        # ---------------- Step 6: Record the outcome for the planner --------
+        if not proved:
+            if attempt_notes:
+                failed_attempts[lemma_id] = attempt_notes
+            log(
+                f"↷ Lemma {lemma_id} left unproved after the proof loop; the "
+                f"planner will see the feedback.",
+                verbose,
+            )
+
     log(
-        f"\n⏹ Reached MAX_ITERATIONS ({MAX_ITERATIONS}) without completing the proof.",
+        f"\n⏹ Reached MAX_ITERATIONS ({MAX_ITERATIONS}) without settling the "
+        f"conjecture (proved or disproved).",
         verbose,
     )
     return load_dag()
@@ -1149,6 +1352,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 def main() -> None:
     global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, MAX_ITERATIONS, NUM_CTX
     global BACKEND, PROFILE, PROMPT_PATHS, MODE, HOTKEY
+    global VERIFY_PASSES, MAX_PROOF_ATTEMPTS
 
     parser = argparse.ArgumentParser(
         description="Run the multi-agent theorem prover."
@@ -1188,6 +1392,20 @@ def main() -> None:
         help=f"Loop iterations before giving up (default: {MAX_ITERATIONS})",
     )
     parser.add_argument(
+        "--verify-passes", type=int, default=VERIFY_PASSES,
+        help=(
+            "How many independent verifier passes must all accept a proof "
+            f"before it enters the DAG (default: {VERIFY_PASSES})"
+        ),
+    )
+    parser.add_argument(
+        "--max-proof-attempts", type=int, default=MAX_PROOF_ATTEMPTS,
+        help=(
+            "How many prover rounds the proof loop may spend on one lemma "
+            f"per iteration (default: {MAX_PROOF_ATTEMPTS})"
+        ),
+    )
+    parser.add_argument(
         "--num-ctx", type=int, default=NUM_CTX,
         help=f"Context window in tokens (default: {NUM_CTX}). Lower it if VRAM is tight.",
     )
@@ -1206,6 +1424,8 @@ def main() -> None:
 
     MODEL_NAME = args.model
     MAX_ITERATIONS = args.max_iterations
+    VERIFY_PASSES = max(1, args.verify_passes)
+    MAX_PROOF_ATTEMPTS = max(1, args.max_proof_attempts)
     MODE = args.mode
 
     # Backend first: the probe tells us the real context ceiling, which the

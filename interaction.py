@@ -234,10 +234,12 @@ class Choice:
 
 _MENU = (
     "  [1-9]  accept as true — straight into the DAG, no proof run\n"
-    "  [1p]   send that one to the prover and verifiers instead\n"
+    "  [1p]   send that one to the proving pipeline instead\n"
     "  [w]    write your own lemma     [wp] write one and have it proved\n"
     "  [r]    none of these, re-plan   [a]  resume automation\n"
-    "  [q]    quit and keep the DAG"
+    "  [q]    quit and keep the DAG\n"
+    "\n"
+    "  ⚔︎ marked candidates work toward a counterexample, not a proof"
 )
 
 # A trailing 'p' is the whole grammar: it means "hand this to the models"
@@ -270,7 +272,9 @@ def render(
         out.append(_wrap(f"Strategy: {plan_summary}", indent="  "))
     for i, (cand, problems) in enumerate(screened, start=1):
         flag = "  ⚠ " + "; ".join(problems) if problems else ""
-        out.append(f"  [{i}] {cand.get('id', '?')}{flag}")
+        aim = str(cand.get("aim") or "").strip().lower()
+        marker = "⚔︎" if aim == "counterexample" else ""
+        out.append(f"  [{i}] {cand.get('id', '?')}{marker}{flag}")
         out.append(_wrap(cand.get("statement", "(no statement)")))
     return "\n".join(out)
 
@@ -361,4 +365,10 @@ def _write_own(proved: set) -> Optional[Dict[str, Any]]:
         print("  empty statement; nothing added.")
         return None
 
-    return {"id": lemma_id, "statement": statement}
+    # The planner marks each candidate with an aim; a hand-written lemma has
+    # one too, defaulting to the ordinary case.
+    aim = _ask("  aim, 'proof' or 'counterexample' (Enter for proof): ").lower()
+    lemma = {"id": lemma_id, "statement": statement}
+    if aim == "counterexample":
+        lemma["aim"] = "counterexample"
+    return lemma

@@ -10,7 +10,7 @@ Layout:
       some_other_problem/
         conjecture.md
 
-    planner.md  prover.md  verifier_a.md  verifier_b.md   <- project-root defaults
+    planner.md  prover.md  verifier.md  reviser.md        <- project-root defaults
 
 Two decisions worth flagging, both changeable:
 
@@ -42,7 +42,7 @@ from typing import Dict, List, Optional
 CONJECTURES_ROOT = "conjectures"
 CONJECTURE_FILENAME = "conjecture.md"
 DAG_FILENAME = "dag.json"
-PROMPT_FILES = ("planner.md", "prover.md", "verifier_a.md", "verifier_b.md")
+PROMPT_FILES = ("planner.md", "prover.md", "verifier.md", "reviser.md")
 
 
 class ConjectureNotFound(Exception):
