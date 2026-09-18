@@ -39,12 +39,12 @@ The prompts instruct each model to emit strict JSON directly, so every
 response is first parsed as-is; a schema-constrained *extraction* call only
 runs as a fallback. The underlying tension between `format` (JSON schemas)
 and `think` (reasoning) differs between the two supported backends and is
-handled inside `llm_backend.py`, which `main.py` uses without knowing which
-server is listening.
+handled inside `src/llm_backend.py`, which `src/main.py` uses without knowing
+which server is listening.
 
 ### Backends
 
-Two transports, probed at startup (`llm_backend.py`):
+Two transports, probed at startup (`src/llm_backend.py`):
 
 - **Ollama** — native `/api/chat`; `think` as a top-level field, `format` as
   a JSON schema, reasoning returned in `message.thinking`.
@@ -69,13 +69,13 @@ Python 3 install with `requests` works.
 ## Usage
 
 ```sh
-python main.py --conjecture torsor_examples
-python main.py --conjecture torsor_examples --model gemma4:31b
-python main.py --conjecture torsor_examples --backend llamacpp \
+python src/main.py --conjecture torsor_examples
+python src/main.py --conjecture torsor_examples --model gemma4:31b
+python src/main.py --conjecture torsor_examples --backend llamacpp \
                --model Qwen3.5-122B-Q4_K_M
-python main.py --conjecture torsor_examples --no-verbose --max-iterations 25
-python main.py --conjecture torsor_examples --mode human
-python main.py --conjecture torsor_examples --verify-passes 5
+python src/main.py --conjecture torsor_examples --no-verbose --max-iterations 25
+python src/main.py --conjecture torsor_examples --mode human
+python src/main.py --conjecture torsor_examples --verify-passes 5
 ```
 
 ### CLI options
@@ -106,22 +106,24 @@ direction, without restarting:
 - At the menu itself, type `a` (the line-oriented input is what the menu
   already owns, so the hotkey is paused while it is up).
 
-`interaction.py` explains why the toggle is a keystroke in one place and a
-line of input in the other.
+`src/interaction.py` explains why the toggle is a keystroke in one place and
+a line of input in the other.
 
 ## Project layout
 
 ```
+agents/
+  planner.md  prover.md  verifier.md  reviser.md   # default agent prompts
+src/
+  main.py              # the proof loop (planner → prover → verifier → reviser)
+  llm_backend.py       # backend transports (Ollama, llama.cpp) + model profiles
+  interaction.py       # human-in-the-loop menu + hotkey
+  workspace.py         # per-conjecture run directories and prompt resolution
 conjectures/
   torsor_examples/
     conjecture.md          # required: the statement
     dag.json               # shared by every model and backend
     prover.md              # optional per-conjecture prompt override
-main.py                    # the proof loop (planner → prover → verifier → reviser)
-llm_backend.py             # backend transports (Ollama, llama.cpp) + model profiles
-interaction.py             # human-in-the-loop menu + hotkey
-workspace.py               # per-conjecture run directories and prompt resolution
-planner.md  prover.md  verifier.md  reviser.md   # default agent prompts
 flake.nix                  # Nix dev shell
 ```
 
@@ -135,6 +137,6 @@ a 27B model and passed by the verifiers is no less proved when a 122B model
 arrives. The cost is that this is collaboration, not a controlled comparison —
 give a model its own file with `--dag` if you want them isolated again.
 
-Prompt files are looked up in the conjecture directory first, then the
-project root, so a conjecture that needs a special prompt (e.g. a prover
-primed for Brauer groups) can carry one without forking the defaults.
+Prompt files are looked up in the conjecture directory first, then in
+`agents/`, so a conjecture that needs a special prompt (e.g. a prover primed
+for Brauer groups) can carry one without forking the defaults.

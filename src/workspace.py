@@ -10,7 +10,8 @@ Layout:
       some_other_problem/
         conjecture.md
 
-    planner.md  prover.md  verifier.md  reviser.md        <- project-root defaults
+    agents/
+      planner.md  prover.md  verifier.md  reviser.md      <- project-wide defaults
 
 Two decisions worth flagging, both changeable:
 
@@ -27,8 +28,8 @@ Two decisions worth flagging, both changeable:
     own file with --dag; the tagged name this used to generate was
     dag-<backend>-<model>.json.
 
-  * Prompt files are looked up in the conjecture directory first, then the
-    project root. Nothing changes unless you drop a file in; it just means a
+  * Prompt files are looked up in the conjecture directory first, then in
+    agents/. Nothing changes unless you drop a file in; it just means a
     conjecture that needs, say, a prover primed for Brauer groups can have one
     without forking the defaults.
 """
@@ -42,6 +43,7 @@ from typing import Dict, List, Optional
 CONJECTURES_ROOT = "conjectures"
 CONJECTURE_FILENAME = "conjecture.md"
 DAG_FILENAME = "dag.json"
+AGENTS_DIR = "agents"
 PROMPT_FILES = ("planner.md", "prover.md", "verifier.md", "reviser.md")
 
 
@@ -112,7 +114,7 @@ def resolve(
             prompts[fname] = local
             overridden.append(fname)
         else:
-            prompts[fname] = project_root / fname
+            prompts[fname] = project_root / AGENTS_DIR / fname
 
     return RunPaths(root=root, conjecture=conjecture, dag=dag,
                     prompts=prompts, overridden_prompts=overridden)
