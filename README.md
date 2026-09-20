@@ -2,8 +2,9 @@
 
 A Python program that drives a small team of LLM agents to iteratively prove
 (or refute) a mathematical conjecture. The agents work in a loop —
-**planner → prover → verifier → reviser** — and accumulate a proof as a DAG of
-lemmas written to `dag.json` next to the conjecture.
+**planner → selector → prover → verifier → reviser** — and accumulate a proof
+as a DAG of lemmas written to `dag.json` next to the conjecture. (In
+`--mode human`, the operator takes the selector's place at the menu.)
 
 ## How it works
 
@@ -15,8 +16,12 @@ Each iteration:
    carries an *aim* — `proof` (work toward the conjecture being true) or
    `counterexample` (work toward refuting it).
 2. **Selection** picks exactly one candidate:
-   - `--mode auto`: `screen_candidates()` filters, and the first survivor is
-     taken.
+   - `--mode auto`: `screen_candidates()` filters out candidates whose ids are
+     already in the DAG, and when more than one survives, the **selector**
+     (`selector.md`) weighs them all and picks the one it judges most likely
+     to come through the prover and the verifiers. The planner's best-first
+     order is the fallback: it is taken when the selector fails or when only
+     one candidate survives.
    - `--mode human`: a menu appears. Type a number and Enter to accept that
      lemma as true on your own authority (it goes straight into the DAG,
      marked `"provenance": "operator"`). Type `Np` to send a lemma through
@@ -41,6 +46,17 @@ runs as a fallback. The underlying tension between `format` (JSON schemas)
 and `think` (reasoning) differs between the two supported backends and is
 handled inside `src/llm_backend.py`, which `src/main.py` uses without knowing
 which server is listening.
+
+### When a call hits the context wall
+
+The server is stateless, so a response cut off by the context window cannot
+just be re-sent. Before reporting a ceiling, `reason()` does one pi-style
+compaction: the thinking trace (scratch) is summarised into a structured
+summary — in chunked passes if it is big — the answer written so far is kept
+verbatim, and the model is asked to resume from the cut with the whole
+headroom of the now-smaller prompt. If that continuation also truncates, the
+lemma is reported as too large for the window and the usual decomposition
+escape hatches take over.
 
 ### Backends
 
@@ -69,20 +85,20 @@ Python 3 install with `requests` works.
 ## Usage
 
 ```sh
-python src/main.py --conjecture torsor_examples
-python src/main.py --conjecture torsor_examples --model gemma4:31b
-python src/main.py --conjecture torsor_examples --backend llamacpp \
+python src/main.py --conjecture algebra_example
+python src/main.py --conjecture algebra_example --model gemma4:31b
+python src/main.py --conjecture algebra_example --backend llamacpp \
                --model Qwen3.5-122B-Q4_K_M
-python src/main.py --conjecture torsor_examples --no-verbose --max-iterations 25
-python src/main.py --conjecture torsor_examples --mode human
-python src/main.py --conjecture torsor_examples --verify-passes 5
+python src/main.py --conjecture algebra_example --no-verbose --max-iterations 25
+python src/main.py --conjecture algebra_example --mode human
+python src/main.py --conjecture algebra_example --verify-passes 5
 ```
 
 ### CLI options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--conjecture NAME` | `curve_indices` | A directory under `conjectures/` holding a `conjecture.md`. |
+| `--conjecture NAME` | `algebra_example` | A directory under `conjectures/` holding a `conjecture.md`. |
 | `--backend {ollama,llamacpp}` | `ollama` | Which server to talk to. |
 | `--model NAME` | `qwen3.6:35b` | Ollama model tag, or the label llama-server reports. |
 | `--host URL` | per backend | Server base URL (`localhost:11434` for ollama, `localhost:8081` for llamacpp). |
@@ -90,7 +106,7 @@ python src/main.py --conjecture torsor_examples --verify-passes 5
 | `--max-iterations N` | 10 | Loop iterations before giving up. |
 | `--verify-passes N` | 3 | Independent verifier passes a proof must survive. |
 | `--max-proof-attempts N` | 12 | Prover rounds per lemma before it is given up. |
-| `--num-ctx N` | 40960 | Context window in tokens (capped at the server's limit; lower it if VRAM is tight). |
+| `--num-ctx N` | 65536 | Context window in tokens (capped at the server's limit; lower it if VRAM is tight). |
 | `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
 | `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
 | `--verbose / --no-verbose` | on | Console logging. |
@@ -113,14 +129,14 @@ a line of input in the other.
 
 ```
 agents/
-  planner.md  prover.md  verifier.md  reviser.md   # default agent prompts
+  planner.md  selector.md  prover.md  verifier.md  reviser.md   # default agent prompts
 src/
-  main.py              # the proof loop (planner → prover → verifier → reviser)
+  main.py              # the proof loop (planner → selector → prover → verifier → reviser)
   llm_backend.py       # backend transports (Ollama, llama.cpp) + model profiles
   interaction.py       # human-in-the-loop menu + hotkey
   workspace.py         # per-conjecture run directories and prompt resolution
 conjectures/
-  torsor_examples/
+  algebra_example/
     conjecture.md          # required: the statement
     dag.json               # shared by every model and backend
     prover.md              # optional per-conjecture prompt override

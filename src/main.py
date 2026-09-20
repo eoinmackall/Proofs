@@ -1,4 +1,4 @@
-"""Multi-agent proof loop: planner -> prover -> verifier -> reviser -> DAG.
+"""Multi-agent proof loop: planner -> selector -> prover -> verifier -> reviser -> DAG.
 
 Design note on thinking vs. structured output
 ---------------------------------------------
@@ -18,8 +18,9 @@ So we never combine the two, and we never send `think: false`:
                        mathematics happens here, so losing thinking costs
                        nothing.
 
-All four agent prompts (planner.md, prover.md, verifier.md, reviser.md)
-instruct the model to emit strict JSON directly, so each response is first
+All five agent prompts (planner.md, selector.md, prover.md, verifier.md,
+reviser.md) instruct the model to emit strict JSON directly, so each
+response is first
 parsed as-is; the extraction stage only runs as a fallback when the model
 fails to comply. The prover never round-trips through a second model call at
 all: its JSON is parsed locally and, failing that, the reasoning content is
@@ -36,10 +37,14 @@ Planning is a shortlist, not a decision
 ---------------------------------------
 The planner proposes PLANNER_CANDIDATES (5) lemmas per iteration rather than
 one, ordered best-first, and something downstream picks exactly one. In
---mode auto that picker is screen_candidates() plus "take the first survivor",
-which is why automation still behaves as it did when the planner returned a
-single lemma — with the difference that a candidate naming an unproved
-dependency now costs a candidate rather than a whole iteration.
+--mode auto that picker is the selector agent: screen_candidates() filters
+the shortlist against the DAG, and when more than one candidate survives,
+selector.md is asked to weigh them all and name the one it judges most
+likely to come through the prover and the verifiers. The planner's best-first
+order is the fallback, not the default — it is what gets taken when the
+selector fails, names a candidate it was not offered, or when only one
+candidate survives, where there is nothing left to choose. A candidate naming
+an unproved dependency still costs a candidate rather than a whole iteration.
 
 Proving is a loop, not a single pass
 ------------------------------------
@@ -54,6 +59,20 @@ argument keeps the statement and sends the prover back with the verdict as
 feedback. The loop allows MAX_PROOF_ATTEMPTS prover rounds per lemma per
 iteration (--max-proof-attempts), then gives the lemma up and asks the
 planner again.
+
+When a call runs into the context wall
+--------------------------------------
+The server is stateless, so a truncated exchange — prompt, thinking trace,
+answer-so-far, summing to about num_ctx — cannot be re-sent whole. reason()
+therefore gets one pi-style compaction rescue before reporting "ceiling":
+the thinking trace (scratch, regenerable) is summarised into a structured
+summary — Goal, Progress, Key Decisions, Next Steps, Critical Context, plus
+a <cited-lemmas> tracking block — in chunked passes if it is big; the task
+prompt and the answer written so far are kept verbatim, the answer ending
+exactly where it was cut; and the model is asked to resume from the cut with
+the whole headroom of the now-smaller prompt. One compaction and one
+continuation per call; any failure degrades to the "ceiling" the
+planner/prover/verifier callers already handle.
 
 In --mode human the picker is a person, and picking is two decisions rather
 than one. A number and Enter accepts that candidate as true on your
@@ -72,15 +91,15 @@ for why one of these is a keystroke and the other is a line of input.
 
 Usage
 -----
-    python main.py --conjecture curve_indices
-    python main.py --conjecture curve_indices --model gemma4:31b
-    python main.py --conjecture curve_indices --backend llamacpp \
+    python main.py --conjecture algebra_example
+    python main.py --conjecture algebra_example --model gemma4:31b
+    python main.py --conjecture algebra_example --backend llamacpp \
                    --model Qwen3.5-122B-Q4_K_M
-    python main.py --conjecture curve_indices --backend llamacpp \
+    python main.py --conjecture algebra_example --backend llamacpp \
                    --model qwen3.8-27b
-    python main.py --conjecture curve_indices --no-verbose --max-iterations 25
-    python main.py --conjecture curve_indices --mode human
-    python main.py --conjecture curve_indices --verify-passes 5
+    python main.py --conjecture algebra_example --no-verbose --max-iterations 25
+    python main.py --conjecture algebra_example --mode human
+    python main.py --conjecture algebra_example --verify-passes 5
 
 --conjecture names a directory under conjectures/ holding a conjecture.md.
 The DAG is written beside it as dag.json and shared by every model: point a
@@ -108,7 +127,7 @@ import workspace
 # :35b-a3b-q4_K_M. NOT the same as :35b-mlx (Apple Silicon) or :35b-a3b-mtp-*.
 DEFAULT_BACKEND = "ollama"
 MODEL_NAME = "qwen3.6:35b"
-DEFAULT_CONJECTURE = "curve_indices"
+DEFAULT_CONJECTURE = "algebra_example"
 
 # Set in main(). BACKEND owns the HTTP conversation; PROFILE is what the
 # capability probe found (context ceiling, thinking support, tokenizer ratio).
@@ -146,26 +165,18 @@ HOTKEY: interaction.HotKey = interaction.NullHotKey()
 
 # Ollama defaults num_ctx low (2048/4096) regardless of model capability.
 # Reasoning tokens are drawn from the same budget as the answer, so a thinking
-# prover needs a much larger allowance than a one-shot one.
-NUM_CTX = 40960              # model supports 256K; raise if VRAM allows
-# Per-role generation budgets. Thinking and answer share this stream, so the
-# prover — which must think *and* then write a full proof — needs the most.
-# reason() grows these on truncation, clamped to whatever num_ctx allows.
-NUM_PREDICT_REASONING = {
-    # Five candidate statements is several times the old single-lemma answer,
-    # and the thinking that precedes it grows too — the planner is now
-    # comparing routes, not committing to one. reason() would discover this on
-    # its own by hitting the ceiling and doubling, but only after paying for a
-    # truncated generation first.
-    "planner": 16384,
-    "prover": 24576,
-    "verifier": 12288,
-    # The reviser reads proof and verdict and comes back with a diagnosis
-    # plus, at most, one restated lemma — the verifier's job at a different
-    # temperature of scepticism.
-    "reviser": 12288,
-}
-NUM_PREDICT_EXTRACT = 1024
+# prover needs a much larger allowance than a one-shot one. 65536 matches the
+# Qwen3.8-27B reference launch line in llm_backend.py (-c 65536); main() still
+# clamps it to whatever the probe finds the server actually allows.
+NUM_CTX = 65536
+# No static per-role generation budgets. reason() and extract() give every
+# call the full headroom — num_ctx minus the prompt, minus a safety margin —
+# because num_predict is a ceiling, not a target: the model stops at EOS
+# whatever the number, so a tight budget can only ever end in a truncated
+# generation paid for in full, followed by a retry with a bigger number. The
+# response is allowed to use the whole window, which means a truncation now
+# reports "ceiling" — the lemma is too big for the context — instead of
+# quietly undersizing the answer.
 
 # Thinking level: True, or "low"/"medium"/"high"/"max" on models that support
 # levels. Set to None to omit the field entirely (the model's default).
@@ -177,6 +188,7 @@ NUM_PREDICT_EXTRACT = 1024
 # understands booleans is ignored silently, which is worse.
 THINK = {
     "planner": True,
+    "selector": True,
     "prover": True,
     "verifier": True,
     "reviser": True,
@@ -198,7 +210,7 @@ REASONING_OPTIONS: Dict[str, Any] = {
     "temperature": 0.7,          # Greedy decoding degrades thinking models.
     "num_ctx": NUM_CTX,
     # presence_penalty: deliberately absent — see llm_backend.OVERRIDES.
-    # num_predict is set per role by reason(); see NUM_PREDICT_REASONING.
+    # num_predict is set per call by reason(); see the NUM_CTX comment.
 }
 
 EXTRACT_OPTIONS: Dict[str, Any] = {
@@ -208,17 +220,29 @@ EXTRACT_OPTIONS: Dict[str, Any] = {
                                  # overrides whatever OVERRIDES recommends.
     "min_p": 0.0,
     "num_ctx": NUM_CTX,
-    "num_predict": NUM_PREDICT_EXTRACT,
+    # num_predict is set per call by extract(); see the NUM_CTX comment.
 }
 
 # Per-role reasoning temperature overrides.
 TEMPERATURES = {
     "planner": 0.7,
+    "selector": 0.5,   # Comparing a shortlist, not generating one.
     "prover": 0.6,     # Slightly tighter: rigour over exploration.
     "verifier": 0.8,   # Looser, so the repeated verification passes don't
                        # collapse into one review of the first pass.
     "reviser": 0.7,    # Diagnosing a failure is planning-scale judgement.
 }
+
+# Pi-style compaction on the context wall: a truncated call is resumed by
+# summarising its thinking trace and re-sending task + answer-so-far (see
+# _resume_compacted, between _headroom and reason below). COMPACT_CHUNK_TOKENS
+# bounds one compaction pass's input, COMPACT_TAIL_CHARS is what the compactor
+# sees of the answer-so-far, COMPACT_MIN_ROOM is the smallest headroom a
+# continuation is worth attempting.
+COMPACT_ENABLED = True
+COMPACT_CHUNK_TOKENS = 24000
+COMPACT_TAIL_CHARS = 2000
+COMPACT_MIN_ROOM = 2048
 
 # Set at runtime if schema-constrained extraction proves incompatible with the
 # model's default thinking (empty content, output stranded in .thinking).
@@ -268,6 +292,18 @@ PLANNER_SCHEMA: Dict[str, Any] = {
         "plan_summary",
         "candidate_lemmas",
     ],
+}
+
+# The selector picks by id, but "one of these particular ids" is not
+# something a grammar can enforce, so the offered ids are listed in the
+# prompt and the answer is checked against them in select_lemma(), which
+# falls back to the planner's first candidate when it does not check out.
+SELECTOR_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "selected_id": {"type": "string"},
+    },
+    "required": ["selected_id"],
 }
 
 VERIFIER_SCHEMA: Dict[str, Any] = {
@@ -474,9 +510,9 @@ def clean_json_text(raw: str) -> str:
 def parse_json_or_none(text: str) -> Optional[Dict[str, Any]]:
     """Parse an agent reply that already complies with its prompt file.
 
-    planner.md, prover.md, verifier.md and reviser.md all end with
-    "Output strictly valid JSON ... no markdown fences and no extra text", so
-    the reasoning stage's content is usually the JSON object itself. When it
+    planner.md, selector.md, prover.md, verifier.md and reviser.md all end
+    with "Output strictly valid JSON ... no markdown fences and no extra
+    text", so the reasoning stage's content is usually the JSON object itself. When it
     parses, we use it directly and skip the extraction call entirely.
     """
     if not text:
@@ -494,9 +530,9 @@ def parse_json_or_none(text: str) -> Optional[Dict[str, Any]]:
 def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
     """Tokens available for generation after the prompt, with a safety margin.
 
-    num_ctx caps prompt + generation together, so doubling num_predict past
-    this point buys nothing: the model would be cut off by the context window
-    instead of by the budget, after a long generation.
+    num_ctx caps prompt + generation together, so this is the most a response
+    can ever get: anything more is cut off by the context window, not the
+    budget, after a long generation.
 
     The prompt size used to be estimated as chars // 4. That is optimistic for
     LaTeX-dense text and, worse, it is tokenizer-specific — the whole point of
@@ -509,6 +545,195 @@ def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
     ratio = PROFILE.chars_per_token if PROFILE else 4.0
     used = int(chars / max(ratio, 1.0)) + 1
     return max(num_ctx - used - 512, 0)
+
+
+COMPACT_SYSTEM = (
+    "You are a compaction pass, not the agent. You are given part of a "
+    "mathematician's reasoning trace that was cut off by the context limit. "
+    "Write ONLY the structured summary in the format below — do not continue "
+    "the mathematics, do not add claims, no preamble, no fences. If a previous "
+    "pass's summary is included, fold it in: the result must cover everything "
+    "it covered, plus this part.\n\n"
+    "Format (fill every section, 'none' where nothing applies):\n"
+    "## Goal\n[the task the trace was working on, in your own words]\n"
+    "## Progress\n### Done\n- [x] ...\n### In Progress\n- [ ] ...\n"
+    "### Blocked\n- ...\n## Key Decisions\n- **[decision]**: rationale\n"
+    "## Next Steps\n1. [what must happen next, starting exactly where the "
+    "trace stopped]\n## Critical Context\n- [definitions, facts, partial "
+    "results needed to continue]\n<cited-lemmas>\n[comma-separated lemma ids "
+    "the trace cited or used, or 'none']\n</cited-lemmas>"
+)
+
+
+def _split_inline_thinking(content: str, thinking: str) -> Tuple[str, str]:
+    """Recover (content, thinking) when the model inlined its reasoning
+    instead of separating it."""
+    if not thinking and "\u003cthink\u003e" in content:
+        m = re.search(r"\u003cthink\u003e(.*?)\u003c/think\u003e", content, re.DOTALL)
+        if m:
+            thinking = m.group(1).strip()
+        content = _THINK_RE.sub("", content).strip()
+    return content, thinking
+
+
+def _split_trace_chunks(text: str, max_tokens: int) -> List[str]:
+    """Split a trace into line-aligned chunks of at most ~max_tokens, so a
+    compaction pass never needs more than a fraction of the window. Breaking
+    on newlines keeps no LaTeX display cut mid-line; a chunk may still exceed
+    the limit by one very long line, which the pass's headroom absorbs."""
+    ratio = PROFILE.chars_per_token if PROFILE else 4.0
+    max_chars = max(int(max_tokens * ratio), 1000)
+    chunks: List[str] = []
+    cur = ""
+    for line in text.split("\n"):
+        if cur and len(cur) + len(line) + 1 > max_chars:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _compact_pass(part: str, prev: str, tail: str,
+                  part_no: int, n_parts: int, verbose: bool) -> str:
+    """One summarisation pass over part of the cut-off trace.
+
+    Returns the folded summary, or `prev` unchanged on any failure: the
+    compaction must never lose what it already had, and it is a rescue, not a
+    new stage that can fail the call.
+    """
+    user = (
+        f"Part {part_no} of {n_parts} of the cut-off reasoning trace:\n"
+        f"[Thinking trace]:\n{part}"
+    )
+    if prev:
+        user = (
+            "The summary of all previous parts — fold it in, drop nothing "
+            f"from it:\n{prev}\n\n" + user
+        )
+    if tail:
+        user += (
+            "\n\n[The answer written before the cut, its tail — the work "
+            f"ends here, mid-sentence]:\n{tail}"
+        )
+    messages = [
+        {"role": "system", "content": COMPACT_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    options = {
+        **EXTRACT_OPTIONS,
+        "num_predict": _headroom(messages, EXTRACT_OPTIONS["num_ctx"]),
+    }
+    try:
+        reply = BACKEND.chat(messages, think=None, schema=None,
+                             options=options)
+    except (requests.RequestException, ValueError, KeyError) as e:
+        log(f"  ⚠️  compaction pass {part_no}/{n_parts} transport error: {e}",
+            verbose)
+        return prev
+    summary = (reply.content or "").strip()
+    if reply.truncated or not summary:
+        log(f"  ⚠️  compaction pass {part_no}/{n_parts} was truncated or "
+            f"empty; keeping the previous summary.", verbose)
+        return prev
+    return summary
+
+
+def _compact_trace(role: str, thinking: str, tail: str, verbose: bool) -> str:
+    """Summarise a cut-off reasoning trace in pi-style passes: chunked, each
+    pass folding the previous summary in. Returns the summary, or "" when the
+    trace was empty or nothing survived the passes."""
+    if not thinking.strip():
+        return ""
+    parts = _split_trace_chunks(thinking, COMPACT_CHUNK_TOKENS)
+    log(f"  📦 {role} trace too big to re-send; compacting in "
+        f"{len(parts)} pass(es).", verbose)
+    summary = ""
+    for i, part in enumerate(parts, 1):
+        summary = _compact_pass(part, summary, tail, i, len(parts), verbose)
+    return summary
+
+
+def _resume_compacted(
+    role: str,
+    system_prompt: str,
+    user_prompt: str,
+    thinking: str,
+    content: str,
+    think: Any,
+    verbose: bool,
+) -> str:
+    """Pi-style overflow recovery after a truncated call.
+
+    Compacts the reasoning trace (the scratch, summarised), keeps the task
+    prompt and the answer-so-far verbatim (the recent work), and asks the
+    model to resume from the cut with the whole headroom of the now-smaller
+    prompt: P + summary + C is strictly less than P + trace + C was. Returns
+    the completed answer, or "" to fall through to "ceiling" — one attempt,
+    and a truncation there means the answer genuinely did not fit the window.
+    """
+    tail = content[-COMPACT_TAIL_CHARS:]
+    summary = _compact_trace(role, thinking, tail, verbose)
+
+    parts = [
+        user_prompt,
+        "---",
+        "Your previous attempt at this task was cut off by the context "
+        "limit.",
+    ]
+    if summary:
+        parts += [
+            "Summary of your reasoning trace (what is established, where it "
+            "stopped, what it cited):",
+            summary,
+        ]
+    if content.strip():
+        parts += [
+            "Your answer so far, verbatim, ending exactly where it was cut "
+            "off:",
+            content,
+            "Resume from exactly that point and finish the answer. Do not "
+            "repeat anything already written.",
+        ]
+    else:
+        parts += [
+            "Your previous answer had not started: the limit was hit during "
+            "reasoning. Using the summary as your notes, write the complete "
+            "answer now.",
+        ]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+    room = _headroom(messages, REASONING_OPTIONS["num_ctx"])
+    if room < COMPACT_MIN_ROOM:
+        log(f"  ⛔ {role} compaction left only ~{room} tokens of room; not "
+            f"enough to continue.", verbose)
+        return ""
+    options = {
+        **REASONING_OPTIONS,
+        "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
+        "num_predict": room,
+    }
+    want_think = think if (think is not None and think is not False) else None
+    try:
+        reply = BACKEND.chat(messages, think=want_think, schema=None,
+                             options=options)
+    except (requests.RequestException, ValueError, KeyError) as e:
+        log(f"  ⚠️  {role} continuation transport error: {e}", verbose)
+        return ""
+    cont_content, _ = _split_inline_thinking(reply.content or "",
+                                             reply.thinking or "")
+    if reply.truncated:
+        log(f"  ⛔ {role} continuation was truncated again; the answer does "
+            f"not fit the window.", verbose)
+        return ""
+    if not cont_content.strip():
+        log(f"  ⚠️  {role} continuation returned empty content.", verbose)
+        return ""
+    return cont_content.strip()
 
 
 def reason(
@@ -525,8 +750,13 @@ def reason(
     task is too large, not that the call failed.
 
     Truncated output is never returned as if it were complete: `done_reason ==
-    "length"` means the model was cut off mid-sentence, so we grow the budget
-    and retry rather than shipping a stump downstream.
+    "length"` means the model was cut off mid-sentence, and the budget already
+    covers the whole window. Before a truncation is reported as "ceiling" the
+    exchange gets one pi-style compaction rescue — the thinking trace
+    summarised, the answer written so far kept verbatim, the model asked to
+    resume from the cut (see _resume_compacted); a truncation that survives
+    that, or leaves nothing to resume from, means the task is too large for
+    the window.
     """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -535,62 +765,58 @@ def reason(
     options: Dict[str, Any] = {
         **REASONING_OPTIONS,
         "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
-        "num_predict": NUM_PREDICT_REASONING.get(role, 12288),
+        # As much room as the window has left, recomputed for this prompt:
+        # the prompt differs every iteration and every role, and there is no
+        # point asking for more than the window holds or less than it does.
+        "num_predict": _headroom(messages, REASONING_OPTIONS["num_ctx"]),
     }
     # `think` is passed through as a request. The backend reconciles it with
     # the probed capabilities and never sends False, whatever we ask for.
     want_think = think if (think is not None and think is not False) else None
 
-    last_partial = ""
     for attempt in range(1, LLM_MAX_RETRIES + 1):
         try:
             reply = BACKEND.chat(messages, think=want_think, schema=None,
                                  options=options)
             content = reply.content or ""
             thinking = reply.thinking or ""
+            content, thinking = _split_inline_thinking(content, thinking)
 
             hit_ceiling = reply.truncated
-            if not thinking and "<think>" in content:
-                # Model inlined its reasoning instead of separating it.
-                m = re.search(r"<think>(.*?)</think>", content, re.DOTALL)
-                if m:
-                    thinking = m.group(1).strip()
-                content = _THINK_RE.sub("", content).strip()
 
             if content.strip() and not hit_ceiling:
                 return content.strip(), ""
 
             if hit_ceiling:
-                budget = options["num_predict"]
                 spent = reply.eval_tokens or (len(thinking) + len(content)) // 4
                 log(
-                    f"  ⚠️  {role} was cut off at num_predict={budget} "
-                    f"(generated {spent} tokens, "
+                    f"  ⛔ {role} hit the context wall "
+                    f"(num_ctx={options['num_ctx']}, generated {spent} tokens, "
                     f"~{len(thinking) // 4} of them thinking).",
                     verbose,
                 )
-                if content.strip():
-                    last_partial = content.strip()
-                room = _headroom(messages, options["num_ctx"])
-                new = min(budget * 2, room)
-                if new > budget and attempt < LLM_MAX_RETRIES:
-                    options["num_predict"] = new
-                    log(f"     retrying with num_predict={new}.", verbose)
-                    continue
-                # No headroom left: the window itself is the limit.
-                log(
-                    f"  ⛔ {role} exhausted the context window "
-                    f"(num_ctx={options['num_ctx']}, room={room}).",
-                    verbose,
-                )
+                # One pi-style compaction rescue, when there is something to
+                # resume from: the trace gets summarised, the answer-so-far
+                # is kept verbatim, and the model is asked to finish from the
+                # cut. Any failure falls through to "ceiling" below, which the
+                # callers already handle.
+                if COMPACT_ENABLED and (thinking.strip() or content.strip()):
+                    resumed = _resume_compacted(
+                        role, system_prompt, user_prompt, thinking, content,
+                        want_think, verbose,
+                    )
+                    if resumed:
+                        log(f"  ✅ {role} completed after compaction + "
+                            f"continuation.", verbose)
+                        return resumed, ""
                 return "", "ceiling"
 
             log(f"  ⚠️  {role} returned empty content (attempt {attempt}).", verbose)
         except (requests.RequestException, ValueError, KeyError) as e:
             log(f"  ⚠️  {role} transport error (attempt {attempt}): {e}", verbose)
 
-    # Retries exhausted. A truncated draft beats nothing, but flag it as such.
-    return (last_partial, "ceiling") if last_partial else ("", "")
+    # Retries exhausted on empty replies or transport errors; nothing to salvage.
+    return "", ""
 
 
 def extract(
@@ -632,9 +858,7 @@ def extract(
         options = dict(EXTRACT_OPTIONS)
         call_messages = messages
         if not use_schema:
-            # Free-form mode: the model may think first, so it needs a real
-            # budget, and the schema moves from grammar to prompt.
-            options["num_predict"] = max(NUM_PREDICT_EXTRACT * 4, 4096)
+            # Free-form mode: the schema moves from grammar to prompt.
             call_messages = [
                 {
                     "role": "system",
@@ -644,6 +868,12 @@ def extract(
                     + json.dumps(schema),
                 },
             ] + messages[1:]
+        # The extraction is a copy of the source, so it can be as long as the
+        # source was; give it whatever this (larger) prompt leaves of the
+        # window. That may be less than the source itself — the source plus a
+        # copy of it do not always both fit — which is window physics, not a
+        # budget to be nudged.
+        options["num_predict"] = _headroom(call_messages, options["num_ctx"])
 
         content: Optional[str] = None
         try:
@@ -848,6 +1078,76 @@ def log_candidates(
     log(interaction.render(screened, plan_summary), verbose)
 
 
+def select_lemma(
+    usable: List[Dict[str, Any]],
+    dag: Dict[str, Any],
+    conjecture: str,
+    plan_summary: str,
+    failed_attempts: Dict[str, List[str]],
+    verbose: bool,
+) -> Dict[str, Any]:
+    """Ask the selector agent to pick, from the candidates that survived
+    screening, the one it judges most likely to come through the prover and
+    the verifiers.
+
+    The planner's best-first order is the fallback, not the default: if the
+    selector fails, runs out of room, or names a lemma it was not offered, the
+    first offered candidate is taken — which is what automation did before the
+    selector existed, and which keeps --mode auto able to make progress even
+    when this extra call goes wrong.
+    """
+    selector_sys = load_file(PROMPT_PATHS["selector.md"])
+    selector_user = (
+        f"Conjecture:\n{conjecture}\n\n"
+        f"Planner's strategy summary:\n{plan_summary or '(none)'}\n\n"
+        f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}\n\n"
+        f"Previously rejected attempts (routes the prover and the verifiers "
+        f"have already found wanting):\n"
+        f"{json.dumps(failed_attempts, indent=2)}\n\n"
+        f"Candidate lemmas, in the order the planner offered them. Exactly "
+        f"one will be sent to the prover; choose from these only:\n"
+        f"{json.dumps(usable, indent=2)}"
+    )
+    text, _status = reason(selector_sys, selector_user, "selector",
+                           THINK["selector"], verbose)
+    check_mode_toggle(verbose)
+
+    res: Optional[Dict[str, Any]] = None
+    if text:
+        # selector.md demands raw JSON output; extraction is the fallback.
+        res = parse_json_or_none(text)
+        if res is None:
+            res = extract(
+                "Extract the selector's decision. selected_id must be one of "
+                "the offered candidate ids, copied verbatim.",
+                text,
+                SELECTOR_SCHEMA,
+                "selector",
+                verbose,
+            )
+    res = res or {}
+    selected_id = str(res.get("selected_id") or "").strip()
+    for cand in usable:
+        if cand["id"] == selected_id:
+            log(f"🧭 Selector picked {cand['id']}.", verbose)
+            return cand
+
+    if not text or not selected_id:
+        log(
+            f"⚠️  Selector gave no usable choice; taking the first candidate "
+            f"instead ({usable[0]['id']}).",
+            verbose,
+        )
+    else:
+        log(
+            f"⚠️  Selector chose {selected_id!r}, which was not among the "
+            f"candidates offered; taking the first candidate instead "
+            f"({usable[0]['id']}).",
+            verbose,
+        )
+    return usable[0]
+
+
 def check_mode_toggle(verbose: bool = True) -> None:
     """Apply a hotkey press, if one has landed since the last check.
 
@@ -897,13 +1197,15 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         return load_dag()
 
     planner_sys = load_file(PROMPT_PATHS["planner.md"])
+    selector_sys = load_file(PROMPT_PATHS["selector.md"])
     prover_sys = load_file(PROMPT_PATHS["prover.md"])
     verifier_sys = load_file(PROMPT_PATHS["verifier.md"])
     reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
 
     empty = [name for name, text in (
-        ("planner.md", planner_sys), ("prover.md", prover_sys),
-        ("verifier.md", verifier_sys), ("reviser.md", reviser_sys),
+        ("planner.md", planner_sys), ("selector.md", selector_sys),
+        ("prover.md", prover_sys), ("verifier.md", verifier_sys),
+        ("reviser.md", reviser_sys),
     ) if not text]
     if empty:
         # A missing system prompt does not crash — it produces an agent with
@@ -984,7 +1286,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         # ---------------- Step 1b: Selection ----------------
         # The one place the two modes differ, and so the one place MODE is
         # read. Everything after this block runs identically whether the lemma
-        # was chosen by a person or by the screener, which is what keeps
+        # was chosen by a person or by the selector, which is what keeps
         # --mode auto honest as a control.
         next_lemma: Optional[Dict[str, Any]] = None
         if MODE == "human":
@@ -1034,9 +1336,13 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 next_lemma = choice.lemma
 
         if next_lemma is None:
-            # Automatic selection. planner.md orders the shortlist best-first,
-            # so the first candidate that survives screening is the one the
-            # planner would have proposed alone — hence "as before".
+            # Automatic selection. Screening removes the candidates whose ids
+            # are already in the DAG; of what survives, the selector agent
+            # weighs each one and names the one it judges most likely to
+            # succeed.
+            # The planner's best-first order is only the fallback: with
+            # exactly one candidate surviving there is nothing to choose, and
+            # select_lemma() itself falls back when the selector fails.
             log_candidates(screened, summary, verbose)
             usable = [cand for cand, problems in screened if not problems]
             if not usable:
@@ -1046,12 +1352,17 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                         f"Planning error: {'; '.join(problems)}."
                     )
                 continue
-            next_lemma = usable[0]
-            if next_lemma is not screened[0][0]:
-                log(
-                    f"↷ Skipped {screened[0][0]['id']} "
-                    f"({'; '.join(screened[0][1])}); took {next_lemma['id']}.",
-                    verbose,
+            if len(usable) == 1:
+                next_lemma = usable[0]
+                if next_lemma is not screened[0][0]:
+                    log(
+                        f"↷ Skipped {screened[0][0]['id']} "
+                        f"({'; '.join(screened[0][1])}); took {next_lemma['id']}.",
+                        verbose,
+                    )
+            else:
+                next_lemma = select_lemma(
+                    usable, dag, conjecture, summary, failed_attempts, verbose
                 )
 
         lemma_id = next_lemma["id"]

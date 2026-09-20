@@ -3,7 +3,7 @@
 Layout:
 
     conjectures/
-      curve_indices/
+      algebra_example/
         conjecture.md              <- required, the only mandatory file
         dag.json                   <- shared by every model and backend
         prover.md                  <- optional per-conjecture prompt override
@@ -11,7 +11,7 @@ Layout:
         conjecture.md
 
     agents/
-      planner.md  prover.md  verifier.md  reviser.md      <- project-wide defaults
+      planner.md  selector.md  prover.md  verifier.md  reviser.md  <- project-wide defaults
 
 Two decisions worth flagging, both changeable:
 
@@ -44,7 +44,7 @@ CONJECTURES_ROOT = "conjectures"
 CONJECTURE_FILENAME = "conjecture.md"
 DAG_FILENAME = "dag.json"
 AGENTS_DIR = "agents"
-PROMPT_FILES = ("planner.md", "prover.md", "verifier.md", "reviser.md")
+PROMPT_FILES = ("planner.md", "selector.md", "prover.md", "verifier.md", "reviser.md")
 
 
 class ConjectureNotFound(Exception):
@@ -53,9 +53,9 @@ class ConjectureNotFound(Exception):
 
 @dataclass
 class RunPaths:
-    root: Path                  # conjectures/curve_indices
-    conjecture: Path            # conjectures/curve_indices/conjecture.md
-    dag: Path                   # conjectures/curve_indices/dag.json
+    root: Path                  # conjectures/algebra_example
+    conjecture: Path            # conjectures/algebra_example/conjecture.md
+    dag: Path                   # conjectures/algebra_example/dag.json
     prompts: Dict[str, Path]    # "prover.md" -> resolved path
     overridden_prompts: List[str]
 
@@ -78,10 +78,10 @@ def resolve(
     """Turn a conjecture name into every path the run needs.
 
     `name` is accepted in whichever form is convenient:
-        curve_indices
-        conjectures/curve_indices
-        conjectures/curve_indices/          (trailing slash, from tab-completion)
-        /abs/path/to/curve_indices
+        algebra_example
+        conjectures/algebra_example
+        conjectures/algebra_example/          (trailing slash, from tab-completion)
+        /abs/path/to/algebra_example
     """
     candidate = Path(name.rstrip("/\\"))
     for guess in (candidate, project_root / CONJECTURES_ROOT / candidate.name):

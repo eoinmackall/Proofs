@@ -55,7 +55,7 @@ class Profile:
     """What we know about the loaded model. Probed where possible."""
     name: str
     backend: str
-    context_limit: int = 40960     # tokens the *server* will actually allow
+    context_limit: int = 65536     # tokens the *server* will actually allow
     supports_thinking: bool = False
     thinking_levels: bool = False  # accepts "low"/"high"/"max", not just bool
     context_is_fixed: bool = False # True for llama.cpp: set with -c at launch
@@ -409,8 +409,8 @@ def describe(prof: Profile, requested_ctx: int) -> str:
         )
     if not prof.supports_thinking:
         lines.append(
-            "  ⚠️  No thinking capability reported. The prover's num_predict "
-            "budget assumes a reasoning trace, so it will be far larger than "
-            "needed and truncation heuristics will not fire as designed."
+            "  ⚠️  No thinking capability reported. The generation budget "
+            "assumes a reasoning trace, so it will be far larger than needed "
+            "— harmless, since num_predict is a ceiling, not a target."
         )
     return "\n".join(lines)

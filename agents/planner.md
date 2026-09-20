@@ -29,9 +29,9 @@ and safer step, and — where the state of the proof allows — one ambitious
 step that would close a large gap if it succeeded.
 
 Rules:
-- Each candidate must be provable from the already-proved lemmas alone. A
-  candidate that would need one of the other four candidates first is not
-  admissible; propose the prerequisite itself instead.
+- Each candidate must be provable from the already-proved lemmas and standard
+  mathematical results. A candidate that would need one of the other four candidates 
+  first is not admissible; propose the prerequisite itself instead.
 - Every candidate id must be unique within the list and must not reuse the id
   of an already-proved lemma.
 - Do not re-propose an already-proved lemma statement.
