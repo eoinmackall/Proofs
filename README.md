@@ -50,13 +50,16 @@ which server is listening.
 ### When a call hits the context wall
 
 The server is stateless, so a response cut off by the context window cannot
-just be re-sent. Before reporting a ceiling, `reason()` does one pi-style
+just be re-sent. Before reporting a ceiling, `reason()` runs pi-style
 compaction: the thinking trace (scratch) is summarised into a structured
 summary — in chunked passes if it is big — the answer written so far is kept
 verbatim, and the model is asked to resume from the cut with the whole
-headroom of the now-smaller prompt. If that continuation also truncates, the
-lemma is reported as too large for the window and the usual decomposition
-escape hatches take over.
+headroom of the now-smaller prompt. The passes are unbounded: a continuation
+that hits the wall itself becomes the next pass's input, its trace folded
+into the summary, its text extending the verbatim answer, until the answer
+completes. Only when a pass leaves nothing to build on (or no headroom left)
+is the lemma reported as too large for the window, and the usual
+decomposition escape hatches take over.
 
 ### Backends
 
@@ -92,7 +95,14 @@ python src/main.py --conjecture algebra_example --backend llamacpp \
 python src/main.py --conjecture algebra_example --no-verbose --max-iterations 25
 python src/main.py --conjecture algebra_example --mode human
 python src/main.py --conjecture algebra_example --verify-passes 5
+
+# once, before proving: parse the conjecture's reference collection
+python src/parsing.py --conjecture algebra_example
 ```
+
+`parsing.py` shares main.py's backend options (`--backend`, `--host`,
+`--model`, `--num-ctx`) and its `--conjecture NAME` / `--verbose` pair; it
+has no proving options, because it has no loop.
 
 ### CLI options
 
@@ -130,8 +140,10 @@ a line of input in the other.
 ```
 agents/
   planner.md  selector.md  prover.md  verifier.md  reviser.md   # default agent prompts
+  parsing.md                               # references parser prompt
 src/
   main.py              # the proof loop (planner → selector → prover → verifier → reviser)
+  parsing.py           # standalone references/ → references.md parser
   llm_backend.py       # backend transports (Ollama, llama.cpp) + model profiles
   interaction.py       # human-in-the-loop menu + hotkey
   workspace.py         # per-conjecture run directories and prompt resolution
@@ -139,6 +151,8 @@ conjectures/
   algebra_example/
     conjecture.md          # required: the statement
     dag.json               # shared by every model and backend
+    references/            # optional: source files (.tex/.md/plain text) to parse
+    references.md          # parsed theorem-level results (strict JSON array)
     prover.md              # optional per-conjecture prompt override
 flake.nix                  # Nix dev shell
 ```
@@ -156,3 +170,54 @@ give a model its own file with `--dag` if you want them isolated again.
 Prompt files are looked up in the conjecture directory first, then in
 `agents/`, so a conjecture that needs a special prompt (e.g. a prover primed
 for Brauer groups) can carry one without forking the defaults.
+
+### References
+
+A conjecture can ship a `references/` directory: chapters, surveys or
+papers, as `.tex`, `.md` or plain text, that the agents may lean on. The
+directory is parsed by a standalone tool, not by the proving loop:
+
+```sh
+python src/parsing.py --conjecture algebra_example
+```
+
+reads every parsable file in `references/`, asks the model (via
+`agents/parsing.md`) for the theorem-level results, and writes them to
+`references.md` beside the DAG as a **strict JSON array** — one object per
+result with `id`, `slogan`, `formal statement`, `reference` (where it appears
+in the file) and `tags`. `main.py` then feeds that file to the loop at three
+different granularities:
+
+- **Planner** — an `id` + `slogan` shortlist, and only while the collection
+  is small: below `PLANNER_REFERENCE_LIMIT` (20) entries it gets every
+  result, at or above it none. A shortlist of hundreds of slogans costs
+  more than it returns, and the prover sees the full collection anyway, so
+  a named result the planner misses is one round away, not lost. A strategy
+  for large collections is deliberately not built yet.
+- **Prover** — the whole collection unconditionally (id, slogan, formal
+  statement, tags). It may cite any entry by `id` in `cited_lemmas` and
+  rely on it without proving it, exactly like a proved lemma.
+- **Verifier** — only the formal statements of the results the proof
+  actually cites, merged with the cited DAG lemmas into one set. The rest
+  of the collection is withheld on purpose: a proof that leans on a result
+  it never cited must read as an unjustified leap, and the verifier is
+  told that citing a reference is legitimate while proving it inline is
+  not.
+
+Two properties of the parser matter for resuming:
+
+- **Ids are stable across re-parses.** `ref_N` numbers are assigned by the
+  tool, never by the model; a result whose formal statement matches an
+  existing entry keeps its id, so a DAG that cites `ref_3` still means the
+  same thing after you add a chapter to `references/` and re-run.
+- **Re-parses are a union.** Entries from a previous `references.md` whose
+  statements were not re-derived this run are kept, so a flaky parse of one
+  file cannot silently delete a result another proof cites. An empty
+  `references/` directory never touches an existing `references.md`. There is
+  no clear mode: to reset the collection, delete or rewrite `references.md`
+  (a DAG that cited its entries will warn about the dangling ids) — deleting
+  it and re-running `parsing.py` is the cleanest way to start over.
+
+A run without `references/` or `references.md` is exactly the old run:
+every prompt degrades to its pre-references form, which is also the failure
+mode for a corrupt `references.md` (it warns once and is ignored).

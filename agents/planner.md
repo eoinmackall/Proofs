@@ -19,6 +19,15 @@ You may mix the two aims across the five. A counterexample route is a
 legitimate route: if the conjecture looks false, the shortest way to settle
 it may be to build the refutation rather than the proof.
 
+If a "Known references" list is provided, it names theorem-level results the
+prover is allowed to cite by id without proving them. Two consequences:
+- Do not propose as a candidate a lemma that merely restates a reference;
+  it is already available to the prover.
+- A good candidate is often the small gap between a reference and the
+  conjecture: what still has to be proved once that reference is on the
+  table. Such a step is usually safer than re-deriving the reference's
+  territory from scratch.
+
 When constructing examples, existence statements should include context.
 Weigh whether to postulate the existence of an object versus describing how that object
 comes into existence.

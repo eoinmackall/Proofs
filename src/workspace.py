@@ -6,6 +6,8 @@ Layout:
       algebra_example/
         conjecture.md              <- required, the only mandatory file
         dag.json                   <- shared by every model and backend
+        references/                <- optional: .tex/.md files for parsing.py
+        references.md              <- optional: strict-JSON refs, parsing.py's output
         prover.md                  <- optional per-conjecture prompt override
       some_other_problem/
         conjecture.md
@@ -36,6 +38,7 @@ Two decisions worth flagging, both changeable:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -43,8 +46,19 @@ from typing import Dict, List, Optional
 CONJECTURES_ROOT = "conjectures"
 CONJECTURE_FILENAME = "conjecture.md"
 DAG_FILENAME = "dag.json"
+# parsing.py's input: a directory of .tex/.md/plain-text files to parse.
+# Its output: references.md, a strict-JSON array of
+# { id, slogan, "formal statement", reference, tags } objects that main.py
+# feeds to the planner, the prover and the verifier.
+REFERENCES_DIRNAME = "references"
+REFERENCES_FILENAME = "references.md"
 AGENTS_DIR = "agents"
-PROMPT_FILES = ("planner.md", "selector.md", "prover.md", "verifier.md", "reviser.md")
+# Every prompt the loop can load, and therefore every per-conjecture override
+# that is meaningful. parsing.md is the standalone parser's (parsing.py's).
+PROMPT_FILES = (
+    "planner.md", "selector.md", "prover.md", "verifier.md", "reviser.md",
+    "parsing.md",
+)
 
 
 class ConjectureNotFound(Exception):
@@ -56,6 +70,8 @@ class RunPaths:
     root: Path                  # conjectures/algebra_example
     conjecture: Path            # conjectures/algebra_example/conjecture.md
     dag: Path                   # conjectures/algebra_example/dag.json
+    references_dir: Path        # conjectures/algebra_example/references/ (input)
+    references: Path            # conjectures/algebra_example/references.md
     prompts: Dict[str, Path]    # "prover.md" -> resolved path
     overridden_prompts: List[str]
 
@@ -117,6 +133,8 @@ def resolve(
             prompts[fname] = project_root / AGENTS_DIR / fname
 
     return RunPaths(root=root, conjecture=conjecture, dag=dag,
+                    references_dir=root / REFERENCES_DIRNAME,
+                    references=root / REFERENCES_FILENAME,
                     prompts=prompts, overridden_prompts=overridden)
 
 
@@ -139,6 +157,25 @@ def describe(paths: RunPaths) -> str:
             f"{', '.join(legacy)} — rename one to {DAG_FILENAME} to carry it "
             f"forward, or pass --dag"
         )
+    if paths.references_dir.is_dir():
+        n_files = sum(1 for p in paths.references_dir.iterdir() if p.is_file())
+        lines.append(
+            f"  references={paths.references_dir.name}/ ({n_files} file(s) for "
+            f"parsing.py)"
+        )
+    if paths.references.is_file():
+        try:
+            entries = json.loads(paths.references.read_text(encoding="utf-8"))
+            n = len(entries) if isinstance(entries, list) else -1
+        except (OSError, json.JSONDecodeError):
+            n = -1
+        if n < 0:
+            lines.append(
+                f"  ⚠ references={paths.references.name} is not valid JSON; "
+                f"the loop will ignore it"
+            )
+        else:
+            lines.append(f"  references={paths.references.name} ({n} entries)")
     if paths.overridden_prompts:
         lines.append(
             f"  ✎ local prompt overrides: {', '.join(paths.overridden_prompts)}"

@@ -64,14 +64,17 @@ When a call runs into the context wall
 --------------------------------------
 The server is stateless, so a truncated exchange — prompt, thinking trace,
 answer-so-far, summing to about num_ctx — cannot be re-sent whole. reason()
-therefore gets one pi-style compaction rescue before reporting "ceiling":
+therefore gets pi-style compaction rescues before reporting "ceiling":
 the thinking trace (scratch, regenerable) is summarised into a structured
 summary — Goal, Progress, Key Decisions, Next Steps, Critical Context, plus
 a <cited-lemmas> tracking block — in chunked passes if it is big; the task
 prompt and the answer written so far are kept verbatim, the answer ending
 exactly where it was cut; and the model is asked to resume from the cut with
-the whole headroom of the now-smaller prompt. One compaction and one
-continuation per call; any failure degrades to the "ceiling" the
+the whole headroom of the now-smaller prompt. The passes are unbounded: a
+continuation that hits the wall itself becomes the next pass's input, its
+trace folded into the summary, its text extending the verbatim answer, so
+the loop runs as long as the answer keeps advancing. Only a pass that leaves
+nothing to build on, or no headroom left, degrades to the "ceiling" the
 planner/prover/verifier callers already handle.
 
 In --mode human the picker is a person, and picking is two decisions rather
@@ -100,6 +103,14 @@ Usage
     python main.py --conjecture algebra_example --no-verbose --max-iterations 25
     python main.py --conjecture algebra_example --mode human
     python main.py --conjecture algebra_example --verify-passes 5
+    python parsing.py --conjecture algebra_example
+
+parsing.py is standalone: it reads conjectures/<name>/references/ (any .tex
+or .md file in it), asks the model for the theorem-level results, and writes
+them as a strict-JSON array to conjectures/<name>/references.md. main.py then
+offers those references to the prover (citable by id), to the verifier (the
+formal statements of the cited ones only) and to the planner (an id + slogan
+shortlist, only while the collection is small enough to be one).
 
 --conjecture names a directory under conjectures/ holding a conjecture.md.
 The DAG is written beside it as dag.json and shared by every model: point a
@@ -138,6 +149,7 @@ PROFILE: Any = None
 # so these are paths rather than the bare filenames they used to be.
 CONJECTURE_FILE = ""
 DAG_FILE = ""
+REFERENCES_FILE = ""
 PROMPT_PATHS: Dict[str, str] = {name: name for name in workspace.PROMPT_FILES}
 
 MAX_ITERATIONS = 10
@@ -148,6 +160,16 @@ REQUEST_TIMEOUT = 1800       # Thinking models are slow; give them room
 # planner tokens and, in human mode, attention; five is about as many
 # candidates as can be compared without re-reading the conjecture.
 PLANNER_CANDIDATES = 5
+
+# How many parsed references (references.md) the planner is shown at all. The
+# rule is deliberately blunt: below the limit the planner gets an id + slogan
+# per result, so it can build on a named theorem rather than re-prove it from
+# scratch; at or above it, none. A shortlist of hundreds of slogans costs
+# more in tokens and attention than it returns, and the prover sees the full
+# collection regardless, so a named result the planner misses is one proving
+# round away, not lost. A strategy for large collections is deliberately not
+# built yet.
+PLANNER_REFERENCE_LIMIT = 20
 
 # The proof loop: how many independent verifier passes must all accept the
 # same proof before a lemma enters the DAG, and how many prover rounds one
@@ -192,6 +214,7 @@ THINK = {
     "prover": True,
     "verifier": True,
     "reviser": True,
+    "parser": True,   # parsing.py: reading mathematics, then extracting it
 }
 
 # Sampling. The presence penalty is the delicate one: it pushes the model off
@@ -231,11 +254,14 @@ TEMPERATURES = {
     "verifier": 0.8,   # Looser, so the repeated verification passes don't
                        # collapse into one review of the first pass.
     "reviser": 0.7,    # Diagnosing a failure is planning-scale judgement.
+    "parser": 0.3,     # Extracting from a fixed source, not exploring.
 }
 
 # Pi-style compaction on the context wall: a truncated call is resumed by
 # summarising its thinking trace and re-sending task + answer-so-far (see
-# _resume_compacted, between _headroom and reason below). COMPACT_CHUNK_TOKENS
+# _resume_compacted, between _headroom and reason below). A truncated
+# continuation is not a failure but the next pass, so the passes run until
+# the answer completes (or nothing is left to build on). COMPACT_CHUNK_TOKENS
 # bounds one compaction pass's input, COMPACT_TAIL_CHARS is what the compactor
 # sees of the answer-so-far, COMPACT_MIN_ROOM is the smallest headroom a
 # continuation is worth attempting.
@@ -641,16 +667,20 @@ def _compact_pass(part: str, prev: str, tail: str,
     return summary
 
 
-def _compact_trace(role: str, thinking: str, tail: str, verbose: bool) -> str:
+def _compact_trace(role: str, thinking: str, tail: str, verbose: bool,
+                   prev_summary: str = "") -> str:
     """Summarise a cut-off reasoning trace in pi-style passes: chunked, each
-    pass folding the previous summary in. Returns the summary, or "" when the
-    trace was empty or nothing survived the passes."""
+    pass folding the previous summary in. prev_summary carries an earlier
+    compaction round's result across, so a trace compacted in several rounds
+    (a continuation that itself hit the wall) never loses what the first
+    rounds established. Returns the summary, or prev_summary unchanged when
+    the trace was empty or nothing survived the passes."""
     if not thinking.strip():
-        return ""
+        return prev_summary
     parts = _split_trace_chunks(thinking, COMPACT_CHUNK_TOKENS)
     log(f"  📦 {role} trace too big to re-send; compacting in "
         f"{len(parts)} pass(es).", verbose)
-    summary = ""
+    summary = prev_summary
     for i, part in enumerate(parts, 1):
         summary = _compact_pass(part, summary, tail, i, len(parts), verbose)
     return summary
@@ -667,73 +697,94 @@ def _resume_compacted(
 ) -> str:
     """Pi-style overflow recovery after a truncated call.
 
-    Compacts the reasoning trace (the scratch, summarised), keeps the task
-    prompt and the answer-so-far verbatim (the recent work), and asks the
-    model to resume from the cut with the whole headroom of the now-smaller
-    prompt: P + summary + C is strictly less than P + trace + C was. Returns
-    the completed answer, or "" to fall through to "ceiling" — one attempt,
-    and a truncation there means the answer genuinely did not fit the window.
-    """
-    tail = content[-COMPACT_TAIL_CHARS:]
-    summary = _compact_trace(role, thinking, tail, verbose)
+    One pass: compact the reasoning trace (the scratch, summarised), keep
+    the task prompt and the answer-so-far verbatim (the recent work), and
+    ask the model to resume from the cut with the whole headroom of the
+    now-smaller prompt: P + summary + C is strictly less than P + trace + C
+    was.
 
-    parts = [
-        user_prompt,
-        "---",
-        "Your previous attempt at this task was cut off by the context "
-        "limit.",
-    ]
-    if summary:
-        parts += [
-            "Summary of your reasoning trace (what is established, where it "
-            "stopped, what it cited):",
-            summary,
-        ]
-    if content.strip():
-        parts += [
-            "Your answer so far, verbatim, ending exactly where it was cut "
-            "off:",
-            content,
-            "Resume from exactly that point and finish the answer. Do not "
-            "repeat anything already written.",
-        ]
-    else:
-        parts += [
-            "Your previous answer had not started: the limit was hit during "
-            "reasoning. Using the summary as your notes, write the complete "
-            "answer now.",
-        ]
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "\n\n".join(parts)},
-    ]
-    room = _headroom(messages, REASONING_OPTIONS["num_ctx"])
-    if room < COMPACT_MIN_ROOM:
-        log(f"  ⛔ {role} compaction left only ~{room} tokens of room; not "
-            f"enough to continue.", verbose)
-        return ""
-    options = {
-        **REASONING_OPTIONS,
-        "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
-        "num_predict": room,
-    }
+    The passes are not bounded by a count. When a continuation hits the wall
+    itself, its trace and answer-so-far become the next pass's input — the
+    summary carries across rounds, so nothing established earlier is lost —
+    and the model resumes from the new cut. The loop ends when the answer
+    completes, when a pass leaves nothing to build on, or when the prompt
+    plus the verbatim answer runs out of headroom; those return "" and fall
+    through to "ceiling", which the callers already handle.
+    """
+    answer = content
+    summary = ""
     want_think = think if (think is not None and think is not False) else None
-    try:
-        reply = BACKEND.chat(messages, think=want_think, schema=None,
-                             options=options)
-    except (requests.RequestException, ValueError, KeyError) as e:
-        log(f"  ⚠️  {role} continuation transport error: {e}", verbose)
-        return ""
-    cont_content, _ = _split_inline_thinking(reply.content or "",
-                                             reply.thinking or "")
-    if reply.truncated:
-        log(f"  ⛔ {role} continuation was truncated again; the answer does "
-            f"not fit the window.", verbose)
-        return ""
-    if not cont_content.strip():
-        log(f"  ⚠️  {role} continuation returned empty content.", verbose)
-        return ""
-    return cont_content.strip()
+    while True:
+        tail = answer[-COMPACT_TAIL_CHARS:]
+        summary = _compact_trace(role, thinking, tail, verbose, summary)
+
+        parts = [
+            user_prompt,
+            "---",
+            "Your previous attempt at this task was cut off by the context "
+            "limit.",
+        ]
+        if summary:
+            parts += [
+                "Summary of your reasoning trace (what is established, where "
+                "it stopped, what it cited):",
+                summary,
+            ]
+        if answer.strip():
+            parts += [
+                "Your answer so far, verbatim, ending exactly where it was "
+                "cut off:",
+                answer,
+                "Resume from exactly that point and finish the answer. Do "
+                "not repeat anything already written.",
+            ]
+        else:
+            parts += [
+                "Your previous answer had not started: the limit was hit "
+                "during reasoning. Using the summary as your notes, write "
+                "the complete answer now.",
+            ]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "\n\n".join(parts)},
+        ]
+        room = _headroom(messages, REASONING_OPTIONS["num_ctx"])
+        if room < COMPACT_MIN_ROOM:
+            log(f"  ⛔ {role} compaction left only ~{room} tokens of room; "
+                f"not enough to continue.", verbose)
+            return ""
+        options = {
+            **REASONING_OPTIONS,
+            "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
+            "num_predict": room,
+        }
+        try:
+            reply = BACKEND.chat(messages, think=want_think, schema=None,
+                                 options=options)
+        except (requests.RequestException, ValueError, KeyError) as e:
+            log(f"  ⚠️  {role} continuation transport error: {e}", verbose)
+            return ""
+        cont_content, cont_thinking = _split_inline_thinking(
+            reply.content or "", reply.thinking or "")
+        if reply.truncated:
+            if not (cont_content.strip() or cont_thinking.strip()):
+                log(f"  ⛔ {role} continuation was truncated with nothing "
+                    f"to build on; the answer does not fit the window.",
+                    verbose)
+                return ""
+            # The continuation itself hit the wall: not a failure, the next
+            # pass. Its trace joins the summary, its content extends the
+            # verbatim answer, and the model resumes from the new cut.
+            answer += cont_content
+            thinking = cont_thinking
+            log(f"  🔁 {role} continuation hit the wall; the next pass "
+                f"compacts its trace and resumes from the new cut.",
+                verbose)
+            continue
+        if not cont_content.strip():
+            log(f"  ⚠️  {role} continuation returned empty content.", verbose)
+            return ""
+        return (answer + cont_content).strip()
 
 
 def reason(
@@ -752,11 +803,12 @@ def reason(
     Truncated output is never returned as if it were complete: `done_reason ==
     "length"` means the model was cut off mid-sentence, and the budget already
     covers the whole window. Before a truncation is reported as "ceiling" the
-    exchange gets one pi-style compaction rescue — the thinking trace
+    exchange gets pi-style compaction rescues — the thinking trace
     summarised, the answer written so far kept verbatim, the model asked to
-    resume from the cut (see _resume_compacted); a truncation that survives
-    that, or leaves nothing to resume from, means the task is too large for
-    the window.
+    resume from the cut (see _resume_compacted). The passes are unbounded:
+    a continuation that is itself truncated becomes the next pass's input,
+    and only a pass that leaves nothing to build on, or no headroom left,
+    means the task is too large for the window.
     """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -795,10 +847,12 @@ def reason(
                     f"~{len(thinking) // 4} of them thinking).",
                     verbose,
                 )
-                # One pi-style compaction rescue, when there is something to
+                # A pi-style compaction rescue, when there is something to
                 # resume from: the trace gets summarised, the answer-so-far
                 # is kept verbatim, and the model is asked to finish from the
-                # cut. Any failure falls through to "ceiling" below, which the
+                # cut — as many passes as it takes, each truncated
+                # continuation feeding the next (see _resume_compacted).
+                # Any failure falls through to "ceiling" below, which the
                 # callers already handle.
                 if COMPACT_ENABLED and (thinking.strip() or content.strip()):
                     resumed = _resume_compacted(
@@ -969,34 +1023,81 @@ def prover_context(dag: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def verifier_context(dag: Dict[str, Any], cited: List[str]) -> Dict[str, Any]:
-    """Statements of exactly the lemmas the prover claims to have used.
+def verifier_context(
+    dag: Dict[str, Any],
+    cited: List[str],
+    references: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Statements of exactly the results the prover claims to have used.
 
-    Deliberately not the whole DAG. verifier.md is asked to reject "use of
-    results not present in the provided lemma set", which only bites if the
-    set is the prover's declared citations: a proof leaning on a lemma it
-    never declared then reads as an unjustified leap, which is what it is.
+    DAG lemmas and reference results are merged into one set, keyed by id and
+    carrying the statement only. Deliberately not the whole DAG or the whole
+    reference collection: verifier.md is asked to reject "use of results not
+    present in the provided set", which only bites if the set is the prover's
+    declared citations: a proof leaning on a result it never declared then
+    reads as an unjustified leap, which is what it is.
     """
-    return {
-        "dependency_lemmas": {
-            lid: {"statement": dag["lemmas"][lid]["statement"]}
-            for lid in cited
-            if lid in dag["lemmas"]
-        }
+    statements = {
+        lid: {"statement": dag["lemmas"][lid]["statement"]}
+        for lid in cited
+        if lid in dag["lemmas"]
     }
+    for ref in references:
+        lid = str(ref.get("id") or "")
+        if lid in cited and lid not in statements:
+            statements[lid] = {
+                "statement": str(ref.get("formal statement", ""))
+            }
+    return {"cited_results": statements}
 
 
-def scan_citations(proof: str, dag: Dict[str, Any]) -> List[str]:
-    """Fallback edge recovery: which proved ids appear in the proof text.
+def scan_citations(
+    proof: str, dag: Dict[str, Any], references: List[Dict[str, Any]]
+) -> List[str]:
+    """Fallback edge recovery: which known ids appear in the proof text.
 
     Only used when the prover ignored its output format entirely, in which
-    case the alternative is a node with no edges at all — a lemma that silently
-    claims to stand on its own. Word-boundary matching, so lemma_1 does not
-    match inside lemma_10.
+    case the alternative is a node with no edges at all — a lemma that
+    silently claims to stand on its own. Scans lemma ids and reference ids;
+    word-boundary matching, so lemma_1 does not match inside lemma_10.
     """
+    ids = set(dag["lemmas"])
+    ids.update(str(r.get("id")) for r in references if r.get("id"))
     return [
-        lid for lid in dag["lemmas"]
+        lid for lid in ids
         if re.search(rf"\b{re.escape(lid)}\b", proof)
+    ]
+
+
+def load_references() -> List[Dict[str, Any]]:
+    """Load references.md — parsing.py's output.
+
+    A strict JSON array of { id, slogan, "formal statement", reference,
+    tags } objects, written once by parsing.py; this module only reads it.
+    A missing file returns [], which is exactly the pre-features run: every
+    call site degrades to the old prompts. A corrupt file warns and returns
+    [] too — the right fix is to re-run parsing.py, not to hand the loop a
+    subset. Ids (ref_N) are assigned by parsing.py, never here, so a prover
+    that cites one is citing a name the file vouches for.
+    """
+    if not REFERENCES_FILE or not os.path.exists(REFERENCES_FILE):
+        return []
+    try:
+        with open(REFERENCES_FILE, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+        if text.startswith("```"):
+            text = _FENCE_RE.sub("", text).strip()
+        data = json.loads(text)
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"⚠️  {REFERENCES_FILE} is not valid JSON ({e}); ignoring it. "
+            f"Re-run parsing.py if you expected references here.")
+        return []
+    if not isinstance(data, list):
+        log(f"⚠️  {REFERENCES_FILE} is not a JSON array; ignoring it.")
+        return []
+    return [
+        r for r in data
+        if isinstance(r, dict) and str(r.get("id") or "").strip()
     ]
 
 
@@ -1213,17 +1314,86 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         log(f"Missing or empty prompt files: {', '.join(empty)}. Aborting.", verbose)
         return load_dag()
 
+    # references.md, if parsing.py produced one. The prover gets the full
+    # collection unconditionally — it is the tool that cites — so it is
+    # rendered once here and reused on every attempt.
+    references = load_references()
+    ref_ids = {str(r["id"]) for r in references}
+    prover_refs = [
+        {
+            "id": r["id"],
+            "slogan": r.get("slogan", ""),
+            "formal statement": r.get("formal statement", ""),
+            "tags": r.get("tags", []),
+        }
+        for r in references
+    ]
+    reference_block = (
+        "\n\nKnown references (theorem-level results from the parsed "
+        "collection; you may cite any of them by id in cited_lemmas without "
+        "proving them yourself):\n"
+        + json.dumps(prover_refs, indent=2)
+        if prover_refs
+        else ""
+    )
+    # The planner only sees a small collection: below PLANNER_REFERENCE_LIMIT
+    # it gets an id + slogan per result, at or above it none. See the limit's
+    # comment for why a blunt rule beats a graded one here.
+    if references:
+        if len(references) < PLANNER_REFERENCE_LIMIT:
+            planner_ref_block = (
+                "\n\nKnown references (named theorem-level results the prover "
+                "may cite by id; the prover sees their full statements):\n"
+                + json.dumps(
+                    [
+                        {
+                            "id": r["id"],
+                            "slogan": r.get("slogan", ""),
+                            "tags": r.get("tags", []),
+                        }
+                        for r in references
+                    ],
+                    indent=2,
+                )
+            )
+        else:
+            planner_ref_block = ""
+            log(
+                f"ℹ️  {len(references)} references parsed; that is at or "
+                f"above the planner limit ({PLANNER_REFERENCE_LIMIT}), so the "
+                f"planner gets none. The prover sees them all."
+            )
+    else:
+        planner_ref_block = ""
+
     failed_attempts: Dict[str, List[str]] = {}
+    warned_dangling = set()
 
     for iteration in range(1, MAX_ITERATIONS + 1):
         log(f"\n--- Iteration {iteration}/{MAX_ITERATIONS} ---", verbose)
         check_mode_toggle(verbose)
         dag = load_dag()
 
+        # An existing DAG may cite reference ids; one that no longer exists in
+        # references.md (a re-parse dropped it) dangles every proof that used
+        # it, and the verifier would reject those for good reason. Warn once
+        # per (lemma, dependency) pair rather than every iteration.
+        known_ids = set(dag["lemmas"]) | ref_ids
+        for lid, node in dag["lemmas"].items():
+            for dep in node.get("dependencies", []):
+                if dep not in known_ids and (lid, dep) not in warned_dangling:
+                    warned_dangling.add((lid, dep))
+                    log(
+                        f"⚠️  DAG node {lid} cites {dep}, which is neither a "
+                        f"lemma nor a parsed reference; verification of it "
+                        f"will see a citation with no statement behind it."
+                    )
+
         # ---------------- Step 1: Planner ----------------
         planner_user = (
             f"Conjecture:\n{conjecture}\n\n"
-            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}\n\n"
+            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+            f"{planner_ref_block}\n\n"
             f"Previously rejected attempts (avoid or decompose these):\n"
             f"{json.dumps(failed_attempts, indent=2)}"
         )
@@ -1415,7 +1585,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             prover_user = (
                 f"Conjecture:\n{conjecture}\n\n"
                 f"Available proved lemmas:\n"
-                f"{json.dumps(prover_context(dag), indent=2)}\n\n"
+                f"{json.dumps(prover_context(dag), indent=2)}"
+                f"{reference_block}\n\n"
                 f"Lemma to prove:\n{json.dumps(target, indent=2)}\n"
                 + (
                     f"\nFeedback from the previous attempt "
@@ -1466,7 +1637,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             # format, and scanning the text beats recording a lemma as
             # standing on nothing.
             if declared is None:
-                dep_ids = scan_citations(proof, dag)
+                dep_ids = scan_citations(proof, dag, references)
                 if dep_ids:
                     log(
                         f"  ℹ️  Prover declared no citations; recovered "
@@ -1474,16 +1645,20 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                         verbose,
                     )
             else:
-                dep_ids = [c for c in declared if c in dag["lemmas"]]
-                phantom = [c for c in declared if c not in dag["lemmas"]]
+                # Citations may name DAG lemmas or parsed references; the
+                # verifier's context is the union of the two, so both are
+                # kept. A name in neither set is dropped, and the verifier is
+                # about to see a proof that leans on a result absent from its
+                # context, which is exactly the unjustified step it is meant
+                # to catch.
+                dep_ids = [c for c in declared if c in dag["lemmas"] or c in ref_ids]
+                phantom = [
+                    c for c in declared if c not in dag["lemmas"] and c not in ref_ids
+                ]
                 if phantom:
-                    # Cited something that isn't in the DAG. Dropping it here
-                    # is not a cover-up: the verifier is about to see a proof
-                    # that leans on a lemma absent from its context, which is
-                    # exactly the unjustified step it is meant to catch.
                     log(
-                        f"  ⚠️  Prover cited lemmas not in the DAG: "
-                        f"{', '.join(phantom)}.",
+                        f"  ⚠️  Prover cited ids that are neither lemmas nor "
+                        f"references: {', '.join(phantom)}.",
                         verbose,
                     )
 
@@ -1499,8 +1674,10 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             # reviser; only a proof that survives every pass is accepted.
             verifier_user = (
                 f"Conjecture:\n{conjecture}\n\n"
-                f"Available proved lemmas:\n"
-                f"{json.dumps(verifier_context(dag, dep_ids), indent=2)}\n\n"
+                f"Cited results (statements of exactly the lemmas and "
+                f"references the proof declares it used; nothing else is "
+                f"available to it):\n"
+                f"{json.dumps(verifier_context(dag, dep_ids, references), indent=2)}\n\n"
                 f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
                 f"Proposed proof:\n{proof}"
             )
@@ -1661,7 +1838,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 # CLI
 # ----------------------------------------------------------------------------
 def main() -> None:
-    global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, MAX_ITERATIONS, NUM_CTX
+    global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, REFERENCES_FILE
+    global MAX_ITERATIONS, NUM_CTX
     global BACKEND, PROFILE, PROMPT_PATHS, MODE, HOTKEY
     global VERIFY_PASSES, MAX_PROOF_ATTEMPTS
 
@@ -1760,6 +1938,7 @@ def main() -> None:
 
     CONJECTURE_FILE = str(paths.conjecture)
     DAG_FILE = str(paths.dag)
+    REFERENCES_FILE = str(paths.references)
     PROMPT_PATHS = {name: str(p) for name, p in paths.prompts.items()}
     log(workspace.describe(paths), args.verbose)
 
