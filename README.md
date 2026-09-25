@@ -29,9 +29,10 @@ Each iteration:
      lemma (`w`, or `wp` to have it proved) or send the planner back.
 3. **Prover** (`prover.md`) writes a complete, rigorous proof of the chosen
    lemma, citing only lemmas already in the DAG.
-4. **Verifier** (`verifier.md`) checks it adversarially — logic *and*
-   arithmetic. A lemma enters the DAG only after `VERIFY_PASSES` (default 3)
-   independent passes have all accepted it.
+4. **Verifiers** (`verifier_1.md`, `verifier_2.md`, `verifier_3.md`) check it
+   adversarially — logic *and* arithmetic. Verification is three atomic
+   steps, one per agent; a lemma enters the DAG only after all three have
+   accepted it. (The three files are currently identical.)
 5. **Reviser** (`reviser.md`) handles a reject: it decides whether the fault
    is in the *proof* (send the prover back with the verdict as feedback) or
    in the *statement* (return a revised statement as the prover's new target).
@@ -42,10 +43,9 @@ Each iteration:
 
 The prompts instruct each model to emit strict JSON directly, so every
 response is first parsed as-is; a schema-constrained *extraction* call only
-runs as a fallback. The underlying tension between `format` (JSON schemas)
-and `think` (reasoning) differs between the two supported backends and is
-handled inside `src/llm_backend.py`, which `src/main.py` uses without knowing
-which server is listening.
+runs as a fallback. The underlying tension there — on llama.cpp, reasoning
+silently voids the grammar — is handled inside `src/llm_backend.py`, which
+disables reasoning for exactly the calls that carry a schema.
 
 ### When a call hits the context wall
 
@@ -61,18 +61,16 @@ completes. Only when a pass leaves nothing to build on (or no headroom left)
 is the lemma reported as too large for the window, and the usual
 decomposition escape hatches take over.
 
-### Backends
+### Backend
 
-Two transports, probed at startup (`src/llm_backend.py`):
+One transport, probed at startup (`src/llm_backend.py`):
 
-- **Ollama** — native `/api/chat`; `think` as a top-level field, `format` as
-  a JSON schema, reasoning returned in `message.thinking`.
-- **llama.cpp** — `server` HTTP API; there the grammar suppresses thinking,
+- **llama.cpp** — `llama-server` on its OpenAI-compatible
+  `/v1/chat/completions` endpoint; there the grammar suppresses thinking,
   so reasoning is disabled for schema calls.
 
-Model capabilities (context size, thinking support, thinking levels) are
-*profiles*, probed rather than hard-coded, so adding a model needs no code
-change.
+Model capabilities (context size, thinking support) are *profiles*, probed
+rather than hard-coded, so adding a model needs no code change.
 
 ## Setup
 
@@ -89,34 +87,29 @@ Python 3 install with `requests` works.
 
 ```sh
 python src/main.py --conjecture algebra_example
-python src/main.py --conjecture algebra_example --model gemma4:31b
-python src/main.py --conjecture algebra_example --backend llamacpp \
-               --model Qwen3.5-122B-Q4_K_M
+python src/main.py --conjecture algebra_example --model Qwen3.5-122B-Q4_K_M
 python src/main.py --conjecture algebra_example --no-verbose --max-iterations 25
 python src/main.py --conjecture algebra_example --mode human
-python src/main.py --conjecture algebra_example --verify-passes 5
 
 # once, before proving: parse the conjecture's reference collection
 python src/parsing.py --conjecture algebra_example
 ```
 
-`parsing.py` shares main.py's backend options (`--backend`, `--host`,
-`--model`, `--num-ctx`) and its `--conjecture NAME` / `--verbose` pair; it
-has no proving options, because it has no loop.
+`parsing.py` shares main.py's server options (`--host`, `--model`,
+`--num-ctx`) and its `--conjecture NAME` / `--verbose` pair; it has no
+proving options, because it has no loop.
 
 ### CLI options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--conjecture NAME` | `algebra_example` | A directory under `conjectures/` holding a `conjecture.md`. |
-| `--backend {ollama,llamacpp}` | `ollama` | Which server to talk to. |
-| `--model NAME` | `qwen3.6:35b` | Ollama model tag, or the label llama-server reports. |
-| `--host URL` | per backend | Server base URL (`localhost:11434` for ollama, `localhost:8081` for llamacpp). |
+| `--model NAME` | `qwen3.8-27b` | The `--alias` llama-server was launched with. |
+| `--host URL` | `http://localhost:8081` | llama-server base URL (`$LLAMA_HOST` overrides the default; 8080 is taken by open-webui). |
 | `--dag PATH` | `conjectures/<name>/dag.json` | Use a separate DAG file (e.g. to isolate a model's run). |
 | `--max-iterations N` | 10 | Loop iterations before giving up. |
-| `--verify-passes N` | 3 | Independent verifier passes a proof must survive. |
 | `--max-proof-attempts N` | 12 | Prover rounds per lemma before it is given up. |
-| `--num-ctx N` | 65536 | Context window in tokens (capped at the server's limit; lower it if VRAM is tight). |
+| `--num-ctx N` | the server's own (probed) | Context window in tokens. Defaults to the server's context — the `-c` llama-server was launched with, as probed. Lower it if VRAM is tight. |
 | `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
 | `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
 | `--verbose / --no-verbose` | on | Console logging. |
@@ -139,18 +132,18 @@ a line of input in the other.
 
 ```
 agents/
-  planner.md  selector.md  prover.md  verifier.md  reviser.md   # default agent prompts
+  planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md   # default agent prompts
   parsing.md                               # references parser prompt
 src/
   main.py              # the proof loop (planner → selector → prover → verifier → reviser)
   parsing.py           # standalone references/ → references.md parser
-  llm_backend.py       # backend transports (Ollama, llama.cpp) + model profiles
+  llm_backend.py       # llama.cpp transport + model profiles
   interaction.py       # human-in-the-loop menu + hotkey
   workspace.py         # per-conjecture run directories and prompt resolution
 conjectures/
   algebra_example/
     conjecture.md          # required: the statement
-    dag.json               # shared by every model and backend
+    dag.json               # shared by every model
     references/            # optional: source files (.tex/.md/plain text) to parse
     references.md          # parsed theorem-level results (strict JSON array)
     prover.md              # optional per-conjecture prompt override
@@ -161,7 +154,7 @@ flake.nix                  # Nix dev shell
 
 `--conjecture` names a directory under `conjectures/` that must contain a
 `conjecture.md`. The DAG is written beside it as `dag.json` and is *shared by
-every model and backend*: point a second model at a conjecture already under
+every model*: point a second model at a conjecture already under
 way and it continues from the lemmas the first one proved. A lemma proved by
 a 27B model and passed by the verifiers is no less proved when a 122B model
 arrives. The cost is that this is collaboration, not a controlled comparison —

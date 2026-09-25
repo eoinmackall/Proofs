@@ -13,7 +13,7 @@ Layout:
         conjecture.md
 
     agents/
-      planner.md  selector.md  prover.md  verifier.md  reviser.md  <- project-wide defaults
+      planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md  <- project-wide defaults
 
 Two decisions worth flagging, both changeable:
 
@@ -49,15 +49,18 @@ DAG_FILENAME = "dag.json"
 # parsing.py's input: a directory of .tex/.md/plain-text files to parse.
 # Its output: references.md, a strict-JSON array of
 # { id, slogan, "formal statement", reference, tags } objects that main.py
-# feeds to the planner, the prover and the verifier.
+# feeds to the planner, the prover and the verifiers.
 REFERENCES_DIRNAME = "references"
 REFERENCES_FILENAME = "references.md"
 AGENTS_DIR = "agents"
 # Every prompt the loop can load, and therefore every per-conjecture override
 # that is meaningful. parsing.md is the standalone parser's (parsing.py's).
+# The three verifier_*.md files are the three atomic verification steps
+# (VERIFIER_AGENTS in main.py).
 PROMPT_FILES = (
-    "planner.md", "selector.md", "prover.md", "verifier.md", "reviser.md",
-    "parsing.md",
+    "planner.md", "selector.md", "prover.md",
+    "verifier_1.md", "verifier_2.md", "verifier_3.md",
+    "reviser.md", "parsing.md",
 )
 
 

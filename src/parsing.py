@@ -41,8 +41,7 @@ therefore idempotent on a good run — same files in, same file out.
 Usage
 -----
     python parsing.py --conjecture algebra_example
-    python parsing.py --conjecture algebra_example --backend llamacpp \
-                      --model Qwen3.5-122B-Q4_K_M
+    python parsing.py --conjecture algebra_example --model Qwen3.5-122B-Q4_K_M
     python parsing.py --conjecture algebra_example --num-ctx 65536
 
 --conjecture names a directory under conjectures/ holding a conjecture.md,
@@ -253,17 +252,13 @@ def run() -> None:
         help="Enable or disable console logging (default: --verbose)",
     )
     ap.add_argument(
-        "--backend", choices=("ollama", "llamacpp"), default=main.DEFAULT_BACKEND,
-        help=f"Inference server to talk to (default: {main.DEFAULT_BACKEND})",
-    )
-    ap.add_argument(
         "--host", default=None,
-        help="Server base URL. Defaults to localhost:11434 for ollama and "
-             "localhost:8081 for llamacpp.",
+        help="llama-server base URL. Defaults to $LLAMA_HOST or "
+             "localhost:8081 (8080 is taken by open-webui).",
     )
     ap.add_argument(
         "--model", default=main.MODEL_NAME,
-        help="Ollama model tag, or the label llama-server reports",
+        help="The --alias llama-server was launched with",
     )
     ap.add_argument(
         "--conjecture", default=main.DEFAULT_CONJECTURE,
@@ -271,22 +266,34 @@ def run() -> None:
              f"{workspace.CONJECTURE_FILENAME} (default: {main.DEFAULT_CONJECTURE})",
     )
     ap.add_argument(
-        "--num-ctx", type=int, default=main.NUM_CTX,
-        help=f"Context window in tokens (default: {main.NUM_CTX}).",
+        "--num-ctx", type=int, default=None,
+        help=(
+            "Context window in tokens. Defaults to the server's own — "
+            "the -c llama-server was launched with, as probed. Lower it if "
+            "VRAM is tight."
+        ),
     )
     args = ap.parse_args()
 
-    # The same backend setup as main.main(): probe first, then clamp the
-    # requested context to what the server actually allows.
+    # The same backend setup as main.main(): probe first, then resolve the
+    # context window — an explicit --num-ctx clamped to what the server
+    # allows, or the server's own context when it is not given.
     main.BACKEND = llm_backend.make_backend(
-        args.backend, args.model, args.host, main.REQUEST_TIMEOUT
+        args.model, args.host, main.REQUEST_TIMEOUT
     )
     main.PROFILE = main.BACKEND.probe()
-    main.log(llm_backend.describe(main.PROFILE, args.num_ctx), args.verbose)
-    num_ctx = min(args.num_ctx, main.PROFILE.context_limit)
+    if args.num_ctx is None:
+        num_ctx = main.PROFILE.context_limit
+    else:
+        num_ctx = min(args.num_ctx, main.PROFILE.context_limit)
     main.NUM_CTX = num_ctx
     main.REASONING_OPTIONS["num_ctx"] = num_ctx
     main.EXTRACT_OPTIONS["num_ctx"] = num_ctx
+    # The banner warns when an *explicit* --num-ctx is clamped; in the auto
+    # case the resolution above has already made the two agree.
+    main.log(llm_backend.describe(
+        main.PROFILE, args.num_ctx if args.num_ctx is not None else num_ctx
+    ), args.verbose)
 
     try:
         paths = workspace.resolve(args.conjecture)

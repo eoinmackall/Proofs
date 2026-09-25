@@ -2,36 +2,29 @@
 
 Design note on thinking vs. structured output
 ---------------------------------------------
-Ollama's `format` parameter constrains generation with a GBNF grammar. That
-grammar zeroes the probability of the <think> token, so passing `format`
-silently disables reasoning. Passing `think: false` is worse: on models whose
-chat template uses think tokens (qwen3.x, gemma4) it makes `format` be ignored
-entirely, and you get plain prose back instead of JSON.
+llama.cpp's `json_schema` response_format is *ignored* while reasoning is on,
+so the model is free to wrap its JSON in a markdown fence, and the
+server's own JSON parser then 500s (ggml-org/llama.cpp#20345). The fix has
+two halves:
 
-So we never combine the two, and we never send `think: false`:
+  * `llm_backend.py` neutralizes the conflict per call: thinking is turned
+    off for exactly the calls that carry a schema (the extraction stage),
+    and left on everywhere else.
+  * `extract()` additionally degrades to prompt-only with a JSON repair
+    pipeline in `clean_json_text()`, in case the model still wraps the
+    output in a fence or emits stray prose.
 
-  * Reasoning stage  - no `format`. The model thinks freely; Ollama returns the
-                       chain of thought in `message.thinking`, separate from
-                       `message.content`.
-  * Extraction stage - `format` set to an explicit JSON schema, applied to the
-                       *text the reasoning stage already produced*. No new
-                       mathematics happens here, so losing thinking costs
-                       nothing.
+The reasoning stage stays schema-free, because that is exactly where the
+model needs to think.
 
-All five agent prompts (planner.md, selector.md, prover.md, verifier.md,
-reviser.md) instruct the model to emit strict JSON directly, so each
+All seven agent prompts (planner.md, selector.md, prover.md, verifier_1.md,
+verifier_2.md, verifier_3.md and reviser.md) instruct the model to emit
+strict JSON directly, so each
 response is first
 parsed as-is; the extraction stage only runs as a fallback when the model
 fails to comply. The prover never round-trips through a second model call at
 all: its JSON is parsed locally and, failing that, the reasoning content is
 taken verbatim, so the proof text can't be abridged or paraphrased.
-
-The paragraphs above describe Ollama. llama.cpp inverts the conflict: there
-it is *thinking that suppresses the grammar*, not the other way round, so the
-schema is silently unenforced unless reasoning is disabled for the call.
-Neither rule is expressed here any more — llm_backend.py owns both, and this
-module only asks for "a reply, optionally schema-shaped, optionally with
-thinking" without knowing which server is listening.
 
 Planning is a shortlist, not a decision
 ---------------------------------------
@@ -48,11 +41,13 @@ an unproved dependency still costs a candidate rather than a whole iteration.
 
 Proving is a loop, not a single pass
 ------------------------------------
-A lemma enters the DAG only after VERIFY_PASSES independent passes of the
-verifier have all accepted the same proof (--verify-passes). The passes are
-the one verifier agent run repeatedly at a temperature that keeps them apart,
-not separate agents; any single reject ends the counting and sends the proof
-to the reviser with the verifier's reasoning about the failure. The reviser
+A lemma enters the DAG only after all three verifier agents have accepted the
+same proof. Verification is three atomic steps rather than one: verifier_1,
+verifier_2 and verifier_3 are separate agents — separate prompt files and
+separate roles — each a single call, so each step can later grow its
+own focus (for now all three prompts are identical). Any single reject ends
+the counting and sends the proof to the reviser with the
+verifier's reasoning about the failure. The reviser
 decides where the fault lies: a fault in the statement comes back as a
 revised statement, which becomes the prover's new target; a fault in the
 argument keeps the statement and sends the prover back with the verdict as
@@ -95,20 +90,16 @@ for why one of these is a keystroke and the other is a line of input.
 Usage
 -----
     python main.py --conjecture algebra_example
-    python main.py --conjecture algebra_example --model gemma4:31b
-    python main.py --conjecture algebra_example --backend llamacpp \
-                   --model Qwen3.5-122B-Q4_K_M
-    python main.py --conjecture algebra_example --backend llamacpp \
-                   --model qwen3.8-27b
+    python main.py --conjecture algebra_example --model Qwen3.5-122B-Q4_K_M
+    python main.py --conjecture algebra_example --model qwen3.8-27b
     python main.py --conjecture algebra_example --no-verbose --max-iterations 25
     python main.py --conjecture algebra_example --mode human
-    python main.py --conjecture algebra_example --verify-passes 5
     python parsing.py --conjecture algebra_example
 
 parsing.py is standalone: it reads conjectures/<name>/references/ (any .tex
 or .md file in it), asks the model for the theorem-level results, and writes
 them as a strict-JSON array to conjectures/<name>/references.md. main.py then
-offers those references to the prover (citable by id), to the verifier (the
+offers those references to the prover (citable by id), to the verifiers (the
 formal statements of the cited ones only) and to the planner (an id + slogan
 shortlist, only while the collection is small enough to be one).
 
@@ -133,11 +124,9 @@ import workspace
 # ----------------------------------------------------------------------------
 # Configuration (all overridable from the command line; see main())
 # ----------------------------------------------------------------------------
-# qwen3.6:35b — MoE, 36B total / ~3B active (a3b), Q4_K_M, ~24GB, 256K ctx,
-# arch qwen35moe. Same blob (07d35212591f) as :latest, :35b-a3b and
-# :35b-a3b-q4_K_M. NOT the same as :35b-mlx (Apple Silicon) or :35b-a3b-mtp-*.
-DEFAULT_BACKEND = "ollama"
-MODEL_NAME = "qwen3.6:35b"
+# qwen3.8-27b — llama-server reached over the SSH tunnel on 8081
+# (the only live inference server on this machine).
+MODEL_NAME = "qwen3.8-27b"
 DEFAULT_CONJECTURE = "algebra_example"
 
 # Set in main(). BACKEND owns the HTTP conversation; PROFILE is what the
@@ -169,12 +158,17 @@ PLANNER_CANDIDATES = 5
 # collection regardless, so a named result the planner misses is one proving
 # round away, not lost. A strategy for large collections is deliberately not
 # built yet.
-PLANNER_REFERENCE_LIMIT = 20
+PLANNER_REFERENCE_LIMIT = 100
 
-# The proof loop: how many independent verifier passes must all accept the
-# same proof before a lemma enters the DAG, and how many prover rounds one
-# iteration may spend on a lemma before giving it up and re-planning.
-VERIFY_PASSES = 3
+# The verification steps: a proof enters the DAG only after every one of
+# these verifier agents has accepted it. Each is a separate agent — its own
+# prompt file and role, run as a single atomic check — rather than one
+# verifier run repeatedly, so each step can grow its own focus. For now all
+# three prompts are identical. One reject ends the counting and sends the
+# proof to the reviser.
+VERIFIER_AGENTS = ("verifier_1.md", "verifier_2.md", "verifier_3.md")
+# How many prover rounds one iteration may spend on a lemma before giving it
+# up and re-planning.
 MAX_PROOF_ATTEMPTS = 12
 
 # "auto" reproduces the original behaviour end to end. "human" stops at every
@@ -185,11 +179,12 @@ MODE = DEFAULT_MODE
 HOTKEY_KEYS = "h"            # single keystroke; see interaction.HotKey
 HOTKEY: interaction.HotKey = interaction.NullHotKey()
 
-# Ollama defaults num_ctx low (2048/4096) regardless of model capability.
-# Reasoning tokens are drawn from the same budget as the answer, so a thinking
-# prover needs a much larger allowance than a one-shot one. 65536 matches the
-# Qwen3.8-27B reference launch line in llm_backend.py (-c 65536); main() still
-# clamps it to whatever the probe finds the server actually allows.
+# Default context window. main() reassigns it after probing: with no
+# --num-ctx the server's own -c is used as-is (the KV cache is already
+# allocated at launch, so there is nothing to request); an explicit
+# --num-ctx always wins, clamped to the probed ceiling. This constant stands
+# in when the probe fails. 65536 matches the Qwen3.8-27B reference launch
+# line in llm_backend.py (-c 65536).
 NUM_CTX = 65536
 # No static per-role generation budgets. reason() and extract() give every
 # call the full headroom — num_ctx minus the prompt, minus a safety margin —
@@ -206,13 +201,15 @@ NUM_CTX = 65536
 #
 # These are requests, not guarantees. The backend checks them against the
 # probed capabilities and drops or downgrades: asking a non-thinking model to
-# think is a 400 from Ollama, and a level string sent to a model that only
-# understands booleans is ignored silently, which is worse.
+# think is a 400 from the server, and a level string sent to a model that
+# only understands booleans is ignored silently, which is worse.
 THINK = {
     "planner": True,
     "selector": True,
     "prover": True,
-    "verifier": True,
+    "verifier_1": True,
+    "verifier_2": True,
+    "verifier_3": True,
     "reviser": True,
     "parser": True,   # parsing.py: reading mathematics, then extracting it
 }
@@ -223,12 +220,10 @@ THINK = {
 # same symbols (\epsilon, n, x_i) over and over, and the extraction stage's
 # whole job is verbatim copying.
 #
-# The right value is model-specific, because it is a delta against whatever
-# the Modelfile ships: 0.4 is a large reduction for qwen3.6 (which defaults to
-# 1.5) and a penalty introduced from nothing for gemma4 (which sets none). So
-# the per-model baseline lives in llm_backend.OVERRIDES and the backend layers
-# these on top; anything set here wins, anything omitted takes the model's
-# recommended value. Keep the dict minimal for that reason.
+# The right value is model-specific, so the per-model baseline lives in
+# llm_backend.OVERRIDES and the backend layers these on top; anything set
+# here wins, anything omitted takes the model's recommended value. Keep the
+# dict minimal for that reason.
 REASONING_OPTIONS: Dict[str, Any] = {
     "temperature": 0.7,          # Greedy decoding degrades thinking models.
     "num_ctx": NUM_CTX,
@@ -251,8 +246,10 @@ TEMPERATURES = {
     "planner": 0.7,
     "selector": 0.5,   # Comparing a shortlist, not generating one.
     "prover": 0.6,     # Slightly tighter: rigour over exploration.
-    "verifier": 0.8,   # Looser, so the repeated verification passes don't
-                       # collapse into one review of the first pass.
+    "verifier_1": 0.8,
+    "verifier_2": 0.8,
+    "verifier_3": 0.8,   # Looser, so the three independent checks don't
+                        # collapse into one review of the first pass.
     "reviser": 0.7,    # Diagnosing a failure is planning-scale judgement.
     "parser": 0.3,     # Extracting from a fixed source, not exploring.
 }
@@ -282,8 +279,8 @@ def log(message: str, verbose: bool = True) -> None:
 
 
 # ----------------------------------------------------------------------------
-# Response schemas (Ollama builds a grammar from these, so required keys and
-# enum values are guaranteed rather than hoped for).
+# Response schemas (llama.cpp builds a grammar from these, so required keys
+# and enum values are guaranteed rather than hoped for).
 # ----------------------------------------------------------------------------
 # No dependencies field: the planner proposes statements, and which proved
 # lemmas a proof leans on is settled by the prover while it writes the proof.
@@ -300,10 +297,10 @@ _LEMMA_SCHEMA: Dict[str, Any] = {
     "required": ["id", "statement", "aim"],
 }
 
-# minItems/maxItems are deliberately absent: Ollama compiles this to a GBNF
-# grammar and its schema support does not cover array cardinality, so writing
-# them here would look like an enforced guarantee while enforcing nothing. The
-# count is requested in planner.md and trimmed in planner_candidates().
+# minItems/maxItems are deliberately absent: llama.cpp's schema support does
+# not cover array cardinality, so writing them here would look like an
+# enforced guarantee while enforcing nothing. The count is requested in
+# planner.md and trimmed in planner_candidates().
 PLANNER_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -536,7 +533,8 @@ def clean_json_text(raw: str) -> str:
 def parse_json_or_none(text: str) -> Optional[Dict[str, Any]]:
     """Parse an agent reply that already complies with its prompt file.
 
-    planner.md, selector.md, prover.md, verifier.md and reviser.md all end
+    planner.md, selector.md, prover.md, the three verifier prompts
+    (verifier_1.md, verifier_2.md, verifier_3.md) and reviser.md all end
     with "Output strictly valid JSON ... no markdown fences and no extra
     text", so the reasoning stage's content is usually the JSON object itself. When it
     parses, we use it directly and skip the extraction call entirely.
@@ -882,11 +880,10 @@ def extract(
 ) -> Dict[str, Any]:
     """Stage 2: convert stage-1 prose into schema-conformant JSON.
 
-    Thinking is never requested here. On Ollama that means the field is
-    omitted rather than set False, so the grammar constraint survives; on
-    llama.cpp the backend goes further and disables reasoning outright,
-    because there it is thinking that voids the grammar. Both are the
-    backend's problem, not this function's.
+    Thinking is never requested here, and the backend goes further and
+    disables reasoning outright for this call, because on llama.cpp it is
+    thinking that voids the grammar. That is the backend's problem, not
+    this function's.
     """
     system = (
         "You convert a mathematician's written work into JSON. Copy the "
@@ -903,7 +900,7 @@ def extract(
     # model's default thinking mode conflict (symptom: empty content, output
     # stranded in message.thinking). The repair pipeline in clean_json_text
     # reclaims JSON from free-form output on the fallback path. The conflict
-    # is a property of the model + Ollama version, not of one call, so once
+    # is a property of the model, not of one call, so once
     # discovered it's remembered for the rest of the run.
     global _SCHEMA_MODE_BROKEN
     use_schema = not _SCHEMA_MODE_BROKEN
@@ -1032,7 +1029,8 @@ def verifier_context(
 
     DAG lemmas and reference results are merged into one set, keyed by id and
     carrying the statement only. Deliberately not the whole DAG or the whole
-    reference collection: verifier.md is asked to reject "use of results not
+    reference collection: the verifier agents are asked to reject "use of
+    results not
     present in the provided set", which only bites if the set is the prover's
     declared citations: a proof leaning on a result it never declared then
     reads as an unjustified leap, which is what it is.
@@ -1278,6 +1276,47 @@ def check_mode_toggle(verbose: bool = True) -> None:
     )
 
 
+def _run_verifier(
+    role: str,
+    system_prompt: str,
+    user_prompt: str,
+    verbose: bool,
+) -> Tuple[str, str]:
+    """One atomic verification step: a single call to one verifier agent.
+
+    Returns (decision, justification). A pass that hits the context wall
+    without a verdict, or returns nothing parseable, is a reject — a check
+    that cannot be completed can never count as an acceptance, so the proof
+    goes to the reviser rather than into the DAG on the strength of the
+    other two verifiers.
+    """
+    review, review_status = reason(
+        system_prompt, user_prompt, role, THINK[role], verbose,
+    )
+    check_mode_toggle(verbose)
+    if review_status == "ceiling" and not review:
+        return (
+            "reject",
+            f"{role} exhausted its token budget without reaching a verdict; "
+            "the proof is likely too long to review in one pass.",
+        )
+    # The verifier prompts demand raw JSON output; extraction is the fallback.
+    res = parse_json_or_none(review) if review else None
+    if res is None and review:
+        res = extract(
+            "Extract the verdict. decision is 'accept' only if the review "
+            "endorses the proof without unresolved objections.",
+            review,
+            VERIFIER_SCHEMA,
+            role,
+            verbose,
+        )
+    res = res or {}
+    decision = str(res.get("decision", "")).strip().lower()
+    justification = str(res.get("justification") or "(no justification)").strip()
+    return decision, justification
+
+
 # ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
@@ -1300,12 +1339,13 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
     planner_sys = load_file(PROMPT_PATHS["planner.md"])
     selector_sys = load_file(PROMPT_PATHS["selector.md"])
     prover_sys = load_file(PROMPT_PATHS["prover.md"])
-    verifier_sys = load_file(PROMPT_PATHS["verifier.md"])
+    # One prompt per verification step; VERIFIER_AGENTS names the three.
+    verifier_sys = {name: load_file(PROMPT_PATHS[name]) for name in VERIFIER_AGENTS}
     reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
 
     empty = [name for name, text in (
         ("planner.md", planner_sys), ("selector.md", selector_sys),
-        ("prover.md", prover_sys), ("verifier.md", verifier_sys),
+        ("prover.md", prover_sys), *verifier_sys.items(),
         ("reviser.md", reviser_sys),
     ) if not text]
     if empty:
@@ -1544,15 +1584,16 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         log(f"📌 Next Lemma [{lemma_id}] (aim: {aim}): {lemma_stmt}", verbose)
 
         # ---------------- Steps 2-5: the proof loop ----------------
-        # prover -> verifier -> reviser, repeated within the iteration. The
-        # prover writes a proof of `target`; the verifier then checks it
-        # VERIFY_PASSES times, independently, and one reject ends the counting
-        # and sends the proof to the reviser with the verdict's reasoning. The
-        # reviser either keeps the statement (the prover re-tries with the
-        # verdict as feedback) or revises it (the revised statement becomes the
-        # new target). Only a proof that survives all VERIFY_PASSES passes
-        # enters the DAG; after MAX_PROOF_ATTEMPTS prover rounds the lemma is
-        # given up for this iteration and the planner is asked again.
+        # prover -> verifiers -> reviser, repeated within the iteration. The
+        # prover writes a proof of `target`; the verifiers then check it —
+        # three atomic passes, one per verifier agent — and one reject ends the
+        # counting and sends the proof to the reviser with the verdict's
+        # reasoning. The reviser either keeps the statement (the prover
+        # re-tries with the verdict as feedback) or revises it (the revised
+        # statement becomes the new target). Only a proof that survives all
+        # three verifiers enters the DAG; after MAX_PROOF_ATTEMPTS prover
+        # rounds the lemma is given up for this iteration and the planner is
+        # asked again.
         #
         # No human intervention here, in either mode. Choosing 'p' at the menu
         # *is* the decision to let the models settle it; asking again
@@ -1668,10 +1709,12 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 verbose,
             )
 
-            # ---------------- Step 3: Verifier, VERIFY_PASSES passes --------
-            # The same proof is checked VERIFY_PASSES times, independently.
-            # One reject ends the counting and carries its reasoning to the
-            # reviser; only a proof that survives every pass is accepted.
+            # ---------------- Step 3: the three verifier checks -----------
+            # Three atomic checks, one per verifier agent, in the order
+            # verifier_1, verifier_2, verifier_3. Each is a single call to its
+            # own agent; one reject ends the counting and carries its
+            # reasoning to the reviser; only a proof that survives all three
+            # is accepted.
             verifier_user = (
                 f"Conjecture:\n{conjecture}\n\n"
                 f"Cited results (statements of exactly the lemmas and "
@@ -1682,40 +1725,13 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 f"Proposed proof:\n{proof}"
             )
             reject_just: Optional[str] = None
-            for pass_no in range(1, VERIFY_PASSES + 1):
-                review, review_status = reason(
-                    verifier_sys, verifier_user, "verifier",
-                    THINK["verifier"], verbose,
+            for step, agent in enumerate(VERIFIER_AGENTS, 1):
+                role = agent[:-3]   # "verifier_1.md" -> "verifier_1"
+                decision, justification = _run_verifier(
+                    role, verifier_sys[agent], verifier_user, verbose,
                 )
-                check_mode_toggle(verbose)
-                if review_status == "ceiling" and not review:
-                    decision = "reject"
-                    justification = (
-                        "Verifier exhausted its token budget without reaching "
-                        "a verdict; the proof is likely too long to review in "
-                        "one pass."
-                    )
-                else:
-                    # verifier.md demands raw JSON output; extraction is the
-                    # fallback.
-                    res = parse_json_or_none(review) if review else None
-                    if res is None and review:
-                        res = extract(
-                            "Extract the verdict. decision is 'accept' only if "
-                            "the review endorses the proof without unresolved "
-                            "objections.",
-                            review,
-                            VERIFIER_SCHEMA,
-                            "verifier",
-                            verbose,
-                        )
-                    res = res or {}
-                    decision = str(res.get("decision", "")).strip().lower()
-                    justification = str(
-                        res.get("justification") or "(no justification)"
-                    ).strip()
                 log(
-                    f"🔍 Verifier pass {pass_no}/{VERIFY_PASSES}: "
+                    f"🔍 Verifier {step}/{len(VERIFIER_AGENTS)} ({role}): "
                     f"{decision.upper() or '???'} — {justification}",
                     verbose,
                 )
@@ -1725,10 +1741,10 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 
             if reject_just is None:
                 # ---------------- Step 4: DAG update ----------------
-                # All VERIFY_PASSES passes accepted the same proof.
+                # All three verifier checks accepted the same proof.
                 log(
-                    f"✅ Lemma {lemma_id} passed {VERIFY_PASSES} verifier "
-                    f"passes. Adding to DAG.",
+                    f"✅ Lemma {lemma_id} passed all {len(VERIFIER_AGENTS)} "
+                    f"verifier checks. Adding to DAG.",
                     verbose,
                 )
                 dag["lemmas"][lemma_id] = {
@@ -1841,7 +1857,7 @@ def main() -> None:
     global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, REFERENCES_FILE
     global MAX_ITERATIONS, NUM_CTX
     global BACKEND, PROFILE, PROMPT_PATHS, MODE, HOTKEY
-    global VERIFY_PASSES, MAX_PROOF_ATTEMPTS
+    global MAX_PROOF_ATTEMPTS
 
     parser = argparse.ArgumentParser(
         description="Run the multi-agent theorem prover."
@@ -1854,17 +1870,13 @@ def main() -> None:
         help="Enable or disable console logging (default: --verbose)",
     )
     parser.add_argument(
-        "--backend", choices=("ollama", "llamacpp"), default=DEFAULT_BACKEND,
-        help=f"Inference server to talk to (default: {DEFAULT_BACKEND})",
-    )
-    parser.add_argument(
         "--host", default=None,
-        help="Server base URL. Defaults to localhost:11434 for ollama and "
-             "localhost:8081 for llamacpp (8080 is taken by open-webui).",
+        help="llama-server base URL. Defaults to $LLAMA_HOST or "
+             "localhost:8081 (8080 is taken by open-webui).",
     )
     parser.add_argument(
         "--model", default=MODEL_NAME,
-        help="Ollama model tag, or the label llama-server reports",
+        help="The --alias llama-server was launched with",
     )
     parser.add_argument(
         "--conjecture", default=DEFAULT_CONJECTURE,
@@ -1881,13 +1893,6 @@ def main() -> None:
         help=f"Loop iterations before giving up (default: {MAX_ITERATIONS})",
     )
     parser.add_argument(
-        "--verify-passes", type=int, default=VERIFY_PASSES,
-        help=(
-            "How many independent verifier passes must all accept a proof "
-            f"before it enters the DAG (default: {VERIFY_PASSES})"
-        ),
-    )
-    parser.add_argument(
         "--max-proof-attempts", type=int, default=MAX_PROOF_ATTEMPTS,
         help=(
             "How many prover rounds the proof loop may spend on one lemma "
@@ -1895,8 +1900,12 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--num-ctx", type=int, default=NUM_CTX,
-        help=f"Context window in tokens (default: {NUM_CTX}). Lower it if VRAM is tight.",
+        "--num-ctx", type=int, default=None,
+        help=(
+            "Context window in tokens. Defaults to the server's own — "
+            "the -c llama-server was launched with, as probed. Lower it if "
+            "VRAM is tight."
+        ),
     )
     parser.add_argument(
         "--mode", choices=("auto", "human"), default=DEFAULT_MODE,
@@ -1913,22 +1922,31 @@ def main() -> None:
 
     MODEL_NAME = args.model
     MAX_ITERATIONS = args.max_iterations
-    VERIFY_PASSES = max(1, args.verify_passes)
     MAX_PROOF_ATTEMPTS = max(1, args.max_proof_attempts)
     MODE = args.mode
 
-    # Backend first: the probe tells us the real context ceiling, which the
-    # requested --num-ctx is then clamped to. Doing this before resolving
-    # paths also means a dead server is reported before a missing directory.
+    # Backend first: the probe tells us the real context ceiling, which an
+    # explicit --num-ctx is clamped to. Doing this before resolving paths
+    # also means a dead server is reported before a missing directory.
     BACKEND = llm_backend.make_backend(
-        args.backend, args.model, args.host, REQUEST_TIMEOUT
+        args.model, args.host, REQUEST_TIMEOUT
     )
     PROFILE = BACKEND.probe()
-    log(llm_backend.describe(PROFILE, args.num_ctx), args.verbose)
 
-    NUM_CTX = min(args.num_ctx, PROFILE.context_limit)
+    # Resolve the context window: an explicit --num-ctx wins (clamped to the
+    # probed ceiling); with no argument, take the server's own context — see
+    # the NUM_CTX comment.
+    if args.num_ctx is None:
+        NUM_CTX = PROFILE.context_limit
+    else:
+        NUM_CTX = min(args.num_ctx, PROFILE.context_limit)
     REASONING_OPTIONS["num_ctx"] = NUM_CTX
     EXTRACT_OPTIONS["num_ctx"] = NUM_CTX
+    # The banner warns when an *explicit* --num-ctx is clamped; in the auto
+    # case the resolution above has already made the two agree.
+    log(llm_backend.describe(
+        PROFILE, args.num_ctx if args.num_ctx is not None else NUM_CTX
+    ), args.verbose)
 
     try:
         paths = workspace.resolve(args.conjecture, args.dag)

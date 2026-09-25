@@ -1,28 +1,23 @@
 """Transport + capability layer for the multi-agent theorem prover.
 
-main.py currently speaks Ollama's native /api/chat directly: `think` as a
-top-level field, `format` as a JSON schema, sampler knobs nested under
-`options`, and the reasoning trace arriving in `message.thinking`. None of
-that exists on llama.cpp's server, so the two have to be separated.
+This module keeps two things apart:
 
-Two axes, kept apart on purpose:
+  * Transport  — HOW to talk to the server. Real code. There is exactly one:
+    llama.cpp's llama-server, on its OpenAI-compatible /v1/chat/completions
+    endpoint.
 
-  * Backend  — HOW to talk to the server. Real code, one class per server.
-    There are exactly two, and there will keep being exactly two however
-    many models you test.
-
-  * Profile  — WHAT this particular model can do (thinking? levels? how big
-    a context?). Data, and mostly *probed at startup* rather than written
+  * Profile  — WHAT this particular model can do (thinking? how big a
+    context?). Data, and mostly *probed at startup* rather than written
     down, so adding a model needs no code change at all.
 
-The thing to avoid is a third axis of `if model.startswith("gemma")`
+The thing to avoid is a third axis of `if model.startswith("qwen3.8")`
 branches scattered through reason()/extract(). Everything genuinely
 model-specific below is either probed or lives in one small OVERRIDES dict.
 
 Usage from main.py:
 
     from llm_backend import make_backend
-    BACKEND = make_backend(args.backend, args.model, args.host)
+    BACKEND = make_backend(args.model, args.host)
     PROFILE = BACKEND.probe()
     reply = BACKEND.chat(messages, think=..., schema=None, options={...})
 """
@@ -45,7 +40,7 @@ class Reply:
     """One chat completion, with the server-specific shapes flattened out."""
     content: str = ""
     thinking: str = ""
-    truncated: bool = False        # ollama done_reason / llama.cpp finish_reason
+    truncated: bool = False        # llama.cpp finish_reason
     prompt_tokens: int = 0
     eval_tokens: int = 0
 
@@ -54,11 +49,9 @@ class Reply:
 class Profile:
     """What we know about the loaded model. Probed where possible."""
     name: str
-    backend: str
-    context_limit: int = 65536     # tokens the *server* will actually allow
+    context_limit: int = 65536     # tokens the *server* will actually allow;
+                                  # llama-server fixes this with -c at launch
     supports_thinking: bool = False
-    thinking_levels: bool = False  # accepts "low"/"high"/"max", not just bool
-    context_is_fixed: bool = False # True for llama.cpp: set with -c at launch
     probe_ok: bool = False         # False => everything below is a guess
     # Sampler values the model card recommends. REASONING_OPTIONS in main.py
     # is layered on top of these, not instead of them.
@@ -73,7 +66,7 @@ class Profile:
         already optimistic for LaTeX-dense text (\\mathrm, \\alpha, subscripts
         tokenize badly) and it drifts further every time you change model,
         because you change tokenizer. Feeding real counts back keeps the
-        headroom calculation honest across all four models.
+        headroom calculation honest across models.
         """
         if prompt_tokens > 0 and prompt_chars > 0:
             observed = prompt_chars / prompt_tokens
@@ -90,23 +83,20 @@ class Profile:
 # endpoint reports. Capabilities and context sizes are probed, so they are
 # deliberately absent. Match is by longest prefix of the model name.
 #
-# Why this matters for your comparison: REASONING_OPTIONS sets
-# presence_penalty 0.4 with the comment "down from 1.5". That is true of
-# qwen3.6, whose Modelfile ships presence_penalty 1.5. Gemma 4's Modelfile
-# ships only temperature 1 / top_k 64 / top_p 0.95 — no presence penalty at
-# all. So the same 0.4 that *relaxes* qwen silently *adds* a repetition
-# penalty to gemma, on a workload (proofs, verbatim extraction) the comment
-# itself identifies as penalty-sensitive. Same number, opposite effect.
+# presence_penalty is the delicate one: it pushes the model off tokens it
+# has already used, which is actively harmful in mathematics (the same
+# symbols recur by necessity) and in the extraction stage's verbatim
+# copying. The right value is model-specific, so each entry states its own
+# rather than inheriting a global.
 # ----------------------------------------------------------------------------
 OVERRIDES: Dict[str, Dict[str, Any]] = {
-    # llama-server, so there is no Modelfile baseline: the reference launch
-    # line (below) sets no presence penalty, and there is nothing to correct
-    # against. These values just mirror that line so a request cannot drift
+    # Mirrors the reference launch line (below), so a request cannot drift
     # from the server's own defaults.
     "qwen3.8": {"top_p": 0.95, "top_k": 20, "min_p": 0.0},
-    "qwen3.6": {"presence_penalty": 0.4, "top_p": 0.95, "top_k": 20, "min_p": 0.0},
+    # 0.4 was tuned against Ollama's qwen3.6 Modelfile baseline
+    # (presence_penalty 1.5); on llama-server it is a real sampler flag, so
+    # review it if a Qwen3.5 run regresses.
     "qwen3.5": {"presence_penalty": 0.4, "top_p": 0.95, "top_k": 20, "min_p": 0.0},
-    "gemma4":  {"presence_penalty": 0.0, "top_p": 0.95, "top_k": 64, "min_p": 0.0},
 }
 
 
@@ -118,106 +108,6 @@ def _sampling_for(model: str) -> Dict[str, Any]:
     )
     return dict(OVERRIDES.get(key, {})) if key else {}
 
-
-# ----------------------------------------------------------------------------
-# Ollama
-# ----------------------------------------------------------------------------
-class OllamaBackend:
-    kind = "ollama"
-
-    def __init__(self, model: str, host: str = "http://localhost:11434",
-                 timeout: int = 1800) -> None:
-        self.model = model
-        self.host = host.rstrip("/")
-        self.timeout = timeout
-        self.profile: Optional[Profile] = None
-
-    def probe(self) -> Profile:
-        """Ask /api/show what this model can do, instead of hardcoding it.
-
-        The response carries a `capabilities` list ("completion", "tools",
-        "thinking", "vision") and a `model_info` dict whose context length is
-        keyed by architecture, e.g. "qwen35moe.context_length" or
-        "gemma4.context_length". Probing means gemma4:31b, qwen3.6:27b and
-        anything you try next all configure themselves.
-        """
-        prof = Profile(name=self.model, backend=self.kind,
-                       sampling=_sampling_for(self.model))
-        try:
-            r = requests.post(f"{self.host}/api/show",
-                              json={"model": self.model}, timeout=30)
-            r.raise_for_status()
-            body = r.json()
-        except (requests.RequestException, ValueError):
-            return prof   # unreachable or old Ollama: fall back to defaults
-
-        caps = body.get("capabilities") or []
-        prof.supports_thinking = "thinking" in caps
-
-        info = body.get("model_info") or {}
-        for key, val in info.items():
-            if key.endswith(".context_length") and isinstance(val, int):
-                prof.context_limit = val
-                break
-
-        # Levels ("low"/"medium"/"high"/"max") are supported by some model
-        # templates and silently ignored by others; a couple of families
-        # accept *only* levels and ignore booleans. There is no field that
-        # reports this, so infer from the template and let the caller
-        # degrade to a plain bool if the string is rejected.
-        template = body.get("template", "") or ""
-        prof.thinking_levels = "think_level" in template or "reasoning_effort" in template
-
-        prof.probe_ok = True
-        self.profile = prof
-        return prof
-
-    def chat(self, messages: List[Dict[str, str]], *, think: Any = None,
-             schema: Optional[Dict[str, Any]] = None,
-             options: Optional[Dict[str, Any]] = None) -> Reply:
-        opts = dict(self.profile.sampling if self.profile else {})
-        opts.update(options or {})
-
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-            "options": opts,
-        }
-
-        # Never send think:false — on qwen3.x/gemma4 templates it makes
-        # `format` be ignored entirely (see main.py's module docstring).
-        # Omitting the field gives the model's default, which is what we want.
-        if think and self.profile and self.profile.supports_thinking:
-            if isinstance(think, str) and not self.profile.thinking_levels:
-                payload["think"] = True     # model wants a bool, not a level
-            else:
-                payload["think"] = think
-        # If the model has no thinking capability, sending `think` at all is a
-        # 400 from Ollama, so it is dropped silently. The prompts still work;
-        # the model just answers in one pass.
-
-        if schema is not None:
-            payload["format"] = schema
-
-        r = requests.post(f"{self.host}/api/chat", json=payload,
-                          timeout=self.timeout)
-        r.raise_for_status()
-        body = r.json()
-
-        msg = body.get("message", {}) or {}
-        reply = Reply(
-            content=msg.get("content") or "",
-            thinking=msg.get("thinking") or "",
-            truncated=body.get("done_reason") == "length",
-            prompt_tokens=body.get("prompt_eval_count", 0) or 0,
-            eval_tokens=body.get("eval_count", 0) or 0,
-        )
-        if self.profile:
-            self.profile.note_usage(
-                sum(len(m["content"]) for m in messages), reply.prompt_tokens
-            )
-        return reply
 
 
 # ----------------------------------------------------------------------------
@@ -235,16 +125,14 @@ class OllamaBackend:
 #       --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0.0
 #
 # What the probe leans on there: --port 8081 is this module's default host;
-# -c fixes the context at launch (hence context_is_fixed, and the banner
-# tells you to restart the server, not re-request, when --num-ctx is bigger);
-# --reasoning-format deepseek is what splits the trace into
-# message.reasoning_content; the sampler flags are mirrored in
-# OVERRIDES["qwen3.8"] so per-request options cannot drift from them.
+# -c fixes the context at launch, so the banner tells you to restart the
+# server, not re-request, when --num-ctx is bigger; --reasoning-format
+# deepseek is what splits the trace into message.reasoning_content; the
+# sampler flags are mirrored in OVERRIDES["qwen3.8"] so per-request options
+# cannot drift from them.
 
 class LlamaCppBackend:
-    kind = "llamacpp"
-
-    # Ollama option name -> OpenAI/llama.cpp request field.
+    # Option names main.py's option dicts use -> request fields.
     _OPTION_MAP = {
         "num_predict": "max_tokens",
         "temperature": "temperature",
@@ -268,9 +156,7 @@ class LlamaCppBackend:
 
     def probe(self) -> Profile:
         """Read the *server's* configuration, which the client cannot change."""
-        prof = Profile(name=self.model, backend=self.kind,
-                       sampling=_sampling_for(self.model),
-                       context_is_fixed=True)
+        prof = Profile(name=self.model, sampling=_sampling_for(self.model))
         try:
             r = requests.get(f"{self.host}/props", timeout=30)
             r.raise_for_status()
@@ -294,8 +180,6 @@ class LlamaCppBackend:
             or "<think>" in template
             or "reasoning_effort" in template
         )
-        prof.thinking_levels = False
-
         prof.probe_ok = True
         self.profile = prof
         return prof
@@ -317,14 +201,12 @@ class LlamaCppBackend:
                 "type": "json_schema",
                 "json_schema": {"name": "reply", "strict": True, "schema": schema},
             }
-            # llama.cpp's mirror of the Ollama conflict main.py documents, with
-            # the opposite resolution. On Ollama, `format` suppresses thinking.
-            # On llama.cpp, thinking suppresses *the grammar*: with reasoning
-            # on, schema enforcement is not applied at all, so the model is
-            # free to emit fenced JSON — which then fails the server's own
-            # parser with a 500 (ggml-org/llama.cpp#20345). Turning reasoning
-            # off for this call is safe: the extraction stage does no new
-            # mathematics, it only copies.
+            # Thinking suppresses *the grammar*: with reasoning on, schema
+            # enforcement is not applied at all, so the model is free to emit
+            # fenced JSON — which then fails the server's own parser with a
+            # 500 (ggml-org/llama.cpp#20345). Turning reasoning off for this
+            # call is safe: the extraction stage does no new mathematics, it
+            # only copies.
             payload["reasoning_effort"] = "none"
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         elif not think:
@@ -362,45 +244,31 @@ class LlamaCppBackend:
 # ----------------------------------------------------------------------------
 # Factory
 # ----------------------------------------------------------------------------
-_BACKENDS = {"ollama": OllamaBackend, "llamacpp": LlamaCppBackend}
-
 # 8080 is llama-server's own default, but it is also open-webui's, and on this
 # machine open-webui has it. Launch llama-server with --port 8081 to match.
 # The probe makes a wrong guess loud rather than silent: open-webui has no
 # /props route, so it 404s and you get default_generation_settings=None
 # instead of a confusing half-working session against the wrong service.
-_DEFAULT_HOST = {
-    "ollama": os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
-    "llamacpp": os.environ.get("LLAMA_HOST", "http://localhost:8081"),
-}
+_DEFAULT_HOST = os.environ.get("LLAMA_HOST", "http://localhost:8081")
 
 
-def make_backend(kind: str, model: str, host: Optional[str] = None,
-                 timeout: int = 1800):
-    if kind not in _BACKENDS:
-        raise ValueError(f"unknown backend {kind!r}; expected one of {sorted(_BACKENDS)}")
-    return _BACKENDS[kind](model, host or _DEFAULT_HOST[kind], timeout)
+def make_backend(model: str, host: Optional[str] = None,
+                 timeout: int = 1800) -> LlamaCppBackend:
+    return LlamaCppBackend(model, host or _DEFAULT_HOST, timeout)
 
 
 def describe(prof: Profile, requested_ctx: int) -> str:
     """One-line startup banner, and a warning when the request is unsatisfiable."""
     lines = [
-        f"backend={prof.backend} model={prof.name} "
+        f"model={prof.name} "
         f"ctx_limit={prof.context_limit} thinking={prof.supports_thinking}"
-        f"{' (levels)' if prof.thinking_levels else ''}"
     ]
     if requested_ctx > prof.context_limit:
-        if prof.context_is_fixed:
-            lines.append(
-                f"  ⚠️  --num-ctx {requested_ctx} exceeds the server's {prof.context_limit}. "
-                f"llama-server fixes this at launch: restart it with "
-                f"-c {requested_ctx}. Clamping to {prof.context_limit} for now."
-            )
-        else:
-            lines.append(
-                f"  ⚠️  --num-ctx {requested_ctx} exceeds the model's "
-                f"{prof.context_limit}; clamping."
-            )
+        lines.append(
+            f"  ⚠️  --num-ctx {requested_ctx} exceeds the server's {prof.context_limit}. "
+            f"llama-server fixes this at launch: restart it with "
+            f"-c {requested_ctx}. Clamping to {prof.context_limit} for now."
+        )
     if not prof.probe_ok:
         lines.append(
             "  ⚠️  Capability probe failed — is the server up, and is this the "
