@@ -36,7 +36,7 @@ Each iteration:
 5. **Reviser** (`reviser.md`) handles a reject: it decides whether the fault
    is in the *proof* (send the prover back with the verdict as feedback) or
    in the *statement* (return a revised statement as the prover's new target).
-   After `MAX_PROOF_ATTEMPTS` (default 12) prover rounds the lemma is given
+   After `MAX_PROOF_ATTEMPTS` (default 3) prover rounds the lemma is given
    up and the planner is asked again.
 
 ### Thinking vs. structured output
@@ -108,7 +108,8 @@ proving options, because it has no loop.
 | `--host URL` | `http://localhost:8081` | llama-server base URL (`$LLAMA_HOST` overrides the default; 8080 is taken by open-webui). |
 | `--dag PATH` | `conjectures/<name>/dag.json` | Use a separate DAG file (e.g. to isolate a model's run). |
 | `--max-iterations N` | 10 | Loop iterations before giving up. |
-| `--max-proof-attempts N` | 12 | Prover rounds per lemma before it is given up. |
+| `--max-proof-attempts N` | 3 | Prover rounds per lemma before it is given up. |
+| `--fresh` | off | Ignore and delete the checkpoint (`<dag>.checkpoint.json`), restarting the iteration budget from 1. The DAG is kept. |
 | `--num-ctx N` | the server's own (probed) | Context window in tokens. Defaults to the server's context — the `-c` llama-server was launched with, as probed. Lower it if VRAM is tight. |
 | `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
 | `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
@@ -124,6 +125,9 @@ direction, without restarting:
   next planning step.
 - At the menu itself, type `a` (the line-oriented input is what the menu
   already owns, so the hotkey is paused while it is up).
+- Ctrl-C stops the run from anywhere — the menu included — writing the
+  checkpoint first; see [Cancelling a run](#cancelling-a-run-ctrl-c-and-resuming).
+  At the menu, `q` does the same thing.
 
 `src/interaction.py` explains why the toggle is a keystroke in one place and
 a line of input in the other.
@@ -144,6 +148,7 @@ conjectures/
   algebra_example/
     conjecture.md          # required: the statement
     dag.json               # shared by every model
+    dag.checkpoint.json    # optional: where a cancelled run stopped (--fresh)
     references/            # optional: source files (.tex/.md/plain text) to parse
     references.md          # parsed theorem-level results (strict JSON array)
     prover.md              # optional per-conjecture prompt override
@@ -163,6 +168,33 @@ give a model its own file with `--dag` if you want them isolated again.
 Prompt files are looked up in the conjecture directory first, then in
 `agents/`, so a conjecture that needs a special prompt (e.g. a prover primed
 for Brauer groups) can carry one without forking the defaults.
+
+### Cancelling a run (Ctrl-C) and resuming
+
+Ctrl-C stops the run and leaves a checkpoint — `<dag>.checkpoint.json`
+beside `dag.json`, so a `--dag` override gets its own. It records what a
+cancelled run would otherwise lose: where the iteration budget stood, the
+planner's reject list (the `failed_attempts` the next planner call reads),
+and, if the cancellation landed mid-proof, the lemma in flight, which prover
+round it was on, and the feedback the earlier rounds of that attempt already
+produced. The file is written at the safe boundaries — the top of each
+iteration, before each prover round, and the end of each iteration — so it
+always holds a coherent position, and it is deleted when the conjecture
+resolves. An existing checkpoint is announced in the run banner.
+
+Re-run the same command to pick up where the run stopped: the budget
+continues rather than resets, and an in-flight lemma goes straight back to
+the prover at the checkpointed round without asking the planner again. The
+interrupted round itself is re-run — the checkpoint cannot reach into an
+in-flight LLM call — but everything completed before it is kept. `--fresh`
+deletes the checkpoint and restarts the budget from 1 without touching
+`dag.json`; the DAG itself still needs deleting for a genuinely clean run.
+
+A bad checkpoint degrades instead of crashing: an unreadable or incoherent
+one is discarded and the run starts fresh; a checkpoint whose in-flight
+lemma is already in the DAG drops only the in-flight part and resumes as a
+normal iteration; one whose iteration stands past `--max-iterations` is
+reported and kept — raise the budget and re-run to continue from it.
 
 ### References
 

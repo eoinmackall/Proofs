@@ -148,6 +148,14 @@ def describe(paths: RunPaths) -> str:
             f"  ↻ resuming from existing {paths.dag.name} "
             f"(delete it for a clean run)"
         )
+    checkpoint = paths.dag.with_name(
+        paths.dag.stem + ".checkpoint" + paths.dag.suffix
+    )
+    if checkpoint.exists():
+        lines.append(
+            f"  ♻ checkpoint {checkpoint.name} present — the run resumes "
+            f"from it (--fresh to restart the budget)"
+        )
     # Runs from before the DAG was shared left dag-<backend>-<model>.json
     # files here. They are not read any more, and saying so beats letting
     # someone conclude the lemmas were lost.

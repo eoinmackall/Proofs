@@ -1,4 +1,4 @@
-Definitoin: let $k$ be a field. Let $G$ be a finite group. A $G$-algebra $L$ over $k$ is an \'etale $k$-algebra $L$ equipped with an action of the group $G$ by $k$-automorphisms. 
+Definition: let $k$ be a field. Let $G$ be a finite group. A $G$-algebra $L$ over $k$ is an \'etale $k$-algebra $L$ equipped with an action of the group $G$ by $k$-automorphisms. 
 
 Definition: let $k$ be a field. Let $G$ be a finite group. Let $L$ be a $G$-algebra over $k$ such that the order of $G$ equals the $k$-dimension of $L$. Then $L$ is said to be Galois if $L^G = k$.
 

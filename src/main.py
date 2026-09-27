@@ -26,6 +26,28 @@ fails to comply. The prover never round-trips through a second model call at
 all: its JSON is parsed locally and, failing that, the reasoning content is
 taken verbatim, so the proof text can't be abridged or paraphrased.
 
+Cancelling and resuming
+-----------------------
+The run keeps a checkpoint, `dag.checkpoint.json`, beside the DAG it is
+building (so a `--dag` run checkpoints beside its own file). It holds what
+`dag.json` does not: the position of the iteration budget, the planner's
+reject list (`failed_attempts`), and — when the run is cancelled in the
+middle of a proof — the lemma that was in flight, with the target statement
+(the reviser may have revised it), the prover round it was on, and the
+feedback that round was about to be given. Checkpoints are written at safe
+boundaries — the top of each iteration, the top of every prover round, and
+the end of each iteration — and by the SIGINT handler itself on Ctrl-C,
+which writes the last safe boundary's state and exits 130; a second Ctrl-C
+force-exits. Re-running the same command resumes from the checkpoint:
+the budget continues where it stopped, the planner keeps seeing the same
+reject notes, and a lemma cancelled mid-proof goes straight back to the
+prover for the interrupted round rather than through planning again (which
+is what makes a mid-proof Ctrl-C cost the interrupted call, not the whole
+iteration). An interrupted call is never restored — that one is re-run —
+everything completed before it is not. When the planner settles the
+conjecture the checkpoint is deleted; `--fresh` deletes it too, without
+touching `dag.json`.
+
 Planning is a shortlist, not a decision
 ---------------------------------------
 The planner proposes PLANNER_CANDIDATES (5) lemmas per iteration rather than
@@ -113,6 +135,8 @@ import argparse
 import json
 import os
 import re
+import signal
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -138,6 +162,9 @@ PROFILE: Any = None
 # so these are paths rather than the bare filenames they used to be.
 CONJECTURE_FILE = ""
 DAG_FILE = ""
+# Set in main(), beside DAG_FILE: dag.json -> dag.checkpoint.json. See the
+# "Cancelling and resuming" section of the module docstring.
+CHECKPOINT_FILE = ""
 REFERENCES_FILE = ""
 PROMPT_PATHS: Dict[str, str] = {name: name for name in workspace.PROMPT_FILES}
 
@@ -169,7 +196,7 @@ PLANNER_REFERENCE_LIMIT = 100
 VERIFIER_AGENTS = ("verifier_1.md", "verifier_2.md", "verifier_3.md")
 # How many prover rounds one iteration may spend on a lemma before giving it
 # up and re-planning.
-MAX_PROOF_ATTEMPTS = 12
+MAX_PROOF_ATTEMPTS = 3
 
 # "auto" reproduces the original behaviour end to end. "human" stops at every
 # planning step. Set from --mode, then mutated by the hotkey and the menu, so
@@ -375,6 +402,185 @@ def save_dag(dag: Dict[str, Any]) -> None:
     """Save updated DAG state to file, creating it if needed."""
     with open(DAG_FILE, "w", encoding="utf-8") as f:
         json.dump(dag, f, indent=2)
+
+
+# ----------------------------------------------------------------------------
+# Checkpointing: the state a cancelled run leaves behind, so the next run
+# resumes instead of starting over. The DAG itself is the permanent record;
+# this is the run-level state that would otherwise be paid for again: where
+# the iteration budget stood, the planner's reject list, and the lemma that
+# was mid-proof. See "Cancelling and resuming" in the module docstring.
+# ----------------------------------------------------------------------------
+# The latest safe-boundary state, updated by run_loop() as it goes. The
+# SIGINT handler reads it so a Ctrl-C between boundaries still writes what
+# the last boundary established, without reaching into run_loop's locals.
+_LIVE_STATE: Dict[str, Any] = {
+    "iteration": None,
+    "failed_attempts": None,
+    "in_flight": None,
+}
+_sigint_count = 0
+
+
+def checkpoint_path_for(dag_path: str) -> str:
+    """The checkpoint file for a DAG file: dag.json -> dag.checkpoint.json.
+
+    Beside the DAG, not beside the conjecture directory's name, so a run
+    pointed at its own --dag file checkpoints beside exactly that file.
+    """
+    root, ext = os.path.splitext(dag_path)
+    return f"{root}.checkpoint{ext or '.json'}"
+
+
+def save_checkpoint(
+    iteration: int,
+    failed_attempts: Dict[str, List[str]],
+    in_flight: Optional[Dict[str, Any]],
+    verbose: bool = True,
+) -> None:
+    """Write the checkpoint atomically, beside the DAG.
+
+    `iteration` is the next iteration a resuming run should start at, and
+    `in_flight` (None unless a prover round is the resumable position) names
+    the lemma to go straight back to the prover with: its target as the
+    reviser last left it, the prover round to re-run, and the feedback and
+    reject notes that round carries.
+    """
+    if not CHECKPOINT_FILE:
+        return
+    data: Dict[str, Any] = {
+        "version": 1,
+        "iteration": int(iteration),
+        "failed_attempts": {k: list(v) for k, v in failed_attempts.items()},
+    }
+    if in_flight is not None:
+        data["in_flight"] = in_flight
+    tmp = CHECKPOINT_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, CHECKPOINT_FILE)
+    except OSError as e:
+        log(f"⚠️  Could not write checkpoint {CHECKPOINT_FILE}: {e}", verbose)
+
+
+def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
+    """Read and validate the checkpoint.
+
+    Returns {"iteration", "failed_attempts", "in_flight"}, or None when there
+    is no usable checkpoint. A checkpoint that cannot be trusted is discarded
+    rather than fatal: the DAG is the permanent record, and the checkpoint
+    only saves re-paying for a cancelled run's completed work. Corrupt files
+    are a warning, not a crash, for the same reason.
+    """
+    if not CHECKPOINT_FILE or not os.path.exists(CHECKPOINT_FILE):
+        return None
+    try:
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"⚠️  Checkpoint {CHECKPOINT_FILE} is unreadable ({e}); ignoring it.",
+            verbose)
+        discard_checkpoint()
+        return None
+    if not isinstance(data, dict):
+        log(f"⚠️  Checkpoint {CHECKPOINT_FILE} is malformed; ignoring it.",
+            verbose)
+        discard_checkpoint()
+        return None
+    iteration = data.get("iteration")
+    if not isinstance(iteration, int) or iteration < 1:
+        log(f"⚠️  Checkpoint {CHECKPOINT_FILE} has no usable iteration; ignoring it.",
+            verbose)
+        discard_checkpoint()
+        return None
+    failed_raw = data.get("failed_attempts")
+    failed_attempts: Dict[str, List[str]] = {}
+    if isinstance(failed_raw, dict):
+        failed_attempts = {
+            k: [n for n in v if isinstance(n, str)]
+            for k, v in failed_raw.items()
+            if isinstance(v, list)
+        }
+    in_flight: Optional[Dict[str, Any]] = None
+    raw = data.get("in_flight")
+    if isinstance(raw, dict):
+        lemma_id = str(raw.get("lemma_id") or "")
+        target = raw.get("target")
+        attempt = raw.get("attempt")
+        statement = str(target.get("statement") or "").strip() if isinstance(target, dict) else ""
+        if lemma_id and statement and isinstance(attempt, int) and 1 <= attempt <= MAX_PROOF_ATTEMPTS:
+            clean_target: Dict[str, Any] = {"id": lemma_id, "statement": statement}
+            if isinstance(target.get("aim"), str) and target["aim"].strip():
+                clean_target["aim"] = target["aim"]
+            in_flight = {
+                "lemma_id": lemma_id,
+                "target": clean_target,
+                "attempt": attempt,
+                "feedback": [n for n in (raw.get("feedback") or []) if isinstance(n, str)],
+                "attempt_notes": [n for n in (raw.get("attempt_notes") or []) if isinstance(n, str)],
+            }
+        else:
+            log(
+                "⚠️  Checkpoint's in-flight state is unusable (bad lemma, "
+                "statement, or prover round); planning as usual instead.",
+                verbose,
+            )
+    return {
+        "iteration": iteration,
+        "failed_attempts": failed_attempts,
+        "in_flight": in_flight,
+    }
+
+
+def discard_checkpoint() -> None:
+    """Remove the checkpoint file if present.
+
+    Silent on failure: a checkpoint is a convenience file, and its absence
+    is always a valid state (a fresh run).
+    """
+    if CHECKPOINT_FILE and os.path.exists(CHECKPOINT_FILE):
+        try:
+            os.remove(CHECKPOINT_FILE)
+        except OSError:
+            pass
+
+
+def _on_sigint(signum, frame) -> None:
+    """Ctrl-C: write the checkpoint, then exit 130 like the shell expects.
+
+    A second Ctrl-C force-exits without waiting on the file. The checkpoint
+    is written from _LIVE_STATE — the last safe boundary run_loop() reached —
+    so an interrupt mid-LLM-call loses only that call: the next run re-runs
+    the interrupted prover round, not the whole iteration.
+    """
+    global _sigint_count
+    _sigint_count += 1
+    if _sigint_count > 1:
+        print("\nForced exit.", file=sys.stderr)
+        os._exit(130)
+    print("\n⏹ Interrupted — writing checkpoint...", file=sys.stderr)
+    state = _LIVE_STATE
+    if (
+        state["iteration"] is not None
+        and state["failed_attempts"] is not None
+        and CHECKPOINT_FILE
+    ):
+        save_checkpoint(
+            state["iteration"],
+            state["failed_attempts"],
+            state["in_flight"],
+            verbose=False,
+        )
+        print(
+            f"   {os.path.basename(CHECKPOINT_FILE)} written. Re-run the same "
+            f"command to resume where this run stopped.",
+            file=sys.stderr,
+        )
+    else:
+        print("   (no checkpoint state yet — nothing written)", file=sys.stderr)
+    sys.exit(130)
 
 
 # ----------------------------------------------------------------------------
@@ -1406,10 +1612,52 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
     else:
         planner_ref_block = ""
 
-    failed_attempts: Dict[str, List[str]] = {}
-    warned_dangling = set()
+    # Checkpoint restore: the DAG is reloaded from disk every iteration, so a
+    # cancelled run leaves only run-level state to restore — where the
+    # iteration budget stood, the planner's reject list, and the lemma that
+    # was in flight, if the cancellation landed mid-proof. A missing or
+    # corrupt checkpoint degrades to a fresh run, never to a crash.
+    cp = load_checkpoint(verbose)
+    if cp is not None and not os.path.exists(DAG_FILE):
+        log("⚠️  Checkpoint without a DAG file; discarding it.", verbose)
+        discard_checkpoint()
+        cp = None
+    if cp is None:
+        start_iteration = 1
+        failed_attempts: Dict[str, List[str]] = {}
+        in_flight: Optional[Dict[str, Any]] = None
+    else:
+        start_iteration = cp["iteration"]
+        failed_attempts = cp["failed_attempts"]
+        in_flight = cp["in_flight"]
+        if in_flight is None:
+            log(
+                f"♻ Resuming at iteration {start_iteration}/{MAX_ITERATIONS} "
+                f"({len(failed_attempts)} rejected lemma(s) on record).",
+                verbose,
+            )
+        else:
+            log(
+                f"♻ Resuming at iteration {start_iteration}/{MAX_ITERATIONS}, "
+                f"in-flight {in_flight['lemma_id']} at prover round "
+                f"{in_flight['attempt']}/{MAX_PROOF_ATTEMPTS}.",
+                verbose,
+            )
+    if start_iteration > MAX_ITERATIONS:
+        log(
+            f"\n⏹ The checkpoint stands at iteration {start_iteration}, past "
+            f"--max-iterations ({MAX_ITERATIONS}). Re-run with a larger "
+            f"--max-iterations to continue, or --fresh to restart the budget "
+            f"(the DAG is kept either way).",
+            verbose,
+        )
+        return load_dag()
 
-    for iteration in range(1, MAX_ITERATIONS + 1):
+    warned_dangling = set()
+    _LIVE_STATE["failed_attempts"] = failed_attempts
+    _LIVE_STATE["in_flight"] = in_flight
+
+    for iteration in range(start_iteration, MAX_ITERATIONS + 1):
         log(f"\n--- Iteration {iteration}/{MAX_ITERATIONS} ---", verbose)
         check_mode_toggle(verbose)
         dag = load_dag()
@@ -1429,159 +1677,202 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                         f"will see a citation with no statement behind it."
                     )
 
-        # ---------------- Step 1: Planner ----------------
-        planner_user = (
-            f"Conjecture:\n{conjecture}\n\n"
-            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
-            f"{planner_ref_block}\n\n"
-            f"Previously rejected attempts (avoid or decompose these):\n"
-            f"{json.dumps(failed_attempts, indent=2)}"
-        )
-        plan_text, plan_status = reason(
-            planner_sys, planner_user, "planner", THINK["planner"], verbose
-        )
-        check_mode_toggle(verbose)
-        if plan_status == "ceiling" and not plan_text:
-            log("Planner exhausted its token budget. Re-planning.", verbose)
-            continue
-        if not plan_text:
-            log("Planner produced nothing. Re-planning next iteration.", verbose)
-            continue
+        # Checkpoint: this iteration is now the resumable position. If the
+        # previous run was cancelled mid-proof, `in_flight` names the lemma
+        # that goes straight back to the prover; otherwise the iteration
+        # starts with planning. The proof loop and the end-of-iteration
+        # bookkeeping keep it up to date, and the SIGINT handler writes it
+        # on Ctrl-C from _LIVE_STATE.
+        _LIVE_STATE["iteration"] = iteration
+        _LIVE_STATE["in_flight"] = in_flight
+        save_checkpoint(iteration, failed_attempts, in_flight, verbose)
 
-        # planner.md demands raw JSON output; extraction is only the fallback.
-        planner_res = parse_json_or_none(plan_text)
-        if planner_res is None:
-            planner_res = extract(
-                "Extract the plan. Copy every candidate lemma the text proposes "
-                "into candidate_lemmas, preserving the order it presents them "
-                "in and each candidate's aim ('proof' or 'counterexample'); "
-                "where the text gives no aim, use 'proof'. "
-                "is_conjecture_proved must be true only if the text "
-                "explicitly concludes the conjecture is fully proved; "
-                "is_conjecture_disproved must be true only if the text "
-                "explicitly concludes that a full counterexample to the "
-                "conjecture has been established.",
-                plan_text,
-                PLANNER_SCHEMA,
-                "planner",
-                verbose,
-            )
-
-        if planner_res.get("is_conjecture_proved"):
-            log("\n🎉 Conjecture has been fully proved!", verbose)
-            dag["conjecture"] = conjecture
-            dag["status"] = "proved"
-            save_dag(dag)
-            return dag
-
-        if planner_res.get("is_conjecture_disproved"):
+        resuming = in_flight is not None and in_flight["lemma_id"] not in dag["lemmas"]
+        if resuming:
             log(
-                "\n💥 Conjecture has been disproved: a counterexample to it "
-                "stands in the DAG.",
+                f"♻ In-flight {in_flight['lemma_id']}: re-running prover round "
+                f"{in_flight['attempt']}/{MAX_PROOF_ATTEMPTS} (earlier rounds' "
+                f"feedback is kept; the interrupted round itself is re-run).",
                 verbose,
             )
-            dag["conjecture"] = conjecture
-            dag["status"] = "disproved"
-            save_dag(dag)
-            return dag
-
-        candidates = planner_candidates(planner_res)
-        if not candidates:
-            log("Planner proposed no usable lemma. Re-planning.", verbose)
-            continue
-
-        screened = screen_candidates(dag, candidates)
-        summary = str(planner_res.get("plan_summary") or "")
-
-        # ---------------- Step 1b: Selection ----------------
-        # The one place the two modes differ, and so the one place MODE is
-        # read. Everything after this block runs identically whether the lemma
-        # was chosen by a person or by the selector, which is what keeps
-        # --mode auto honest as a control.
-        next_lemma: Optional[Dict[str, Any]] = None
-        if MODE == "human":
-            choice = interaction.choose(
-                screened, dag["lemmas"].keys(), HOTKEY, summary
+        elif in_flight is not None:
+            # The lemma was accepted between two checkpoints: its proof is
+            # already in the DAG, so there is nothing in flight to resume.
+            log(
+                f"♻ Checkpoint's in-flight {in_flight['lemma_id']} is already "
+                f"in the DAG; planning as usual.",
+                verbose,
             )
-            if choice.action == "quit":
-                log("\n⏹ Stopped by the operator; DAG kept as it stands.", verbose)
-                save_dag(dag)
-                return dag
-            if choice.action == "replan":
-                # Recorded against every candidate shown, because the channel
-                # the planner reads is keyed by lemma id and the point is that
-                # it should not come back with this same shortlist.
-                for cand, _ in screened:
-                    for note in choice.notes:
-                        failed_attempts.setdefault(cand["id"], []).append(note)
-                log("↩︎ Shortlist rejected; asking the planner again.", verbose)
+            in_flight = None
+            _LIVE_STATE["in_flight"] = None
+        if not resuming:
+
+            # ---------------- Step 1: Planner ----------------
+            planner_user = (
+                f"Conjecture:\n{conjecture}\n\n"
+                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+                f"{planner_ref_block}\n\n"
+                f"Previously rejected attempts (avoid or decompose these):\n"
+                f"{json.dumps(failed_attempts, indent=2)}"
+            )
+            plan_text, plan_status = reason(
+                planner_sys, planner_user, "planner", THINK["planner"], verbose
+            )
+            check_mode_toggle(verbose)
+            if plan_status == "ceiling" and not plan_text:
+                log("Planner exhausted its token budget. Re-planning.", verbose)
                 continue
-            if choice.action == "auto":
-                MODE = "auto"
-                log(f"▶ Automation resumed. {HOTKEY.hint()}", verbose)
-            elif choice.action == "assert":
-                # The operator has vouched for it, so there is nothing for the
-                # prover or the verifiers to do: no proof is generated, no
-                # review is run, and the lemma is in the DAG before the next
-                # iteration reloads it. `provenance` marks it as resting on a
-                # person rather than on a machine-checked argument — absent on
-                # every node written by the pipeline, and on every DAG file
-                # that predates this, so read it with .get().
-                asserted = choice.lemma or {}
-                dag["lemmas"][asserted["id"]] = {
-                    "statement": asserted["statement"],
-                    "proof": "Asserted by the operator; not machine-proved.",
-                    "dependencies": [],   # nothing was cited; nothing was proved
-                    "provenance": "operator",
-                }
-                save_dag(dag)
-                failed_attempts.pop(asserted["id"], None)
-                log(
-                    f"🖊  Lemma {asserted['id']} accepted on your authority "
-                    f"and added to the DAG unproved.",
+            if not plan_text:
+                log("Planner produced nothing. Re-planning next iteration.", verbose)
+                continue
+
+            # planner.md demands raw JSON output; extraction is only the fallback.
+            planner_res = parse_json_or_none(plan_text)
+            if planner_res is None:
+                planner_res = extract(
+                    "Extract the plan. Copy every candidate lemma the text proposes "
+                    "into candidate_lemmas, preserving the order it presents them "
+                    "in and each candidate's aim ('proof' or 'counterexample'); "
+                    "where the text gives no aim, use 'proof'. "
+                    "is_conjecture_proved must be true only if the text "
+                    "explicitly concludes the conjecture is fully proved; "
+                    "is_conjecture_disproved must be true only if the text "
+                    "explicitly concludes that a full counterexample to the "
+                    "conjecture has been established.",
+                    plan_text,
+                    PLANNER_SCHEMA,
+                    "planner",
                     verbose,
                 )
-                continue
-            else:
-                next_lemma = choice.lemma
 
-        if next_lemma is None:
-            # Automatic selection. Screening removes the candidates whose ids
-            # are already in the DAG; of what survives, the selector agent
-            # weighs each one and names the one it judges most likely to
-            # succeed.
-            # The planner's best-first order is only the fallback: with
-            # exactly one candidate surviving there is nothing to choose, and
-            # select_lemma() itself falls back when the selector fails.
-            log_candidates(screened, summary, verbose)
-            usable = [cand for cand, problems in screened if not problems]
-            if not usable:
-                log("No candidate is currently provable; re-planning.", verbose)
-                for cand, problems in screened:
-                    failed_attempts.setdefault(cand["id"], []).append(
-                        f"Planning error: {'; '.join(problems)}."
-                    )
+            if planner_res.get("is_conjecture_proved"):
+                log("\n🎉 Conjecture has been fully proved!", verbose)
+                dag["conjecture"] = conjecture
+                dag["status"] = "proved"
+                save_dag(dag)
+                discard_checkpoint()
+                return dag
+
+            if planner_res.get("is_conjecture_disproved"):
+                log(
+                    "\n💥 Conjecture has been disproved: a counterexample to it "
+                    "stands in the DAG.",
+                    verbose,
+                )
+                dag["conjecture"] = conjecture
+                dag["status"] = "disproved"
+                save_dag(dag)
+                discard_checkpoint()
+                return dag
+
+            candidates = planner_candidates(planner_res)
+            if not candidates:
+                log("Planner proposed no usable lemma. Re-planning.", verbose)
                 continue
-            if len(usable) == 1:
-                next_lemma = usable[0]
-                if next_lemma is not screened[0][0]:
+
+            screened = screen_candidates(dag, candidates)
+            summary = str(planner_res.get("plan_summary") or "")
+
+            # ---------------- Step 1b: Selection ----------------
+            # The one place the two modes differ, and so the one place MODE is
+            # read. Everything after this block runs identically whether the lemma
+            # was chosen by a person or by the selector, which is what keeps
+            # --mode auto honest as a control.
+            next_lemma: Optional[Dict[str, Any]] = None
+            if MODE == "human":
+                choice = interaction.choose(
+                    screened, dag["lemmas"].keys(), HOTKEY, summary
+                )
+                if choice.action == "quit":
                     log(
-                        f"↷ Skipped {screened[0][0]['id']} "
-                        f"({'; '.join(screened[0][1])}); took {next_lemma['id']}.",
+                        "\n⏹ Stopped by the operator; DAG and checkpoint kept — "
+                        "re-run the same command to resume.",
                         verbose,
                     )
-            else:
-                next_lemma = select_lemma(
-                    usable, dag, conjecture, summary, failed_attempts, verbose
-                )
+                    save_dag(dag)
+                    return dag
+                if choice.action == "replan":
+                    # Recorded against every candidate shown, because the channel
+                    # the planner reads is keyed by lemma id and the point is that
+                    # it should not come back with this same shortlist.
+                    for cand, _ in screened:
+                        for note in choice.notes:
+                            failed_attempts.setdefault(cand["id"], []).append(note)
+                    log("↩︎ Shortlist rejected; asking the planner again.", verbose)
+                    continue
+                if choice.action == "auto":
+                    MODE = "auto"
+                    log(f"▶ Automation resumed. {HOTKEY.hint()}", verbose)
+                elif choice.action == "assert":
+                    # The operator has vouched for it, so there is nothing for the
+                    # prover or the verifiers to do: no proof is generated, no
+                    # review is run, and the lemma is in the DAG before the next
+                    # iteration reloads it. `provenance` marks it as resting on a
+                    # person rather than on a machine-checked argument — absent on
+                    # every node written by the pipeline, and on every DAG file
+                    # that predates this, so read it with .get().
+                    asserted = choice.lemma or {}
+                    dag["lemmas"][asserted["id"]] = {
+                        "statement": asserted["statement"],
+                        "proof": "Asserted by the operator; not machine-proved.",
+                        "dependencies": [],   # nothing was cited; nothing was proved
+                        "provenance": "operator",
+                    }
+                    save_dag(dag)
+                    failed_attempts.pop(asserted["id"], None)
+                    log(
+                        f"🖊  Lemma {asserted['id']} accepted on your authority "
+                        f"and added to the DAG unproved.",
+                        verbose,
+                    )
+                    continue
+                else:
+                    next_lemma = choice.lemma
 
-        lemma_id = next_lemma["id"]
-        lemma_stmt = next_lemma["statement"]
-        aim = str(next_lemma.get("aim") or "proof").strip().lower()
-        if aim not in ("proof", "counterexample"):
-            aim = "proof"
+            if next_lemma is None:
+                # Automatic selection. Screening removes the candidates whose ids
+                # are already in the DAG; of what survives, the selector agent
+                # weighs each one and names the one it judges most likely to
+                # succeed.
+                # The planner's best-first order is only the fallback: with
+                # exactly one candidate surviving there is nothing to choose, and
+                # select_lemma() itself falls back when the selector fails.
+                log_candidates(screened, summary, verbose)
+                usable = [cand for cand, problems in screened if not problems]
+                if not usable:
+                    log("No candidate is currently provable; re-planning.", verbose)
+                    for cand, problems in screened:
+                        failed_attempts.setdefault(cand["id"], []).append(
+                            f"Planning error: {'; '.join(problems)}."
+                        )
+                    continue
+                if len(usable) == 1:
+                    next_lemma = usable[0]
+                    if next_lemma is not screened[0][0]:
+                        log(
+                            f"↷ Skipped {screened[0][0]['id']} "
+                            f"({'; '.join(screened[0][1])}); took {next_lemma['id']}.",
+                            verbose,
+                        )
+                else:
+                    next_lemma = select_lemma(
+                        usable, dag, conjecture, summary, failed_attempts, verbose
+                    )
 
-        log(f"📌 Next Lemma [{lemma_id}] (aim: {aim}): {lemma_stmt}", verbose)
+        if resuming:
+            lemma_id = in_flight["lemma_id"]
+            lemma_stmt = in_flight["target"]["statement"]
+            aim = str(in_flight["target"].get("aim") or "proof").strip().lower()
+            if aim not in ("proof", "counterexample"):
+                aim = "proof"
+            log(f"📌 Next Lemma [{lemma_id}] (aim: {aim}): {lemma_stmt}", verbose)
+        else:
+            lemma_id = next_lemma["id"]
+            lemma_stmt = next_lemma["statement"]
+            aim = str(next_lemma.get("aim") or "proof").strip().lower()
+            if aim not in ("proof", "counterexample"):
+                aim = "proof"
+            log(f"📌 Next Lemma [{lemma_id}] (aim: {aim}): {lemma_stmt}", verbose)
 
         # ---------------- Steps 2-5: the proof loop ----------------
         # prover -> verifiers -> reviser, repeated within the iteration. The
@@ -1599,19 +1890,41 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         # *is* the decision to let the models settle it; asking again
         # afterwards would put the operator back in the loop they just
         # delegated out of. If you want a say over this lemma, assert it.
-        target: Dict[str, Any] = {"id": lemma_id, "statement": lemma_stmt}
-        if aim != "proof":
-            target["aim"] = aim
+        if resuming:
+            target: Dict[str, Any] = in_flight["target"]
+        else:
+            target: Dict[str, Any] = {"id": lemma_id, "statement": lemma_stmt}
+            if aim != "proof":
+                target["aim"] = aim
         # The prover sees only the most recent failure: feedback is rebuilt
         # after each rejected round, so a retry reads the last verdict and
         # diagnosis, not the history of every earlier attempt. That history
         # is kept for the planner in failed_attempts — decomposing or
         # rerouting is its job, not the prover's.
-        feedback: List[str] = []
-        attempt_notes: List[str] = list(failed_attempts.get(lemma_id, []))
+        if resuming:
+            feedback: List[str] = list(in_flight.get("feedback") or [])
+            attempt_notes: List[str] = list(in_flight.get("attempt_notes") or [])
+            first_attempt = in_flight["attempt"]
+        else:
+            feedback: List[str] = []
+            attempt_notes: List[str] = list(failed_attempts.get(lemma_id, []))
+            first_attempt = 1
         proved = False
 
-        for attempt in range(1, MAX_PROOF_ATTEMPTS + 1):
+        for attempt in range(first_attempt, MAX_PROOF_ATTEMPTS + 1):
+            # Checkpoint: this prover round is now the resumable position. If
+            # the run is cancelled anywhere inside it, the next run re-runs
+            # the round with this target and this feedback — the round's own
+            # in-flight call is lost, nothing completed before it is.
+            in_flight_state = {
+                "lemma_id": lemma_id,
+                "target": target,
+                "attempt": attempt,
+                "feedback": feedback,
+                "attempt_notes": attempt_notes,
+            }
+            _LIVE_STATE["in_flight"] = in_flight_state
+            save_checkpoint(iteration, failed_attempts, in_flight_state, verbose)
             log(
                 f"📝 Proof attempt {attempt}/{MAX_PROOF_ATTEMPTS} for {lemma_id}.",
                 verbose,
@@ -1842,9 +2155,18 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 verbose,
             )
 
+        # The lemma is settled one way or another: clear the in-flight state
+        # and move the resumable position to the next iteration, with the
+        # reject list as it now stands.
+        in_flight = None
+        _LIVE_STATE["in_flight"] = None
+        save_checkpoint(iteration + 1, failed_attempts, None, verbose)
+
     log(
         f"\n⏹ Reached MAX_ITERATIONS ({MAX_ITERATIONS}) without settling the "
-        f"conjecture (proved or disproved).",
+        f"conjecture (proved or disproved). The checkpoint keeps the budget "
+        f"position: re-run with a larger --max-iterations to continue, or "
+        f"--fresh to restart it. The DAG is kept either way.",
         verbose,
     )
     return load_dag()
@@ -1857,7 +2179,7 @@ def main() -> None:
     global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, REFERENCES_FILE
     global MAX_ITERATIONS, NUM_CTX
     global BACKEND, PROFILE, PROMPT_PATHS, MODE, HOTKEY
-    global MAX_PROOF_ATTEMPTS
+    global MAX_PROOF_ATTEMPTS, CHECKPOINT_FILE
 
     parser = argparse.ArgumentParser(
         description="Run the multi-agent theorem prover."
@@ -1897,6 +2219,15 @@ def main() -> None:
         help=(
             "How many prover rounds the proof loop may spend on one lemma "
             f"per iteration (default: {MAX_PROOF_ATTEMPTS})"
+        ),
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Ignore and delete any existing checkpoint, restarting the "
+            "iteration budget from 1. The DAG itself is kept: delete "
+            "dag.json for a genuinely clean run."
         ),
     )
     parser.add_argument(
@@ -1956,9 +2287,18 @@ def main() -> None:
 
     CONJECTURE_FILE = str(paths.conjecture)
     DAG_FILE = str(paths.dag)
+    CHECKPOINT_FILE = checkpoint_path_for(DAG_FILE)
     REFERENCES_FILE = str(paths.references)
     PROMPT_PATHS = {name: str(p) for name, p in paths.prompts.items()}
     log(workspace.describe(paths), args.verbose)
+    if args.fresh:
+        if os.path.exists(CHECKPOINT_FILE):
+            discard_checkpoint()
+            log(f"♻ --fresh: deleted {os.path.basename(CHECKPOINT_FILE)}; "
+                f"the iteration budget restarts from 1. The DAG is kept.",
+                args.verbose)
+        else:
+            log("♻ --fresh: no checkpoint to delete.", args.verbose)
 
     # The listener puts the terminal in cbreak mode, so it has to be stopped on
     # every exit path — including a traceback — or the shell you return to has
@@ -1976,6 +2316,11 @@ def main() -> None:
         log(f"mode=auto {HOTKEY.hint()}", args.verbose)
     elif MODE == "human":
         log("mode=human — you pick the lemma at every planning step.", args.verbose)
+
+    # Ctrl-C writes the checkpoint from the safe-boundary state in
+    # _LIVE_STATE and exits 130; a second Ctrl-C force-quits. Installed
+    # now, once the paths exist, so the handler can always write.
+    signal.signal(signal.SIGINT, _on_sigint)
 
     try:
         run_loop(verbose=args.verbose)
