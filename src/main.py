@@ -33,8 +33,10 @@ building (so a `--dag` run checkpoints beside its own file). It holds what
 `dag.json` does not: the position of the iteration budget, the planner's
 reject list (`failed_attempts`), and — when the run is cancelled in the
 middle of a proof — the lemma that was in flight, with the target statement
-(the reviser may have revised it), the prover round it was on, and the
-feedback that round was about to be given. Checkpoints are written at safe
+(the reviser may have revised it), the prover round it was on, the
+feedback that round was about to be given, and the last proof of it (the one
+the verifiers just rejected — the material the reviser judges its difficulty
+by when it next sees this lemma). Checkpoints are written at safe
 boundaries — the top of each iteration, the top of every prover round, and
 the end of each iteration — and by the SIGINT handler itself on Ctrl-C,
 which writes the last safe boundary's state and exits 130; a second Ctrl-C
@@ -69,13 +71,16 @@ verifier_2 and verifier_3 are separate agents — separate prompt files and
 separate roles — each a single call, so each step can later grow its
 own focus (for now all three prompts are identical). Any single reject ends
 the counting and sends the proof to the reviser with the
-verifier's reasoning about the failure. The reviser
-decides where the fault lies: a fault in the statement comes back as a
-revised statement, which becomes the prover's new target; a fault in the
+verifier's reasoning about the failure, along with the rejected proof itself
+(the last proof). The reviser decides where the fault lies: a fault in the
 argument keeps the statement and sends the prover back with the verdict as
-feedback. The loop allows MAX_PROOF_ATTEMPTS prover rounds per lemma per
-iteration (--max-proof-attempts), then gives the lemma up and asks the
-planner again.
+feedback; a fault in the statement comes back as a revised statement, which
+becomes the prover's new target; and a lemma judged too hard to prove as
+stated — from the shape of its last proof — is decomposed into a smaller
+lemma (a fresh id, a sub-statement the last proof left unjustified), which
+the prover then starts on with a fresh budget. The loop allows
+MAX_PROOF_ATTEMPTS prover rounds per lemma per iteration
+(--max-proof-attempts), then gives the lemma up and asks the planner again.
 
 When a call runs into the context wall
 --------------------------------------
@@ -365,17 +370,28 @@ VERIFIER_SCHEMA: Dict[str, Any] = {
     "required": ["decision", "justification"],
 }
 
-# new_statement is a string, not a nullable: the reviser writes the empty
-# string when it keeps the statement, which a grammar can enforce but a
-# ["string", "null"] union is fiddlier to ask one for.
+# new_statement and new_id are strings, not nullable: the reviser writes the
+# empty string when a field does not apply to the chosen action, which a
+# grammar can enforce but a ["string", "null"] union is fiddlier to ask one
+# for. action is an enum so a grammar can force one of the three choices.
 REVISER_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "statement_revision": {"type": "boolean"},
+        # Which of the three revisions the reviser has chosen.
+        #   keep              -> the statement is kept; the prover re-tries it
+        #                        with the verdict as feedback.
+        #   revise_statement  -> the statement is corrected (same id).
+        #   new_lemma         -> the target is too hard as stated; a smaller
+        #                        lemma (new_id + new_statement) is tried instead.
+        "action": {
+            "type": "string",
+            "enum": ["keep", "revise_statement", "new_lemma"],
+        },
         "diagnosis": {"type": "string"},
+        "new_id": {"type": "string"},
         "new_statement": {"type": "string"},
     },
-    "required": ["statement_revision", "diagnosis", "new_statement"],
+    "required": ["action", "diagnosis", "new_id", "new_statement"],
 }
 
 
@@ -443,8 +459,10 @@ def save_checkpoint(
     `iteration` is the next iteration a resuming run should start at, and
     `in_flight` (None unless a prover round is the resumable position) names
     the lemma to go straight back to the prover with: its target as the
-    reviser last left it, the prover round to re-run, and the feedback and
-    reject notes that round carries.
+    reviser last left it, the prover round to re-run, the feedback and reject
+    notes that round carries, and the last proof of it (the one just rejected
+    — the material the reviser judges its difficulty by when it next sees this
+    lemma).
     """
     if not CHECKPOINT_FILE:
         return
@@ -520,6 +538,7 @@ def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
                 "attempt": attempt,
                 "feedback": [n for n in (raw.get("feedback") or []) if isinstance(n, str)],
                 "attempt_notes": [n for n in (raw.get("attempt_notes") or []) if isinstance(n, str)],
+                "last_proof": str(raw.get("last_proof") or ""),
             }
         else:
             log(
@@ -1879,9 +1898,12 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         # prover writes a proof of `target`; the verifiers then check it —
         # three atomic passes, one per verifier agent — and one reject ends the
         # counting and sends the proof to the reviser with the verdict's
-        # reasoning. The reviser either keeps the statement (the prover
-        # re-tries with the verdict as feedback) or revises it (the revised
-        # statement becomes the new target). Only a proof that survives all
+        # reasoning. The reviser then either keeps the statement (the prover
+        # re-tries with the verdict as feedback), revises it (the revised
+        # statement becomes the new target), or decomposes it into a smaller
+        # lemma (judged too hard as stated from the last proof; the prover
+        # restarts on the new one with a fresh budget). Only a proof that
+        # survives all
         # three verifiers enters the DAG; after MAX_PROOF_ATTEMPTS prover
         # rounds the lemma is given up for this iteration and the planner is
         # asked again.
@@ -1905,13 +1927,18 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             feedback: List[str] = list(in_flight.get("feedback") or [])
             attempt_notes: List[str] = list(in_flight.get("attempt_notes") or [])
             first_attempt = in_flight["attempt"]
+            last_proof = str(in_flight.get("last_proof") or "")
         else:
             feedback: List[str] = []
             attempt_notes: List[str] = list(failed_attempts.get(lemma_id, []))
             first_attempt = 1
+            last_proof = ""
         proved = False
-
-        for attempt in range(first_attempt, MAX_PROOF_ATTEMPTS + 1):
+        attempt = first_attempt
+        # `attempt` is a while-loop counter rather than a for-range because the
+        # reviser can reset it: a lemma it decomposes into a smaller one starts
+        # its own prover rounds from 1 (see the new_lemma branch below).
+        while attempt <= MAX_PROOF_ATTEMPTS:
             # Checkpoint: this prover round is now the resumable position. If
             # the run is cancelled anywhere inside it, the next run re-runs
             # the round with this target and this feedback — the round's own
@@ -1922,6 +1949,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 "attempt": attempt,
                 "feedback": feedback,
                 "attempt_notes": attempt_notes,
+                "last_proof": last_proof,
             }
             _LIVE_STATE["in_flight"] = in_flight_state
             save_checkpoint(iteration, failed_attempts, in_flight_state, verbose)
@@ -1984,6 +2012,11 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 log(f"❌ Prover produced no proof for {lemma_id}.", verbose)
                 attempt_notes.append("Prover returned nothing.")
                 break
+
+            # The last proof of this lemma: what the verifiers are about to
+            # check, what the reviser will judge its difficulty by, and what
+            # the checkpoint records beside the in-flight state.
+            last_proof = proof
 
             # The DAG's edges now come from here. An empty declared list is
             # taken at face value — a proof from first principles has no
@@ -2079,7 +2112,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             reviser_user = (
                 f"Conjecture:\n{conjecture}\n\n"
                 f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
-                f"Rejected proof:\n{proof}\n\n"
+                f"The last proof of this lemma (the one just rejected; judge "
+                f"the lemma's difficulty from it):\n{proof}\n\n"
                 f"Verifier's reasoning (why the proof failed):\n{reject_just}"
             )
             revision_text, _revision_status = reason(
@@ -2094,10 +2128,17 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 revision_res = parse_json_or_none(revision_text)
                 if revision_res is None:
                     revision_res = extract(
-                        "Extract the revision decision. statement_revision is "
-                        "true only if the text proposes a changed statement. "
-                        "Copy new_statement verbatim; it is the empty string "
-                        "when the statement is kept.",
+                        "Extract the revision decision. action is one of "
+                        "'keep', 'revise_statement' or 'new_lemma': 'keep' if "
+                        "the statement is kept unchanged, 'revise_statement' "
+                        "only if the text proposes a changed statement for the "
+                        "same lemma, 'new_lemma' only if the text proposes a "
+                        "different, smaller lemma to prove instead. Copy "
+                        "new_statement verbatim; it is the empty string when "
+                        "the statement is kept. Copy new_id verbatim; it is the "
+                        "empty string unless action is 'new_lemma'. If the text "
+                        "uses 'statement_revision' instead of 'action', map "
+                        "true to 'revise_statement' and false to 'keep'.",
                         revision_text,
                         REVISER_SCHEMA,
                         "reviser",
@@ -2111,28 +2152,88 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 )
             revision_res = revision_res or {}
 
+            # `action` is the current contract; older per-conjecture
+            # overrides that still emit statement_revision are read the old
+            # way so they keep working.
+            action = str(revision_res.get("action") or "").strip().lower()
+            if action not in ("keep", "revise_statement", "new_lemma"):
+                action = (
+                    "revise_statement"
+                    if bool(revision_res.get("statement_revision", False))
+                    else "keep"
+                )
             diagnosis = str(revision_res.get("diagnosis") or "").strip()
+            new_id = str(revision_res.get("new_id") or "").strip()
             new_stmt = str(revision_res.get("new_statement") or "").strip()
-            wants_revision = bool(revision_res.get("statement_revision", False))
 
             feedback = [f"Verifier: {reject_just}"]
             if diagnosis:
                 feedback.append(f"Reviser's diagnosis: {diagnosis}")
 
-            if wants_revision and new_stmt and new_stmt != target["statement"]:
+            if (
+                action == "new_lemma"
+                and new_id
+                and new_stmt
+                and new_id not in dag["lemmas"]
+            ):
+                # Decomposition: the target is too hard to prove as stated.
+                # Record the old lemma's history — and why it was set aside —
+                # under its own id, then restart the prover on the smaller
+                # lemma with a fresh attempt budget and no inherited verdict.
+                old_id = lemma_id
+                # The current round's rejection is the old lemma's last word;
+                # fold it into its history before we set the lemma aside.
+                failed_attempts[old_id] = (
+                    list(attempt_notes)
+                    + list(feedback)
+                    + [
+                        f"Decomposed: {old_id} was judged too hard to prove "
+                        f"as stated; the reviser is instead trying {new_id}."
+                    ]
+                )
+                lemma_id = new_id
                 target = {"id": lemma_id, "statement": new_stmt}
                 if aim != "proof":
                     target["aim"] = aim
+                attempt_notes = [
+                    f"Decomposed from {old_id} by the reviser (the original "
+                    f"target was judged too hard to prove as stated)."
+                ]
+                # A fresh lemma has no rejection of its own, so the prover
+                # starts clean rather than inheriting the old proof's verdict.
+                feedback = []
+                last_proof = ""
+                attempt = 1
+                log(
+                    f"↻ Reviser decomposed {old_id}; the prover now starts on "
+                    f"the smaller lemma {lemma_id}:\n{new_stmt}",
+                    verbose,
+                )
+                continue
+
+            if action == "revise_statement" and new_stmt and new_stmt != target["statement"]:
+                target = {"id": lemma_id, "statement": new_stmt}
+                if aim != "proof":
+                    target["aim"] = aim
+                last_proof = ""
                 log(
                     f"↻ Reviser revised the lemma; the prover starts again "
                     f"from:\n{new_stmt}",
                     verbose,
                 )
                 feedback.append(f"Revised statement proposed: {new_stmt}")
-            elif wants_revision:
+            elif action == "revise_statement":
                 log(
                     "⚠️  Reviser flagged a statement revision but gave none "
                     "usable; keeping the statement.",
+                    verbose,
+                )
+            elif action == "new_lemma":
+                # The reviser wanted to decompose but the new id was missing or
+                # already taken; fall back to keeping the statement.
+                log(
+                    "⚠️  Reviser proposed a new lemma with a missing or "
+                    "already-taken id; keeping the statement instead.",
                     verbose,
                 )
             else:
@@ -2142,6 +2243,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                     verbose,
                 )
             attempt_notes.extend(feedback)
+            attempt += 1
             # Loop continues: the next prover round works on `target`, with
             # only this round's feedback.
 

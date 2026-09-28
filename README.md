@@ -33,11 +33,15 @@ Each iteration:
    adversarially — logic *and* arithmetic. Verification is three atomic
    steps, one per agent; a lemma enters the DAG only after all three have
    accepted it. (The three files are currently identical.)
-5. **Reviser** (`reviser.md`) handles a reject: it decides whether the fault
-   is in the *proof* (send the prover back with the verdict as feedback) or
-   in the *statement* (return a revised statement as the prover's new target).
-   After `MAX_PROOF_ATTEMPTS` (default 3) prover rounds the lemma is given
-   up and the planner is asked again.
+5. **Reviser** (`reviser.md`) handles a reject, judging the lemma's
+   difficulty from the rejected proof itself (the *last proof*). It decides
+   whether the fault is in the *proof* (keep the statement; send the prover
+   back with the verdict as feedback), in the *statement* (return a revised
+   statement as the prover's new target), or whether the lemma is *too hard*
+   to prove as stated (decompose it into a smaller lemma — a fresh id and a
+   sub-statement the last proof left unjustified — and start the prover on
+   that with a fresh budget). After `MAX_PROOF_ATTEMPTS` (default 3) prover
+   rounds the lemma is given up and the planner is asked again.
 
 ### Thinking vs. structured output
 
