@@ -17,9 +17,9 @@ two halves:
 The reasoning stage stays schema-free, because that is exactly where the
 model needs to think.
 
-All seven agent prompts (planner.md, selector.md, prover.md, verifier_1.md,
-verifier_2.md, verifier_3.md and reviser.md) instruct the model to emit
-strict JSON directly, so each
+All eight agent prompts (planner.md, selector.md, prover.md, verifier_1.md,
+verifier_2.md, verifier_3.md, reviser.md and reviser_incomplete.md) instruct
+the model to emit strict JSON directly, so each
 response is first
 parsed as-is; the extraction stage only runs as a fallback when the model
 fails to comply. The prover never round-trips through a second model call at
@@ -289,15 +289,36 @@ TEMPERATURES = {
 # Pi-style compaction on the context wall: a truncated call is resumed by
 # summarising its thinking trace and re-sending task + answer-so-far (see
 # _resume_compacted, between _headroom and reason below). A truncated
-# continuation is not a failure but the next pass, so the passes run until
-# the answer completes (or nothing is left to build on). COMPACT_CHUNK_TOKENS
-# bounds one compaction pass's input, COMPACT_TAIL_CHARS is what the compactor
-# sees of the answer-so-far, COMPACT_MIN_ROOM is the smallest headroom a
-# continuation is worth attempting.
+# continuation is not a failure but the next pass; the passes run until the
+# answer completes, nothing is left to build on, or MAX_COMPACTION_PASSES is
+# spent. COMPACT_CHUNK_TOKENS bounds one compaction pass's input,
+# COMPACT_TAIL_CHARS is what the compactor sees of the answer-so-far,
+# COMPACT_MIN_ROOM is the smallest headroom a continuation is worth attempting.
+#
+# COMPACT_THRESHOLD is the fraction of the window a call is allowed to fill
+# (prompt + thinking + answer) before it is cut off and compacted. It is the
+# single knob for "how long a role may think before compaction": the generation
+# budget is set so that prompt + budget lands on COMPACT_THRESHOLD * num_ctx,
+# leaving (1 - COMPACT_THRESHOLD) of the window as a safety margin rather than
+# a fixed 512 tokens. 0.99 leaves a ~1% margin; note the prompt itself eats
+# into the window, so the generation budget is really
+# (COMPACT_THRESHOLD * num_ctx) - prompt — a 30k prompt on a 90k window caps
+# generation near 60k regardless of this value. Raise toward 1.0 for maximum
+# thinking room; lower it only if a run reports the server tripping the wall.
 COMPACT_ENABLED = True
+COMPACT_THRESHOLD = 0.99
 COMPACT_CHUNK_TOKENS = 24000
 COMPACT_TAIL_CHARS = 2000
 COMPACT_MIN_ROOM = 2048
+
+# How many compaction-and-resume passes a single prover call may get before
+# the partial work is handed to the reviser. Two: the first pass usually
+# finishes an answer that merely ran long, the second covers the genuinely
+# long proofs. Still unfinished after the second, the lemma is too large for
+# one call — the trace and partial answer are compacted a final time and the
+# reviser picks a smaller lemma from them, instead of the prover grinding on
+# an unbounded number of passes (see _resume_compacted and the proof loop).
+MAX_COMPACTION_PASSES = 2
 
 # Set at runtime if schema-constrained extraction proves incompatible with the
 # model's default thinking (empty content, output stranded in .thinking).
@@ -789,11 +810,15 @@ def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
     tokenizers. PROFILE.estimate_tokens() uses a ratio calibrated from the
     prompt_eval_count of calls already made, so the estimate converges on the
     truth for whichever model is loaded.
+
+    The budget is set so that prompt + generation lands on
+    COMPACT_THRESHOLD * num_ctx: the model may think and write until the window
+    is COMPACT_THRESHOLD full, and only then is it cut off for compaction.
     """
     chars = sum(len(m["content"]) for m in messages)
     ratio = PROFILE.chars_per_token if PROFILE else 4.0
     used = int(chars / max(ratio, 1.0)) + 1
-    return max(num_ctx - used - 512, 0)
+    return max(int(num_ctx * COMPACT_THRESHOLD) - used, 0)
 
 
 COMPACT_SYSTEM = (
@@ -917,7 +942,8 @@ def _resume_compacted(
     content: str,
     think: Any,
     verbose: bool,
-) -> str:
+    max_passes: int = MAX_COMPACTION_PASSES,
+) -> Tuple[str, Optional[Dict[str, str]]]:
     """Pi-style overflow recovery after a truncated call.
 
     One pass: compact the reasoning trace (the scratch, summarised), keep
@@ -926,18 +952,27 @@ def _resume_compacted(
     now-smaller prompt: P + summary + C is strictly less than P + trace + C
     was.
 
-    The passes are not bounded by a count. When a continuation hits the wall
-    itself, its trace and answer-so-far become the next pass's input — the
-    summary carries across rounds, so nothing established earlier is lost —
-    and the model resumes from the new cut. The loop ends when the answer
-    completes, when a pass leaves nothing to build on, or when the prompt
-    plus the verbatim answer runs out of headroom; those return "" and fall
-    through to "ceiling", which the callers already handle.
+    A continuation that hits the wall is not a failure but the next pass: its
+    trace joins the summary, its content extends the verbatim answer, and the
+    model resumes from the new cut. The summary carries across passes, so
+    nothing established earlier is lost.
+
+    Returns (answer, None) once a pass completes the answer, or ("", state)
+    when the work is still unfinished after `max_passes` passes (or a pass can
+    no longer go on). `state` is {"summary", "thinking", "answer"}, the
+    partial work for the caller to hand on — the proof loop compacts it a
+    final time and sends it to the reviser to pick a smaller lemma.
     """
     answer = content
     summary = ""
     want_think = think if (think is not None and think is not False) else None
-    while True:
+
+    def _partial() -> Dict[str, str]:
+        # The work-so-far for a caller to hand on: the running summary, the
+        # latest (not-yet-compacted) trace, and the verbatim answer.
+        return {"summary": summary, "thinking": thinking, "answer": answer}
+
+    for _pass in range(max_passes):
         tail = answer[-COMPACT_TAIL_CHARS:]
         summary = _compact_trace(role, thinking, tail, verbose, summary)
 
@@ -971,11 +1006,22 @@ def _resume_compacted(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "\n\n".join(parts)},
         ]
+        # Show where the continuation prompt's tokens go: the original task is
+        # re-sent in full, then the compaction (trace summary + verbatim
+        # answer-so-far) rides on top. The two are different fixes, so keep
+        # them separate in the log.
+        _ratio = PROFILE.chars_per_token if PROFILE else 4.0
+        log(
+            f"  📦 {role} continuation prompt: task~{int(len(user_prompt)/_ratio)}"
+            f" + summary~{int(len(summary)/_ratio)}"
+            f" + answer~{int(len(answer)/_ratio)} tokens",
+            verbose,
+        )
         room = _headroom(messages, REASONING_OPTIONS["num_ctx"])
         if room < COMPACT_MIN_ROOM:
             log(f"  ⛔ {role} compaction left only ~{room} tokens of room; "
                 f"not enough to continue.", verbose)
-            return ""
+            return "", _partial()
         options = {
             **REASONING_OPTIONS,
             "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
@@ -986,7 +1032,7 @@ def _resume_compacted(
                                  options=options)
         except (requests.RequestException, ValueError, KeyError) as e:
             log(f"  ⚠️  {role} continuation transport error: {e}", verbose)
-            return ""
+            return "", _partial()
         cont_content, cont_thinking = _split_inline_thinking(
             reply.content or "", reply.thinking or "")
         if reply.truncated:
@@ -994,7 +1040,7 @@ def _resume_compacted(
                 log(f"  ⛔ {role} continuation was truncated with nothing "
                     f"to build on; the answer does not fit the window.",
                     verbose)
-                return ""
+                return "", _partial()
             # The continuation itself hit the wall: not a failure, the next
             # pass. Its trace joins the summary, its content extends the
             # verbatim answer, and the model resumes from the new cut.
@@ -1006,8 +1052,85 @@ def _resume_compacted(
             continue
         if not cont_content.strip():
             log(f"  ⚠️  {role} continuation returned empty content.", verbose)
-            return ""
-        return (answer + cont_content).strip()
+            return "", _partial()
+        return (answer + cont_content).strip(), None
+    # All `max_passes` passes spent and the answer is still unfinished.
+    log(
+        f"  ⛔ {role} still unfinished after {max_passes} compaction passes; "
+        f"handing the partial work on.",
+        verbose,
+    )
+    return "", _partial()
+
+
+def _incomplete_report(
+    role: str, partial: Dict[str, str], verbose: bool,
+) -> str:
+    """The third compaction, for a prover that overflowed the window.
+
+    The two bounded compaction passes left the last (cut-off) trace not yet
+    summarised; fold it into the running summary the way a continuation pass
+    would have, and pair the summary with the verbatim partial answer. The
+    result is what the reviser reads to pick a smaller lemma. Returns the
+    report text, or "" when there is nothing to report.
+    """
+    thinking = str(partial.get("thinking") or "")
+    answer = str(partial.get("answer") or "")
+    if not (thinking.strip() or answer.strip()):
+        return ""
+    summary = str(partial.get("summary") or "")
+    summary = _compact_trace(
+        role, thinking, answer[-COMPACT_TAIL_CHARS:], verbose, summary,
+    )
+    parts = [
+        "The prover ran out of its context window and did not finish: after "
+        f"{MAX_COMPACTION_PASSES} compaction-and-resume passes the proof was "
+        "still incomplete. Read its work below and choose a smaller lemma it "
+        "should try instead.",
+    ]
+    if summary.strip():
+        parts += [
+            "Summary of its reasoning trace (what it established, where it "
+            "stopped, what it cited):",
+            summary,
+        ]
+    if answer.strip():
+        parts += [
+            "The partial answer it wrote, verbatim, ending exactly where it "
+            "was cut off:",
+            answer,
+        ]
+    return "\n\n".join(parts)
+
+
+def _parse_reviser_decision(revision_text: str, verbose: bool) -> Dict[str, Any]:
+    """Parse a reviser's JSON decision, with an extraction fallback.
+
+    reviser.md and reviser_incomplete.md both demand raw JSON; when the model
+    wraps it in prose, extract() recovers the fields. Returns {} when there is
+    nothing to recover — the caller treats that as "no usable decision".
+    """
+    if not revision_text:
+        return {}
+    res = parse_json_or_none(revision_text)
+    if res is None:
+        res = extract(
+            "Extract the revision decision. action is one of 'keep', "
+            "'revise_statement' or 'new_lemma': 'keep' if the statement is "
+            "kept unchanged, 'revise_statement' only if the text proposes a "
+            "changed statement for the same lemma, 'new_lemma' only if the "
+            "text proposes a different, smaller lemma to prove instead. Copy "
+            "new_statement verbatim; it is the empty string when the "
+            "statement is kept. Copy new_id verbatim; it is the empty string "
+            "unless action is 'new_lemma'. If the text uses "
+            "'statement_revision' instead of 'action', map true to "
+            "'revise_statement' and false to 'keep'.",
+            revision_text,
+            REVISER_SCHEMA,
+            "reviser",
+            verbose,
+        )
+    return res or {}
 
 
 def reason(
@@ -1016,22 +1139,27 @@ def reason(
     role: str,
     think: Any = True,
     verbose: bool = True,
-) -> Tuple[str, str]:
+) -> Tuple[str, str, Optional[Dict[str, str]]]:
     """Stage 1: free-form reasoning. No `format`, so thinking is preserved.
 
-    Returns (content, status). status is "" on success, or "ceiling" when the
-    role exhausted the context window without finishing — a signal that the
-    task is too large, not that the call failed.
+    Returns (content, status, partial). status is "" on success, or "ceiling"
+    when the role exhausted the context window without finishing — a signal
+    that the task is too large, not that the call failed. `partial` is None on
+    success; on "ceiling" after a bounded compaction rescue it carries the
+    partial work ({"summary", "thinking", "answer"}) for the caller to hand
+    on — the proof loop compacts it a final time and sends it to the reviser.
 
     Truncated output is never returned as if it were complete: `done_reason ==
     "length"` means the model was cut off mid-sentence, and the budget already
     covers the whole window. Before a truncation is reported as "ceiling" the
-    exchange gets pi-style compaction rescues — the thinking trace
+    exchange gets a pi-style compaction rescue — the thinking trace
     summarised, the answer written so far kept verbatim, the model asked to
-    resume from the cut (see _resume_compacted). The passes are unbounded:
-    a continuation that is itself truncated becomes the next pass's input,
-    and only a pass that leaves nothing to build on, or no headroom left,
-    means the task is too large for the window.
+    resume from the cut (see _resume_compacted). The rescue is bounded by
+    MAX_COMPACTION_PASSES passes: a continuation that is itself truncated
+    becomes the next pass's input, and once the passes are spent (or a pass
+    leaves nothing to build on, or no headroom is left) the partial work is
+    returned for the caller to decide what to do — for the prover, handing it
+    to the reviser to pick a smaller lemma.
     """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1060,7 +1188,7 @@ def reason(
             hit_ceiling = reply.truncated
 
             if content.strip() and not hit_ceiling:
-                return content.strip(), ""
+                return content.strip(), "", None
 
             if hit_ceiling:
                 spent = reply.eval_tokens or (len(thinking) + len(content)) // 4
@@ -1073,27 +1201,27 @@ def reason(
                 # A pi-style compaction rescue, when there is something to
                 # resume from: the trace gets summarised, the answer-so-far
                 # is kept verbatim, and the model is asked to finish from the
-                # cut — as many passes as it takes, each truncated
-                # continuation feeding the next (see _resume_compacted).
-                # Any failure falls through to "ceiling" below, which the
-                # callers already handle.
+                # cut. The rescue is bounded by MAX_COMPACTION_PASSES passes;
+                # if the work is still unfinished then, its partial state is
+                # returned so the proof loop can hand it to the reviser.
+                partial: Optional[Dict[str, str]] = None
                 if COMPACT_ENABLED and (thinking.strip() or content.strip()):
-                    resumed = _resume_compacted(
+                    resumed, partial = _resume_compacted(
                         role, system_prompt, user_prompt, thinking, content,
                         want_think, verbose,
                     )
                     if resumed:
                         log(f"  ✅ {role} completed after compaction + "
                             f"continuation.", verbose)
-                        return resumed, ""
-                return "", "ceiling"
+                        return resumed, "", None
+                return "", "ceiling", partial
 
             log(f"  ⚠️  {role} returned empty content (attempt {attempt}).", verbose)
         except (requests.RequestException, ValueError, KeyError) as e:
             log(f"  ⚠️  {role} transport error (attempt {attempt}): {e}", verbose)
 
     # Retries exhausted on empty replies or transport errors; nothing to salvage.
-    return "", ""
+    return "", "", None
 
 
 def extract(
@@ -1432,7 +1560,7 @@ def select_lemma(
         f"one will be sent to the prover; choose from these only:\n"
         f"{json.dumps(usable, indent=2)}"
     )
-    text, _status = reason(selector_sys, selector_user, "selector",
+    text, _status, _partial = reason(selector_sys, selector_user, "selector",
                            THINK["selector"], verbose)
     check_mode_toggle(verbose)
 
@@ -1515,7 +1643,7 @@ def _run_verifier(
     goes to the reviser rather than into the DAG on the strength of the
     other two verifiers.
     """
-    review, review_status = reason(
+    review, review_status, _partial = reason(
         system_prompt, user_prompt, role, THINK[role], verbose,
     )
     check_mode_toggle(verbose)
@@ -1567,11 +1695,15 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
     # One prompt per verification step; VERIFIER_AGENTS names the three.
     verifier_sys = {name: load_file(PROMPT_PATHS[name]) for name in VERIFIER_AGENTS}
     reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
+    # The overflow variant: the prover ran out of context, so this reviser
+    # reads a summarised trace plus the partial proof instead of a full one.
+    reviser_incomplete_sys = load_file(PROMPT_PATHS["reviser_incomplete.md"])
 
     empty = [name for name, text in (
         ("planner.md", planner_sys), ("selector.md", selector_sys),
         ("prover.md", prover_sys), *verifier_sys.items(),
         ("reviser.md", reviser_sys),
+        ("reviser_incomplete.md", reviser_incomplete_sys),
     ) if not text]
     if empty:
         # A missing system prompt does not crash — it produces an agent with
@@ -1734,7 +1866,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 f"Previously rejected attempts (avoid or decompose these):\n"
                 f"{json.dumps(failed_attempts, indent=2)}"
             )
-            plan_text, plan_status = reason(
+            plan_text, plan_status, _partial = reason(
                 planner_sys, planner_user, "planner", THINK["planner"], verbose
             )
             check_mode_toggle(verbose)
@@ -1978,22 +2110,112 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                     else ""
                 )
             )
-            proof_text, prover_status = reason(
+            proof_text, prover_status, prover_partial = reason(
                 prover_sys, prover_user, "prover", THINK["prover"], verbose
             )
             check_mode_toggle(verbose)
 
-            if prover_status == "ceiling" and not proof_text:
+            if prover_status == "ceiling":
+                # The prover exhausted the window and the compaction rescue
+                # (bounded by MAX_COMPACTION_PASSES) could not finish it. The
+                # partial work is still worth reading: compact it one last time
+                # and let the reviser pick a smaller lemma from it, instead of
+                # discarding it and asking the planner to decompose blind.
+                report = _incomplete_report(
+                    "prover", prover_partial or {}, verbose,
+                )
+                if not report:
+                    log(
+                        f"⛔ Lemma {lemma_id} is too large to prove in one call "
+                        f"and left nothing to build on. Asking the planner to "
+                        f"decompose it.",
+                        verbose,
+                    )
+                    attempt_notes.append(
+                        "Lemma too large: the prover exhausted its entire token "
+                        "budget without completing a proof and left nothing to "
+                        "resume from. Decompose this into smaller, "
+                        "independently provable lemmas rather than re-proposing "
+                        "it."
+                    )
+                    break
                 log(
-                    f"⛔ Lemma {lemma_id} is too large to prove in one call. "
-                    f"Asking the planner to decompose it.",
+                    f"⛔ Lemma {lemma_id} overflowed the context window after "
+                    f"{MAX_COMPACTION_PASSES} compaction passes; asking the "
+                    f"reviser to pick a smaller lemma from the partial proof.",
                     verbose,
                 )
+                overflow_user = (
+                    f"Conjecture:\n{conjecture}\n\n"
+                    f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
+                    f"{report}"
+                )
+                revision_text, _revision_status, _revision_partial = reason(
+                    reviser_incomplete_sys, overflow_user, "reviser",
+                    THINK["reviser"], verbose,
+                )
+                check_mode_toggle(verbose)
+                revision_res = _parse_reviser_decision(revision_text, verbose)
+                action = str(revision_res.get("action") or "").strip().lower()
+                diagnosis = str(revision_res.get("diagnosis") or "").strip()
+                new_id = str(revision_res.get("new_id") or "").strip()
+                new_stmt = str(revision_res.get("new_statement") or "").strip()
+                overflow_feedback = [
+                    f"Prover: the proof of {lemma_id} overflowed the context "
+                    f"window after {MAX_COMPACTION_PASSES} compaction passes; "
+                    f"the reviser is choosing a smaller lemma from the partial "
+                    f"work."
+                ]
+                if diagnosis:
+                    overflow_feedback.append(f"Reviser's diagnosis: {diagnosis}")
+                if (
+                    action == "new_lemma"
+                    and new_id
+                    and new_stmt
+                    and new_id not in dag["lemmas"]
+                ):
+                    # The reviser found a smaller lemma worth trying. Set the
+                    # overflowing lemma aside (its history is recorded under its
+                    # own id) and start the prover on the smaller lemma with a
+                    # fresh budget and no inherited verdict.
+                    old_id = lemma_id
+                    failed_attempts[old_id] = (
+                        list(attempt_notes)
+                        + list(overflow_feedback)
+                        + [
+                            f"Overflowed: {old_id} ran out of the prover's "
+                            f"context window; the reviser is instead trying "
+                            f"{new_id}."
+                        ]
+                    )
+                    lemma_id = new_id
+                    target = {"id": lemma_id, "statement": new_stmt}
+                    if aim != "proof":
+                        target["aim"] = aim
+                    attempt_notes = [
+                        f"Overflowed from {old_id}: the prover ran out of the "
+                        f"context window; the reviser is trying the smaller "
+                        f"{lemma_id} instead."
+                    ]
+                    feedback = []
+                    last_proof = ""
+                    attempt = 1
+                    log(
+                        f"↻ Prover overflowed {old_id}; now trying the smaller "
+                        f"lemma {lemma_id}:\n{new_stmt}",
+                        verbose,
+                    )
+                    continue
+                log(
+                    "⛔ Reviser could not pick a usable smaller lemma from the "
+                    "partial proof; the planner will decompose.",
+                    verbose,
+                )
+                attempt_notes.extend(overflow_feedback)
                 attempt_notes.append(
-                    "Lemma too large: the prover exhausted its entire token "
-                    "budget without completing a proof. Decompose this into "
-                    "smaller, independently provable lemmas rather than "
-                    "re-proposing it."
+                    "Lemma too large: the prover exhausted its context window "
+                    "and the reviser could not split it further. Decompose "
+                    "into smaller, independently provable lemmas."
                 )
                 break
 
@@ -2116,7 +2338,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 f"the lemma's difficulty from it):\n{proof}\n\n"
                 f"Verifier's reasoning (why the proof failed):\n{reject_just}"
             )
-            revision_text, _revision_status = reason(
+            revision_text, _revision_status, _partial = reason(
                 reviser_sys, reviser_user, "reviser", THINK["reviser"], verbose
             )
             check_mode_toggle(verbose)
