@@ -14,7 +14,6 @@ Layout:
 
     agents/
       planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md  <- project-wide defaults
-      reviser_incomplete.md  <- reviser's prompt for a proof that overflowed
 
 Two decisions worth flagging, both changeable:
 
@@ -61,7 +60,7 @@ AGENTS_DIR = "agents"
 PROMPT_FILES = (
     "planner.md", "selector.md", "prover.md",
     "verifier_1.md", "verifier_2.md", "verifier_3.md",
-    "reviser.md", "reviser_incomplete.md", "parsing.md",
+    "reviser.md", "parsing.md",
 )
 
 

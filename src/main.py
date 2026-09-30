@@ -17,9 +17,9 @@ two halves:
 The reasoning stage stays schema-free, because that is exactly where the
 model needs to think.
 
-All eight agent prompts (planner.md, selector.md, prover.md, verifier_1.md,
-verifier_2.md, verifier_3.md, reviser.md and reviser_incomplete.md) instruct
-the model to emit strict JSON directly, so each
+All seven agent prompts (planner.md, selector.md, prover.md, verifier_1.md,
+verifier_2.md, verifier_3.md and reviser.md) instruct the model to emit
+strict JSON directly, so each
 response is first
 parsed as-is; the extraction stage only runs as a fallback when the model
 fails to comply. The prover never round-trips through a second model call at
@@ -102,9 +102,10 @@ covers the genuinely long proofs). Still unfinished after that many — or a
 pass that leaves nothing to build on, or no headroom left — degrades to the
 "ceiling" with the partial work ({"summary", "thinking", "answer"}) for the
 caller to hand on: the proof loop compacts it a final time via
-_incomplete_report() and sends the summary plus the partial answer to
-reviser_incomplete.md to pick a smaller lemma; only when there is nothing
-to build on, or the reviser cannot pick one, does the planner decompose.
+_incomplete_report() and sends the summary plus the partial answer to the
+reviser (the overflow case of reviser.md) to pick a smaller lemma or revise
+the statement; only when there is nothing to build on, or the reviser has
+nothing usable, does the planner decompose.
 
 In --mode human the picker is a person, and picking is two decisions rather
 than one. A number and Enter accepts that candidate as true on your
@@ -322,7 +323,8 @@ COMPACT_MIN_ROOM = 2048
 # finishes an answer that merely ran long, the second covers the genuinely
 # long proofs. Still unfinished after the second, the lemma is too large for
 # one call — the trace and partial answer are compacted a final time and the
-# reviser picks a smaller lemma from them, instead of the prover grinding on
+# reviser picks a smaller lemma from them (or revises the statement),
+# instead of the prover grinding on
 # an unbounded number of passes (see _resume_compacted and the proof loop).
 MAX_COMPACTION_PASSES = 2
 
@@ -967,7 +969,8 @@ def _resume_compacted(
     when the work is still unfinished after `max_passes` passes (or a pass can
     no longer go on). `state` is {"summary", "thinking", "answer"}, the
     partial work for the caller to hand on — the proof loop compacts it a
-    final time and sends it to the reviser to pick a smaller lemma.
+    final time and sends it to the reviser to pick a smaller lemma or
+    revise the statement.
     """
     answer = content
     summary = ""
@@ -1077,8 +1080,9 @@ def _incomplete_report(
     The two bounded compaction passes left the last (cut-off) trace not yet
     summarised; fold it into the running summary the way a continuation pass
     would have, and pair the summary with the verbatim partial answer. The
-    result is what the reviser reads to pick a smaller lemma. Returns the
-    report text, or "" when there is nothing to report.
+    result is what the reviser reads to pick a smaller lemma or revise the
+    statement. Returns the report text, or "" when there is nothing to
+    report.
     """
     thinking = str(partial.get("thinking") or "")
     answer = str(partial.get("answer") or "")
@@ -1092,7 +1096,8 @@ def _incomplete_report(
         "The prover ran out of its context window and did not finish: after "
         f"{MAX_COMPACTION_PASSES} compaction-and-resume passes the proof was "
         "still incomplete. Read its work below and choose a smaller lemma it "
-        "should try instead.",
+        "should try instead — or a corrected statement, if its work shows "
+        "the statement is false or badly posed.",
     ]
     if summary.strip():
         parts += [
@@ -1112,9 +1117,9 @@ def _incomplete_report(
 def _parse_reviser_decision(revision_text: str, verbose: bool) -> Dict[str, Any]:
     """Parse a reviser's JSON decision, with an extraction fallback.
 
-    reviser.md and reviser_incomplete.md both demand raw JSON; when the model
-    wraps it in prose, extract() recovers the fields. Returns {} when there is
-    nothing to recover — the caller treats that as "no usable decision".
+    reviser.md demands raw JSON; when the model wraps it in prose, extract()
+    recovers the fields. Returns {} when there is nothing to recover — the
+    caller treats that as "no usable decision".
     """
     if not revision_text:
         return {}
@@ -1165,7 +1170,7 @@ def reason(
     becomes the next pass's input, and once the passes are spent (or a pass
     leaves nothing to build on, or no headroom is left) the partial work is
     returned for the caller to decide what to do — for the prover, handing it
-    to the reviser to pick a smaller lemma.
+    to the reviser to pick a smaller lemma or revise the statement.
     """
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1701,16 +1706,16 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
     prover_sys = load_file(PROMPT_PATHS["prover.md"])
     # One prompt per verification step; VERIFIER_AGENTS names the three.
     verifier_sys = {name: load_file(PROMPT_PATHS[name]) for name in VERIFIER_AGENTS}
+    # One reviser for both failures: a rejected proof, and a prover that
+    # overflowed the context window. The user message tells it which case it
+    # is — a full rejected proof with the verifier's reasoning, or a
+    # summarised trace plus the partial answer.
     reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
-    # The overflow variant: the prover ran out of context, so this reviser
-    # reads a summarised trace plus the partial proof instead of a full one.
-    reviser_incomplete_sys = load_file(PROMPT_PATHS["reviser_incomplete.md"])
 
     empty = [name for name, text in (
         ("planner.md", planner_sys), ("selector.md", selector_sys),
         ("prover.md", prover_sys), *verifier_sys.items(),
         ("reviser.md", reviser_sys),
-        ("reviser_incomplete.md", reviser_incomplete_sys),
     ) if not text]
     if empty:
         # A missing system prompt does not crash — it produces an agent with
@@ -2126,8 +2131,9 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 # The prover exhausted the window and the compaction rescue
                 # (bounded by MAX_COMPACTION_PASSES) could not finish it. The
                 # partial work is still worth reading: compact it one last time
-                # and let the reviser pick a smaller lemma from it, instead of
-                # discarding it and asking the planner to decompose blind.
+                # and let the reviser pick a smaller lemma or revise the
+                # statement from it, instead of discarding it and asking the
+                # planner to decompose blind.
                 report = _incomplete_report(
                     "prover", prover_partial or {}, verbose,
                 )
@@ -2149,7 +2155,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 log(
                     f"⛔ Lemma {lemma_id} overflowed the context window after "
                     f"{MAX_COMPACTION_PASSES} compaction passes; asking the "
-                    f"reviser to pick a smaller lemma from the partial proof.",
+                    f"reviser to pick a smaller lemma or revise the statement "
+                    f"from the partial proof.",
                     verbose,
                 )
                 overflow_user = (
@@ -2158,7 +2165,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                     f"{report}"
                 )
                 revision_text, _revision_status, _revision_partial = reason(
-                    reviser_incomplete_sys, overflow_user, "reviser",
+                    reviser_sys, overflow_user, "reviser",
                     THINK["reviser"], verbose,
                 )
                 check_mode_toggle(verbose)
@@ -2170,8 +2177,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 overflow_feedback = [
                     f"Prover: the proof of {lemma_id} overflowed the context "
                     f"window after {MAX_COMPACTION_PASSES} compaction passes; "
-                    f"the reviser is choosing a smaller lemma from the partial "
-                    f"work."
+                    f"the reviser is choosing a smaller lemma or a corrected "
+                    f"statement from the partial work."
                 ]
                 if diagnosis:
                     overflow_feedback.append(f"Reviser's diagnosis: {diagnosis}")
@@ -2213,16 +2220,45 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                         verbose,
                     )
                     continue
+                if (
+                    action == "revise_statement"
+                    and new_stmt
+                    and new_stmt != target["statement"]
+                ):
+                    # The partial work shows the statement is false or badly
+                    # posed, and the reviser has corrected it. The lemma keeps
+                    # its id and its attempt budget — the overflowing round
+                    # still counts — and the prover re-runs on the correction
+                    # with this round's feedback, the way a rejected-proof
+                    # revision does.
+                    target = {"id": lemma_id, "statement": new_stmt}
+                    if aim != "proof":
+                        target["aim"] = aim
+                    last_proof = ""
+                    overflow_feedback.append(
+                        f"Revised statement proposed: {new_stmt}"
+                    )
+                    feedback = overflow_feedback
+                    attempt_notes.extend(overflow_feedback)
+                    attempt += 1
+                    log(
+                        f"↻ Reviser revised the lemma after the overflow; the "
+                        f"prover starts again from:\n{new_stmt}",
+                        verbose,
+                    )
+                    continue
                 log(
-                    "⛔ Reviser could not pick a usable smaller lemma from the "
-                    "partial proof; the planner will decompose.",
+                    "⛔ Reviser could not pick a usable smaller lemma or "
+                    "revised statement from the partial proof; the planner "
+                    "will decompose.",
                     verbose,
                 )
                 attempt_notes.extend(overflow_feedback)
                 attempt_notes.append(
                     "Lemma too large: the prover exhausted its context window "
-                    "and the reviser could not split it further. Decompose "
-                    "into smaller, independently provable lemmas."
+                    "and the reviser could neither split it further nor "
+                    "revise its statement. Decompose into smaller, "
+                    "independently provable lemmas."
                 )
                 break
 

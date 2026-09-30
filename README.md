@@ -42,8 +42,8 @@ Each iteration:
    sub-statement the last proof left unjustified — and start the prover on
    that with a fresh budget). After `MAX_PROOF_ATTEMPTS` (default 3) prover
    rounds the lemma is given up and the planner is asked again. When the
-   prover instead overflows the context window, the same job falls to
-   `reviser_incomplete.md`, working from the partial proof — see
+   prover instead overflows the context window, the same reviser does the
+   same job from the partial proof — see
    [When a call hits the context wall](#when-a-call-hits-the-context-wall).
 
 ### Thinking vs. structured output
@@ -72,14 +72,17 @@ ran long, the second covers the genuinely long proofs. Still unfinished then
 — or when a pass leaves nothing to build on, or no headroom is left —
 `reason()` reports the ceiling and hands back the partial work. The proof
 loop compacts it a final time (folding the last cut-off trace into the
-summary) and sends the summary plus the verbatim partial answer to
-`reviser_incomplete.md`, a variant of the reviser that reads an overflow
-instead of a rejected proof and picks a smaller lemma the partial work was
-building toward. If it finds one, the overflowing lemma is set aside — its
-history recorded under its own id — and the prover starts on the smaller
-lemma with a fresh budget. Only when there is nothing left to build on, or
-the reviser cannot pick a usable smaller lemma, does the lemma fall back to
-the planner's decomposition escape hatches.
+summary) and sends the summary plus the verbatim partial answer to the
+reviser, which now reads an overflow instead of a rejected proof and picks
+a smaller lemma the partial work was building toward — or, if the partial
+work shows the statement itself is false or badly posed, returns a
+corrected statement. If it finds a smaller lemma, the overflowing lemma is
+set aside — its history recorded under its own id — and the prover starts
+on the smaller lemma with a fresh budget; a corrected statement keeps the
+lemma's id and the prover re-runs on it. Only when there is nothing left
+to build on, or the reviser has neither a usable smaller lemma nor a usable
+revision, does the lemma fall back to the planner's decomposition escape
+hatches.
 
 ### Backend
 
@@ -183,8 +186,7 @@ a line of input in the other.
 
 ```
 agents/
-  planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md   # default agent prompts
-  reviser_incomplete.md                     # overflow reviser (partial proofs)
+  planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md   # default agent prompts (one reviser for rejects and overflows)
   parsing.md                               # references parser prompt
 src/
   main.py              # the proof loop (planner → selector → prover → verifier → reviser)
