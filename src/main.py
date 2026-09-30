@@ -60,8 +60,9 @@ selector.md is asked to weigh them all and name the one it judges most
 likely to come through the prover and the verifiers. The planner's best-first
 order is the fallback, not the default — it is what gets taken when the
 selector fails, names a candidate it was not offered, or when only one
-candidate survives, where there is nothing left to choose. A candidate naming
-an unproved dependency still costs a candidate rather than a whole iteration.
+candidate survives, where there is nothing left to choose. A candidate whose
+id is already in the DAG is dropped from the shortlist — the rest still go to
+selection — rather than stalling the whole iteration.
 
 Proving is a loop, not a single pass
 ------------------------------------
@@ -92,12 +93,18 @@ summary — Goal, Progress, Key Decisions, Next Steps, Critical Context, plus
 a <cited-lemmas> tracking block — in chunked passes if it is big; the task
 prompt and the answer written so far are kept verbatim, the answer ending
 exactly where it was cut; and the model is asked to resume from the cut with
-the whole headroom of the now-smaller prompt. The passes are unbounded: a
-continuation that hits the wall itself becomes the next pass's input, its
-trace folded into the summary, its text extending the verbatim answer, so
-the loop runs as long as the answer keeps advancing. Only a pass that leaves
-nothing to build on, or no headroom left, degrades to the "ceiling" the
-planner/prover/verifier callers already handle.
+the whole headroom of the now-smaller prompt. A continuation that hits the
+wall itself is not a failure but the next pass: its trace folds into the
+summary, its text extends the verbatim answer, and the model resumes from
+the new cut. The rescue is bounded to MAX_COMPACTION_PASSES passes (two:
+the first usually finishes an answer that merely ran long, the second
+covers the genuinely long proofs). Still unfinished after that many — or a
+pass that leaves nothing to build on, or no headroom left — degrades to the
+"ceiling" with the partial work ({"summary", "thinking", "answer"}) for the
+caller to hand on: the proof loop compacts it a final time via
+_incomplete_report() and sends the summary plus the partial answer to
+reviser_incomplete.md to pick a smaller lemma; only when there is nothing
+to build on, or the reviser cannot pick one, does the planner decompose.
 
 In --mode human the picker is a person, and picking is two decisions rather
 than one. A number and Enter accepts that candidate as true on your
@@ -252,14 +259,13 @@ THINK = {
 # same symbols (\epsilon, n, x_i) over and over, and the extraction stage's
 # whole job is verbatim copying.
 #
-# The right value is model-specific, so the per-model baseline lives in
-# llm_backend.OVERRIDES and the backend layers these on top; anything set
-# here wins, anything omitted takes the model's recommended value. Keep the
-# dict minimal for that reason.
+# The right value is model-specific, but there is no per-model baseline in
+# this codebase: a model runs on its own card's default, and whatever is set
+# in these option dicts wins. Keep the dicts minimal for that reason.
 REASONING_OPTIONS: Dict[str, Any] = {
     "temperature": 0.7,          # Greedy decoding degrades thinking models.
     "num_ctx": NUM_CTX,
-    # presence_penalty: deliberately absent — see llm_backend.OVERRIDES.
+    # presence_penalty: deliberately absent — the server's default applies.
     # num_predict is set per call by reason(); see the NUM_CTX comment.
 }
 
@@ -267,7 +273,7 @@ EXTRACT_OPTIONS: Dict[str, Any] = {
     "temperature": 0.0,          # Mechanical, and grammar-constrained anyway.
     "presence_penalty": 0.0,     # Must be 0 on every model: this stage copies,
                                  # it doesn't write. Stated explicitly so it
-                                 # overrides whatever OVERRIDES recommends.
+                                 # overrides whatever the model's default is.
     "min_p": 0.0,
     "num_ctx": NUM_CTX,
     # num_predict is set per call by extract(); see the NUM_CTX comment.
@@ -807,16 +813,16 @@ def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
     The prompt size used to be estimated as chars // 4. That is optimistic for
     LaTeX-dense text and, worse, it is tokenizer-specific — the whole point of
     this project is now to run the same conjecture through four different
-    tokenizers. PROFILE.estimate_tokens() uses a ratio calibrated from the
-    prompt_eval_count of calls already made, so the estimate converges on the
-    truth for whichever model is loaded.
+    tokenizers. llm_backend.chars_per_token() reads the running estimate that
+    note_usage() revises from each call's real prompt token count, so the
+    estimate converges on the truth for whichever model is loaded.
 
     The budget is set so that prompt + generation lands on
     COMPACT_THRESHOLD * num_ctx: the model may think and write until the window
     is COMPACT_THRESHOLD full, and only then is it cut off for compaction.
     """
     chars = sum(len(m["content"]) for m in messages)
-    ratio = PROFILE.chars_per_token if PROFILE else 4.0
+    ratio = llm_backend.chars_per_token()
     used = int(chars / max(ratio, 1.0)) + 1
     return max(int(num_ctx * COMPACT_THRESHOLD) - used, 0)
 
@@ -855,7 +861,7 @@ def _split_trace_chunks(text: str, max_tokens: int) -> List[str]:
     compaction pass never needs more than a fraction of the window. Breaking
     on newlines keeps no LaTeX display cut mid-line; a chunk may still exceed
     the limit by one very long line, which the pass's headroom absorbs."""
-    ratio = PROFILE.chars_per_token if PROFILE else 4.0
+    ratio = llm_backend.chars_per_token()
     max_chars = max(int(max_tokens * ratio), 1000)
     chunks: List[str] = []
     cur = ""
@@ -1010,7 +1016,7 @@ def _resume_compacted(
         # re-sent in full, then the compaction (trace summary + verbatim
         # answer-so-far) rides on top. The two are different fixes, so keep
         # them separate in the log.
-        _ratio = PROFILE.chars_per_token if PROFILE else 4.0
+        _ratio = llm_backend.chars_per_token()
         log(
             f"  📦 {role} continuation prompt: task~{int(len(user_prompt)/_ratio)}"
             f" + summary~{int(len(summary)/_ratio)}"
@@ -1191,7 +1197,8 @@ def reason(
                 return content.strip(), "", None
 
             if hit_ceiling:
-                spent = reply.eval_tokens or (len(thinking) + len(content)) // 4
+                spent = (reply.usage.get("completion_tokens")
+                         or (len(thinking) + len(content)) // 4)
                 log(
                     f"  ⛔ {role} hit the context wall "
                     f"(num_ctx={options['num_ctx']}, generated {spent} tokens, "
@@ -2517,12 +2524,32 @@ def main() -> None:
     )
     parser.add_argument(
         "--host", default=None,
-        help="llama-server base URL. Defaults to $LLAMA_HOST or "
-             "localhost:8081 (8080 is taken by open-webui).",
+        help="OpenAI-compatible base URL: a local llama-server, or a hosted "
+             "API's base (e.g. https://api.openai.com/v1). Defaults to "
+             "$LLAMA_HOST or localhost:8081 (8080 is taken by open-webui).",
+    )
+    parser.add_argument(
+        "--api-key", default=None,
+        help="API key sent as 'Authorization: Bearer <key>'. Needed for a "
+             "hosted API; defaults to $LLM_API_KEY. Leave unset for a plain "
+             "local llama-server (or one launched without --api-key).",
     )
     parser.add_argument(
         "--model", default=MODEL_NAME,
-        help="The --alias llama-server was launched with",
+        help="Model name: the --alias llama-server was launched with, or the "
+             "provider's model id (e.g. gpt-4o).",
+    )
+    parser.add_argument(
+        "--backend", choices=("auto", "llamacpp", "openai"), default="auto",
+        help=(
+            "Which dialect of the OpenAI-compatible endpoint to speak. "
+            "auto (default): probe /props — an answer means llama.cpp (full "
+            "option set, thinking suppressed for schema calls), no answer "
+            "means a generic endpoint (standard OpenAI fields). llamacpp / "
+            "openai force one side of that decision, for when the probe "
+            "can't see the real server (a proxy in front of llama-server, a "
+            "provider that happens to serve /props)."
+        ),
     )
     parser.add_argument(
         "--conjecture", default=DEFAULT_CONJECTURE,
@@ -2584,9 +2611,14 @@ def main() -> None:
     # explicit --num-ctx is clamped to. Doing this before resolving paths
     # also means a dead server is reported before a missing directory.
     BACKEND = llm_backend.make_backend(
-        args.model, args.host, REQUEST_TIMEOUT
+        args.model, args.host, REQUEST_TIMEOUT, api_key=args.api_key,
+        backend=args.backend
     )
     PROFILE = BACKEND.probe()
+    # A key the API rejected is not a "degrade to defaults" situation: every
+    # call in the run would 401. Fail now, before spending a token on it.
+    if PROFILE.auth_error:
+        parser.error(PROFILE.auth_error)
 
     # Resolve the context window: an explicit --num-ctx wins (clamped to the
     # probed ceiling); with no argument, take the server's own context — see

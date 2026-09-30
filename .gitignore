@@ -2,3 +2,6 @@ __pycache__/
 conjectures/algebra_example/references/*
 .comments
 *.checkpoint.json
+# Never commit API keys (README "Backend": --api-key / $LLM_API_KEY).
+.env
+.env.*

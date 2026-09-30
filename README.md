@@ -41,7 +41,10 @@ Each iteration:
    to prove as stated (decompose it into a smaller lemma — a fresh id and a
    sub-statement the last proof left unjustified — and start the prover on
    that with a fresh budget). After `MAX_PROOF_ATTEMPTS` (default 3) prover
-   rounds the lemma is given up and the planner is asked again.
+   rounds the lemma is given up and the planner is asked again. When the
+   prover instead overflows the context window, the same job falls to
+   `reviser_incomplete.md`, working from the partial proof — see
+   [When a call hits the context wall](#when-a-call-hits-the-context-wall).
 
 ### Thinking vs. structured output
 
@@ -54,24 +57,58 @@ disables reasoning for exactly the calls that carry a schema.
 ### When a call hits the context wall
 
 The server is stateless, so a response cut off by the context window cannot
-just be re-sent. Before reporting a ceiling, `reason()` runs pi-style
-compaction: the thinking trace (scratch) is summarised into a structured
-summary — in chunked passes if it is big — the answer written so far is kept
-verbatim, and the model is asked to resume from the cut with the whole
-headroom of the now-smaller prompt. The passes are unbounded: a continuation
-that hits the wall itself becomes the next pass's input, its trace folded
-into the summary, its text extending the verbatim answer, until the answer
-completes. Only when a pass leaves nothing to build on (or no headroom left)
-is the lemma reported as too large for the window, and the usual
-decomposition escape hatches take over.
+just be re-sent. Before reporting a ceiling, `reason()` runs a pi-style
+compaction rescue: the thinking trace (scratch) is summarised into a
+structured summary — in chunked passes if it is big — the answer written so
+far is kept verbatim, and the model is asked to resume from the cut with the
+whole headroom of the now-smaller prompt. A continuation that hits the wall
+itself is not a failure but the next pass: its trace is folded into the
+summary, its text extends the verbatim answer, and the model resumes from
+the new cut.
+
+The rescue is bounded to two compaction-and-resume passes
+(`MAX_COMPACTION_PASSES`): the first usually finishes an answer that merely
+ran long, the second covers the genuinely long proofs. Still unfinished then
+— or when a pass leaves nothing to build on, or no headroom is left —
+`reason()` reports the ceiling and hands back the partial work. The proof
+loop compacts it a final time (folding the last cut-off trace into the
+summary) and sends the summary plus the verbatim partial answer to
+`reviser_incomplete.md`, a variant of the reviser that reads an overflow
+instead of a rejected proof and picks a smaller lemma the partial work was
+building toward. If it finds one, the overflowing lemma is set aside — its
+history recorded under its own id — and the prover starts on the smaller
+lemma with a fresh budget. Only when there is nothing left to build on, or
+the reviser cannot pick a usable smaller lemma, does the lemma fall back to
+the planner's decomposition escape hatches.
 
 ### Backend
 
-One transport, probed at startup (`src/llm_backend.py`):
+One transport, probed at startup (`src/llm_backend.py`): the
+OpenAI-compatible `/v1/chat/completions` endpoint. The same code serves two
+backends:
 
-- **llama.cpp** — `llama-server` on its OpenAI-compatible
-  `/v1/chat/completions` endpoint; there the grammar suppresses thinking,
-  so reasoning is disabled for schema calls.
+- **llama.cpp** — a local `llama-server`. There the grammar suppresses
+  thinking, so reasoning is disabled for schema calls.
+- **a hosted API** — any OpenAI-compatible provider (OpenAI, OpenRouter,
+  DeepSeek, ...), pointed at by `--host` with its base URL and authenticated
+  with `--api-key` (or `$LLM_API_KEY`). A supplied key is checked against the
+  provider's `/v1/models` at startup, so a wrong key fails loudly instead of
+  401-ing every call in a run.
+
+The probe can't tell the two apart by name, so it tries: a `/props` answer
+means llama.cpp (full option set, real context ceiling); no `/props` means a
+generic endpoint (standard OpenAI option set — `top_k`/`min_p` are dropped,
+because a strict provider 400s on them — and the context limit is a default
+unless `--num-ctx` is given).
+
+`--backend {auto,llamacpp,openai}` (default `auto`) overrides that decision
+when the probe can't see the real server — a proxy in front of llama-server
+that eats `/props`, or a provider that happens to serve one. An explicit
+backend is taken on faith and the banner warns when it contradicts the probe
+(a forced llama.cpp against a server with no `/props` route, or a forced
+standard OpenAI against one that has it). The probe's *measurements* — the
+context ceiling and thinking support — are kept either way, because they
+describe the server that is actually there.
 
 Model capabilities (context size, thinking support) are *profiles*, probed
 rather than hard-coded, so adding a model needs no code change.
@@ -95,21 +132,27 @@ python src/main.py --conjecture algebra_example --model Qwen3.5-122B-Q4_K_M
 python src/main.py --conjecture algebra_example --no-verbose --max-iterations 25
 python src/main.py --conjecture algebra_example --mode human
 
+# or against a hosted API instead of a local llama-server
+LLM_API_KEY=sk-... python src/main.py --conjecture algebra_example \
+    --host https://api.openai.com/v1 --model gpt-4o
+
 # once, before proving: parse the conjecture's reference collection
 python src/parsing.py --conjecture algebra_example
 ```
 
-`parsing.py` shares main.py's server options (`--host`, `--model`,
-`--num-ctx`) and its `--conjecture NAME` / `--verbose` pair; it has no
-proving options, because it has no loop.
+`parsing.py` shares main.py's server options (`--host`, `--api-key`,
+`--backend`, `--model`, `--num-ctx`) and its `--conjecture NAME` /
+`--verbose` pair; it has no proving options, because it has no loop.
 
 ### CLI options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--conjecture NAME` | `algebra_example` | A directory under `conjectures/` holding a `conjecture.md`. |
-| `--model NAME` | `qwen3.8-27b` | The `--alias` llama-server was launched with. |
-| `--host URL` | `http://localhost:8081` | llama-server base URL (`$LLAMA_HOST` overrides the default; 8080 is taken by open-webui). |
+| `--model NAME` | `qwen3.8-27b` | Model name: the `--alias` llama-server was launched with, or a provider's model id (e.g. `gpt-4o`). |
+| `--host URL` | `http://localhost:8081` | OpenAI-compatible base URL — a local llama-server, or a hosted API's base (e.g. `https://api.openai.com/v1`). `$LLAMA_HOST` overrides the default; 8080 is taken by open-webui. |
+| `--api-key KEY` | `$LLM_API_KEY` | Sent as `Authorization: Bearer <key>`. Needed for a hosted API; leave unset for a plain local llama-server. |
+| `--backend {auto,llamacpp,openai}` | `auto` | Which dialect of the OpenAI-compatible endpoint to speak: the full llama.cpp option set (with thinking suppressed for schema calls), or the standard OpenAI set. `auto` takes the probe's answer; the other two force it, for when the probe can't see the real server. |
 | `--dag PATH` | `conjectures/<name>/dag.json` | Use a separate DAG file (e.g. to isolate a model's run). |
 | `--max-iterations N` | 10 | Loop iterations before giving up. |
 | `--max-proof-attempts N` | 3 | Prover rounds per lemma before it is given up. |
@@ -141,11 +184,12 @@ a line of input in the other.
 ```
 agents/
   planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md   # default agent prompts
+  reviser_incomplete.md                     # overflow reviser (partial proofs)
   parsing.md                               # references parser prompt
 src/
   main.py              # the proof loop (planner → selector → prover → verifier → reviser)
   parsing.py           # standalone references/ → references.md parser
-  llm_backend.py       # llama.cpp transport + model profiles
+  llm_backend.py       # OpenAI-compatible transport (llama.cpp or a hosted API) + model profiles
   interaction.py       # human-in-the-loop menu + hotkey
   workspace.py         # per-conjecture run directories and prompt resolution
 conjectures/
@@ -218,7 +262,7 @@ in the file) and `tags`. `main.py` then feeds that file to the loop at three
 different granularities:
 
 - **Planner** — an `id` + `slogan` shortlist, and only while the collection
-  is small: below `PLANNER_REFERENCE_LIMIT` (20) entries it gets every
+  is small: below `PLANNER_REFERENCE_LIMIT` (100) entries it gets every
   result, at or above it none. A shortlist of hundreds of slogans costs
   more than it returns, and the prover sees the full collection anyway, so
   a named result the planner misses is one round away, not lost. A strategy

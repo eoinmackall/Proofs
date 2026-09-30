@@ -171,7 +171,9 @@ def parse_file(
         "Parse this file and extract its theorem-level results.\n\n"
         f"[File: {filename}]\n{text}"
     )
-    content, status = main.reason(
+    # reason() returns (content, status, partial); the partial work is
+    # unused here — a file too long for one pass is skipped, not rescued.
+    content, status, _ = main.reason(
         system_prompt, user, "parser", main.THINK["parser"], verbose
     )
     if status == "ceiling" and not content:
@@ -253,12 +255,31 @@ def run() -> None:
     )
     ap.add_argument(
         "--host", default=None,
-        help="llama-server base URL. Defaults to $LLAMA_HOST or "
-             "localhost:8081 (8080 is taken by open-webui).",
+        help="OpenAI-compatible base URL: a local llama-server, or a hosted "
+             "API's base (e.g. https://api.openai.com/v1). Defaults to "
+             "$LLAMA_HOST or localhost:8081 (8080 is taken by open-webui).",
+    )
+    ap.add_argument(
+        "--api-key", default=None,
+        help="API key sent as 'Authorization: Bearer <key>'. Needed for a "
+             "hosted API; defaults to $LLM_API_KEY. Leave unset for a plain "
+             "local llama-server (or one launched without --api-key).",
     )
     ap.add_argument(
         "--model", default=main.MODEL_NAME,
-        help="The --alias llama-server was launched with",
+        help="Model name: the --alias llama-server was launched with, or the "
+             "provider's model id (e.g. gpt-4o).",
+    )
+    ap.add_argument(
+        "--backend", choices=("auto", "llamacpp", "openai"), default="auto",
+        help=(
+            "Which dialect of the OpenAI-compatible endpoint to speak. "
+            "auto (default): probe /props — an answer means llama.cpp (full "
+            "option set, thinking suppressed for schema calls), no answer "
+            "means a generic endpoint (standard OpenAI fields). llamacpp / "
+            "openai force one side of that decision, for when the probe "
+            "can't see the real server."
+        ),
     )
     ap.add_argument(
         "--conjecture", default=main.DEFAULT_CONJECTURE,
@@ -279,9 +300,12 @@ def run() -> None:
     # context window — an explicit --num-ctx clamped to what the server
     # allows, or the server's own context when it is not given.
     main.BACKEND = llm_backend.make_backend(
-        args.model, args.host, main.REQUEST_TIMEOUT
+        args.model, args.host, main.REQUEST_TIMEOUT, api_key=args.api_key,
+        backend=args.backend
     )
     main.PROFILE = main.BACKEND.probe()
+    if main.PROFILE.auth_error:
+        ap.error(main.PROFILE.auth_error)
     if args.num_ctx is None:
         num_ctx = main.PROFILE.context_limit
     else:
