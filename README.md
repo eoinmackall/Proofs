@@ -34,7 +34,9 @@ Each iteration:
    steps, one per agent; a lemma enters the DAG only after all three have
    accepted it. (The three files are currently identical.)
 5. **Reviser** (`reviser.md`) handles a reject, judging the lemma's
-   difficulty from the rejected proof itself (the *last proof*). It decides
+   difficulty from the rejected proof itself (the *last proof*), which it
+   sees alongside the lemmas already proved and the known references. It
+   decides
    whether the fault is in the *proof* (keep the statement; send the prover
    back with the verdict as feedback), in the *statement* (return a revised
    statement as the prover's new target), or whether the lemma is *too hard*
@@ -261,14 +263,15 @@ reads every parsable file in `references/`, asks the model (via
 `references.md` beside the DAG as a **strict JSON array** — one object per
 result with `id`, `slogan`, `formal statement`, `reference` (where it appears
 in the file) and `tags`. `main.py` then feeds that file to the loop at three
-different granularities:
+granularities:
 
-- **Planner** — an `id` + `slogan` shortlist, and only while the collection
-  is small: below `PLANNER_REFERENCE_LIMIT` (100) entries it gets every
-  result, at or above it none. A shortlist of hundreds of slogans costs
-  more than it returns, and the prover sees the full collection anyway, so
-  a named result the planner misses is one round away, not lost. A strategy
-  for large collections is deliberately not built yet.
+- **Planner and reviser** — an `id` + `slogan` shortlist, and only while the
+  collection is small: below `PLANNER_REFERENCE_LIMIT` (100) entries each
+  gets every result, at or above it none. A shortlist of hundreds of
+  slogans costs more than it returns, and the prover sees the full
+  collection anyway, so a named result the planner misses is one round
+  away, not lost. A strategy for large collections is deliberately not
+  built yet.
 - **Prover** — the whole collection unconditionally (id, slogan, formal
   statement, tags). It may cite any entry by `id` in `cited_lemmas` and
   rely on it without proving it, exactly like a proved lemma.

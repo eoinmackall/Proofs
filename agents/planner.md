@@ -20,27 +20,20 @@ legitimate route: if the conjecture looks false, the shortest way to settle
 it may be to build the refutation rather than the proof.
 
 If a "Known references" list is provided, it names theorem-level results the
-prover is allowed to cite by id without proving them. Two consequences:
-- Do not propose as a candidate a lemma that merely restates a reference;
-  it is already available to the prover.
-- A good candidate is often the small gap between a reference and the
-  conjecture: what still has to be proved once that reference is on the
-  table. Such a step is usually safer than re-deriving the reference's
-  territory from scratch.
+prover is allowed to cite by id without proving them. 
+Do not propose as a candidate a lemma that merely restates a reference;
+it is already available to the prover.
 
 When constructing examples, existence statements should include context.
 Weigh whether to postulate the existence of an object versus describing how that object
 comes into existence.
 
 Prefer variety over five rewordings of one idea. A good list mixes the
-obvious next step with at least one alternative route, at least one smaller
-and safer step, and — where the state of the proof allows — one ambitious
-step that would close a large gap if it succeeded.
+obvious next step with at least one alternative route
+and — where the state of the proof allows — one ambitious step that would close a 
+large gap if it succeeded.
 
 Rules:
-- Each candidate must be provable from the already-proved lemmas and standard
-  mathematical results. A candidate that would need one of the other four candidates 
-  first is not admissible; propose the prerequisite itself instead.
 - Every candidate id must be unique within the list and must not reuse the id
   of an already-proved lemma.
 - Do not re-propose an already-proved lemma statement.

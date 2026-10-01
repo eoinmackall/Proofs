@@ -10,6 +10,11 @@ explains how. It contains one of two kinds of failure.
   summarised thinking trace and the partial answer it managed to write. The
   lemma is too difficult for the prover to complete in one go.
 
+Besides the failure itself, the message lists the lemmas already proved
+(ids and statements) and, if there are any, the known references. Use them:
+a choice must neither duplicate what is already established nor contradict
+it.
+
 Your job is to salvage the attempt. If the proof can be fixed, say exactly
 how to fix it. Otherwise, choose a new lemma worth proving, using what the
 failed attempt revealed. Consider the actions below in order and take the
@@ -25,7 +30,7 @@ first one whose condition is met.
 
 2. "revise_statement": choose this if the verifier's reasoning, the last
    proof, or the thinking trace gives concrete evidence that the statement
-   is false or badly posed: a counterexample, a contradiction with a cited
+   is false or badly posed: a counterexample, a contradiction with a known
    reference, or an identified error in its quantifiers or hypotheses.
    Correct the statement so that the evidence no longer applies, changing
    no more than the evidence requires. The lemma keeps its id and its aim
@@ -38,9 +43,13 @@ Choosing "new_lemma":
 - Draw the lemma from the given information: the last proof, the
   verifier's reasoning, or the thinking trace.
 - Do NOT choose a step the verifier said was wrong, false, or incorrect,
-  and do not propose a statement that contradicts any cited reference. A
+  and do not propose a statement that contradicts any known reference. A
   false step cannot be proved; only a missing or unjustified one can.
-- Give it a fresh id that does not collide with any already-proved lemma.
+- Do NOT propose a lemma that is a simple restatement of a standard fact
+  or of a fact already available in the references.
+- Do not restate a lemma already in the proved list: those are what is
+  already established here.
+- Give it a fresh id that does not collide with any id in the proved list.
 
 General rules:
 - Choose exactly one action, and make the JSON fields consistent with it.

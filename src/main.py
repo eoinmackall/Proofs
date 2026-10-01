@@ -73,7 +73,8 @@ separate roles — each a single call, so each step can later grow its
 own focus (for now all three prompts are identical). Any single reject ends
 the counting and sends the proof to the reviser with the
 verifier's reasoning about the failure, along with the rejected proof itself
-(the last proof). The reviser decides where the fault lies: a fault in the
+(the last proof), the lemmas already proved, and the known references. The
+reviser decides where the fault lies: a fault in the
 argument keeps the statement and sends the prover back with the verdict as
 feedback; a fault in the statement comes back as a revised statement, which
 becomes the prover's new target; and a lemma judged too hard to prove as
@@ -135,8 +136,9 @@ parsing.py is standalone: it reads conjectures/<name>/references/ (any .tex
 or .md file in it), asks the model for the theorem-level results, and writes
 them as a strict-JSON array to conjectures/<name>/references.md. main.py then
 offers those references to the prover (citable by id), to the verifiers (the
-formal statements of the cited ones only) and to the planner (an id + slogan
-shortlist, only while the collection is small enough to be one).
+formal statements of the cited ones only) and to the planner and the reviser
+(an id + slogan shortlist, only while the collection is small enough to be
+one).
 
 --conjecture names a directory under conjectures/ holding a conjecture.md.
 The DAG is written beside it as dag.json and shared by every model: point a
@@ -190,14 +192,14 @@ REQUEST_TIMEOUT = 1800       # Thinking models are slow; give them room
 # candidates as can be compared without re-reading the conjecture.
 PLANNER_CANDIDATES = 5
 
-# How many parsed references (references.md) the planner is shown at all. The
-# rule is deliberately blunt: below the limit the planner gets an id + slogan
-# per result, so it can build on a named theorem rather than re-prove it from
-# scratch; at or above it, none. A shortlist of hundreds of slogans costs
-# more in tokens and attention than it returns, and the prover sees the full
-# collection regardless, so a named result the planner misses is one proving
-# round away, not lost. A strategy for large collections is deliberately not
-# built yet.
+# How many parsed references (references.md) the planner and the reviser are
+# shown at all. The rule is deliberately blunt: below the limit each of them
+# gets an id + slogan per result, so they can build on a named theorem rather
+# than re-prove it from scratch; at or above it, none. A shortlist of hundreds
+# of slogans costs more in tokens and attention than it returns, and the
+# prover sees the full collection regardless, so a named result the planner
+# misses is one proving round away, not lost. A strategy for large
+# collections is deliberately not built yet.
 PLANNER_REFERENCE_LIMIT = 100
 
 # The verification steps: a proof enters the DAG only after every one of
@@ -1745,35 +1747,41 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         if prover_refs
         else ""
     )
-    # The planner only sees a small collection: below PLANNER_REFERENCE_LIMIT
-    # it gets an id + slogan per result, at or above it none. See the limit's
-    # comment for why a blunt rule beats a graded one here.
+    # The planner and the reviser share one short view of the collection:
+    # below PLANNER_REFERENCE_LIMIT they get an id + slogan per result, at or
+    # above it none. See the limit's comment for why a blunt rule beats a
+    # graded one here.
+    short_refs = [
+        {
+            "id": r["id"],
+            "slogan": r.get("slogan", ""),
+            "tags": r.get("tags", []),
+        }
+        for r in references
+    ]
     if references:
         if len(references) < PLANNER_REFERENCE_LIMIT:
             planner_ref_block = (
                 "\n\nKnown references (named theorem-level results the prover "
                 "may cite by id; the prover sees their full statements):\n"
-                + json.dumps(
-                    [
-                        {
-                            "id": r["id"],
-                            "slogan": r.get("slogan", ""),
-                            "tags": r.get("tags", []),
-                        }
-                        for r in references
-                    ],
-                    indent=2,
-                )
+                + json.dumps(short_refs, indent=2)
+            )
+            reviser_ref_block = (
+                "\n\nKnown references (named theorem-level results from the "
+                "parsed collection; treat them as established):\n"
+                + json.dumps(short_refs, indent=2)
             )
         else:
             planner_ref_block = ""
+            reviser_ref_block = ""
             log(
                 f"ℹ️  {len(references)} references parsed; that is at or "
                 f"above the planner limit ({PLANNER_REFERENCE_LIMIT}), so the "
-                f"planner gets none. The prover sees them all."
+                f"planner and the reviser get none. The prover sees them all."
             )
     else:
         planner_ref_block = ""
+        reviser_ref_block = ""
 
     # Checkpoint restore: the DAG is reloaded from disk every iteration, so a
     # cancelled run leaves only run-level state to restore — where the
@@ -2161,6 +2169,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 )
                 overflow_user = (
                     f"Conjecture:\n{conjecture}\n\n"
+                    f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+                    f"{reviser_ref_block}\n\n"
                     f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
                     f"{report}"
                 )
@@ -2376,6 +2386,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             )
             reviser_user = (
                 f"Conjecture:\n{conjecture}\n\n"
+                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+                f"{reviser_ref_block}\n\n"
                 f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
                 f"The last proof of this lemma (the one just rejected; judge "
                 f"the lemma's difficulty from it):\n{proof}\n\n"
