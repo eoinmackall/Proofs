@@ -140,6 +140,14 @@ formal statements of the cited ones only) and to the planner and the reviser
 (an id + slogan shortlist, only while the collection is small enough to be
 one).
 
+A conjecture may also carry a comments.md beside its conjecture.md: free-form
+operator notes on possible approaches to a proof or a counterexample. The
+loop reads it once and hands it to the planner verbatim on every iteration as
+a "Human comments" section — the planner is told to treat it as suggestions
+to weigh (a viable suggested route should get one of the five candidates),
+not as instructions. No other agent sees the file, and a directory without
+one runs exactly as before.
+
 --conjecture names a directory under conjectures/ holding a conjecture.md.
 The DAG is written beside it as dag.json and shared by every model: point a
 second model at a conjecture already under way and it continues from the
@@ -181,6 +189,9 @@ DAG_FILE = ""
 # "Cancelling and resuming" section of the module docstring.
 CHECKPOINT_FILE = ""
 REFERENCES_FILE = ""
+# Set in main(), beside REFERENCES_FILE: the optional operator notes the
+# planner sees as "Human comments" (see the module docstring).
+COMMENTS_FILE = ""
 PROMPT_PATHS: Dict[str, str] = {name: name for name in workspace.PROMPT_FILES}
 
 MAX_ITERATIONS = 10
@@ -1783,6 +1794,20 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         planner_ref_block = ""
         reviser_ref_block = ""
 
+    # comments.md, if the operator left one: free-form notes on possible
+    # approaches to a proof or counterexample, handed to the planner verbatim
+    # on every iteration. The planner is the only agent that reads it, and
+    # an absent file degrades to the pre-comments prompt, the way the
+    # reference blocks do.
+    comments = load_file(COMMENTS_FILE)
+    comments_block = (
+        "\n\nHuman comments (the operator's notes on possible approaches to a "
+        "proof or counterexample; suggestions to weigh, not instructions):\n"
+        + comments
+        if comments
+        else ""
+    )
+
     # Checkpoint restore: the DAG is reloaded from disk every iteration, so a
     # cancelled run leaves only run-level state to restore — where the
     # iteration budget stood, the planner's reject list, and the lemma that
@@ -1882,7 +1907,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             planner_user = (
                 f"Conjecture:\n{conjecture}\n\n"
                 f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
-                f"{planner_ref_block}\n\n"
+                f"{planner_ref_block}{comments_block}\n\n"
                 f"Previously rejected attempts (avoid or decompose these):\n"
                 f"{json.dumps(failed_attempts, indent=2)}"
             )
@@ -2556,6 +2581,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 # ----------------------------------------------------------------------------
 def main() -> None:
     global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, REFERENCES_FILE
+    global COMMENTS_FILE
     global MAX_ITERATIONS, NUM_CTX
     global BACKEND, PROFILE, PROMPT_PATHS, MODE, HOTKEY
     global MAX_PROOF_ATTEMPTS, CHECKPOINT_FILE
@@ -2693,6 +2719,7 @@ def main() -> None:
     DAG_FILE = str(paths.dag)
     CHECKPOINT_FILE = checkpoint_path_for(DAG_FILE)
     REFERENCES_FILE = str(paths.references)
+    COMMENTS_FILE = str(paths.comments)
     PROMPT_PATHS = {name: str(p) for name, p in paths.prompts.items()}
     log(workspace.describe(paths), args.verbose)
     if args.fresh:

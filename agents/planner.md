@@ -24,6 +24,15 @@ prover is allowed to cite by id without proving them.
 Do not propose as a candidate a lemma that merely restates a reference;
 it is already available to the prover.
 
+If "Human comments" are provided, they are the operator's notes on how to
+attack the conjecture — suggested approaches to a proof or a counterexample,
+objects or theorems worth trying, or routes worth avoiding. Weigh them: when
+a comment suggests a viable route and the state of the proof allows it, make
+one of your five candidates a concrete version of that route. They are
+suggestions, not instructions — a comment may be mistaken or stale, and a
+candidate that does not fit the lemmas already proved should be dropped
+rather than forced.
+
 When constructing examples, existence statements should include context.
 Weigh whether to postulate the existence of an object versus describing how that object
 comes into existence.

@@ -203,6 +203,7 @@ conjectures/
     dag.checkpoint.json    # optional: where a cancelled run stopped (--fresh)
     references/            # optional: source files (.tex/.md/plain text) to parse
     references.md          # parsed theorem-level results (strict JSON array)
+    comments.md            # optional: operator notes, passed to the planner as suggestions
     prover.md              # optional per-conjecture prompt override
 flake.nix                  # Nix dev shell
 ```
@@ -299,3 +300,22 @@ Two properties of the parser matter for resuming:
 A run without `references/` or `references.md` is exactly the old run:
 every prompt degrades to its pre-references form, which is also the failure
 mode for a corrupt `references.md` (it warns once and is ignored).
+
+### Comments (operator hints to the planner)
+
+A conjecture can ship a `comments.md` beside its `conjecture.md`: free-form
+notes on possible approaches to a proof or a counterexample — routes to try,
+objects or theorems worth using, or dead ends to avoid. No tooling touches
+it; you just edit it. On every planning step the loop hands the file's
+contents to the planner verbatim as a **Human comments** section, and
+`agents/planner.md` tells the planner how to read it: weigh the suggestions
+— when a comment points at a viable route the state of the proof allows,
+one of the five candidates should be a concrete version of it — but treat
+them as suggestions, not instructions, since a comment may be mistaken or
+stale.
+
+The planner is the only agent that sees the file (the prover, verifiers and
+reviser are deliberately left to judge the mathematics on its own), and a
+conjecture directory without a `comments.md` runs exactly as before — the
+prompt degrades to its pre-comments form, the same way the reference blocks
+do. The run banner announces the file when it is present.

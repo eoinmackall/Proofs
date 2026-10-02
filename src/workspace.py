@@ -8,6 +8,7 @@ Layout:
         dag.json                   <- shared by every model and backend
         references/                <- optional: .tex/.md files for parsing.py
         references.md              <- optional: strict-JSON refs, parsing.py's output
+        comments.md                <- optional: operator notes, passed to the planner as suggestions
         prover.md                  <- optional per-conjecture prompt override
       some_other_problem/
         conjecture.md
@@ -52,6 +53,11 @@ DAG_FILENAME = "dag.json"
 # feeds to the planner, the prover and the verifiers.
 REFERENCES_DIRNAME = "references"
 REFERENCES_FILENAME = "references.md"
+# Free-form operator notes on possible approaches to a proof or
+# counterexample. Read once per run and handed to the planner verbatim on
+# every iteration; the planner is the only agent that sees it, and a
+# conjecture directory without the file runs exactly as before.
+COMMENTS_FILENAME = "comments.md"
 AGENTS_DIR = "agents"
 # Every prompt the loop can load, and therefore every per-conjecture override
 # that is meaningful. parsing.md is the standalone parser's (parsing.py's).
@@ -75,6 +81,7 @@ class RunPaths:
     dag: Path                   # conjectures/algebra_example/dag.json
     references_dir: Path        # conjectures/algebra_example/references/ (input)
     references: Path            # conjectures/algebra_example/references.md
+    comments: Path              # conjectures/algebra_example/comments.md (optional)
     prompts: Dict[str, Path]    # "prover.md" -> resolved path
     overridden_prompts: List[str]
 
@@ -138,6 +145,7 @@ def resolve(
     return RunPaths(root=root, conjecture=conjecture, dag=dag,
                     references_dir=root / REFERENCES_DIRNAME,
                     references=root / REFERENCES_FILENAME,
+                    comments=root / COMMENTS_FILENAME,
                     prompts=prompts, overridden_prompts=overridden)
 
 
@@ -187,6 +195,12 @@ def describe(paths: RunPaths) -> str:
             )
         else:
             lines.append(f"  references={paths.references.name} ({n} entries)")
+    comments = paths.comments
+    if comments.is_file() and comments.read_text(encoding="utf-8").strip():
+        lines.append(
+            f"  comments={comments.name} — passed to the planner verbatim "
+            f"as suggestions"
+        )
     if paths.overridden_prompts:
         lines.append(
             f"  ✎ local prompt overrides: {', '.join(paths.overridden_prompts)}"
