@@ -6,6 +6,11 @@ A Python program that drives a small team of LLM agents to iteratively prove
 as a DAG of lemmas written to `dag.json` next to the conjecture. (In
 `--mode human`, the operator takes the selector's place at the menu.)
 
+By default the loop is serial: one lemma in flight at a time. `--parallel N`
+runs N of these loops side by side around one shared DAG, steered by a planner
+and a lemma generator that work for all the loops at once — see
+[Parallel mode](#parallel-mode).
+
 ## How it works
 
 Each iteration:
@@ -136,6 +141,8 @@ python src/main.py --conjecture algebra_example
 python src/main.py --conjecture algebra_example --model Qwen3.5-122B-Q4_K_M
 python src/main.py --conjecture algebra_example --no-verbose --max-iterations 25
 python src/main.py --conjecture algebra_example --mode human
+python src/main.py --conjecture algebra_example --parallel 2
+python src/main.py --conjecture algebra_example --parallel 3 --mode human
 
 # or against a hosted API instead of a local llama-server
 LLM_API_KEY=sk-... python src/main.py --conjecture algebra_example \
@@ -162,6 +169,7 @@ python src/parsing.py --conjecture algebra_example
 | `--max-iterations N` | 10 | Loop iterations before giving up. |
 | `--max-proof-attempts N` | 3 | Prover rounds per lemma before it is given up. |
 | `--fresh` | off | Ignore and delete the checkpoint (`<dag>.checkpoint.json`), restarting the iteration budget from 1. The DAG is kept. |
+| `--parallel [N]` | off | Run N proof loops in parallel around one shared DAG, steered by one planner and one lemma generator. Bare `--parallel` is N=1. `--mode human`, when set, takes the place of one of the loops (loop-0). See [Parallel mode](#parallel-mode). |
 | `--num-ctx N` | the server's own (probed) | Context window in tokens. Defaults to the server's context — the `-c` llama-server was launched with, as probed. Lower it if VRAM is tight. |
 | `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
 | `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
@@ -184,11 +192,115 @@ direction, without restarting:
 `src/interaction.py` explains why the toggle is a keystroke in one place and
 a line of input in the other.
 
+## Parallel mode
+
+`--parallel N` runs N proof loops concurrently. Each loop is the same engine
+the serial run uses — selector, prover, the three verifiers, reviser, one
+lemma at a time — and every loop reads and writes the same DAG. Two further
+threads steer them: a **planner** that keeps a shared strategy current, and a
+**lemma generator** that keeps the loops supplied with work.
+
+```sh
+python src/main.py --conjecture algebra_example --parallel 2
+python src/main.py --conjecture algebra_example --parallel 3 --mode human
+```
+
+A bare `--parallel` is N=1: the parallel machinery with a single loop. The
+loops never work on the same lemma — the buffer below makes that impossible —
+a loop that has spent its budget stops on its own, and the run ends when the
+last loop out stops, which is also what tells the planner and generator to
+finish.
+
+### The shared possible-lemma list
+
+The loops do not take lemmas from the planner directly. Between them sits a
+fixed buffer of **N+5 slots** — the possible-lemma list. The generator is its
+only writer: each round it proposes five candidate lemmas
+(`agents/parallel/parallel_lemma_generator.md`) and the new ones go into the
+empty slots. An id already in the DAG, already in the buffer, already on the
+reject list, or currently held in flight by a loop is dropped, so no id is
+ever claimed twice. The slots are also the flow control: a full buffer means
+the loops are behind, and the generator waits for a free slot instead of
+piling up work.
+
+Claiming is atomic. A loop's selector is shown the unclaimed lemmas and its
+pick is committed under lock; if another loop took the lemma in the meantime,
+the selector is re-run on what remains, so two loops never work on one id. A
+claimed lemma keeps its slot until it is settled — proved or given up after
+`MAX_PROOF_ATTEMPTS` rounds — or the operator asserts it from the menu.
+
+### The planner and the generator
+
+- **Planner** (`agents/parallel/parallel_planner.md`) sets direction, not
+  lemmas: a strategy summary and an ordered list of priorities — which gaps
+  in the DAG to close next, and why. It runs once at start, and then whenever
+  the DAG changes: a lemma added by *any* loop bumps the DAG version and
+  marks the plan stale. If the DAG moves again *during* the planning call,
+  the plan is installed already marked stale and the planner goes straight
+  back around — no DAG change is lost, and the plan the loops are steering
+  by was always written for the DAG as it stood.
+- **Generator** (`agents/parallel/parallel_lemma_generator.md`) turns the
+  plan into five concrete candidate lemmas per round. It sees the conjecture,
+  the plan, the DAG, the buffer's current contents, and the reject list, so
+  it never restates a lemma the loops already have, hold, or failed.
+
+The split is deliberate: the planner re-reads the whole DAG and is the costly
+call, so it runs only when the DAG moves; the generator is cheap and runs
+continuously against the fixed buffer.
+
+### Budgets
+
+Each loop gets the full `--max-iterations` budget, spent one iteration per
+lemma claimed. Resuming an in-flight lemma after a restart does not spend a
+new one — the iteration was already spent when the lemma was claimed — and a
+loop that dies holding a lemma still finishes it, budget or no. Failed
+attempts go to one shared reject list that the steering planner and the
+generator both read, so a route one loop found dead is dead for the whole
+run.
+
+### Human mode and the hotkey
+
+`--mode human` takes the place of **loop-0**: the operator sits at loop-0's
+menu while loops 1..N-1 run unattended. The menu shows the shared buffer —
+each lemma marked with the loop that has claimed it — and everything the
+serial menu can do works the same: assert a lemma on your authority (it goes
+straight into the shared DAG as `"provenance": "operator"`), send one through
+the proving pipeline, write your own, or reject the buffer and send the
+planner back. The hotkey and the menu's `a` still hand loop-0 between human
+and automatic mid-run; the other loops are always automatic. Quitting from
+the menu stops the whole run, not just
+loop-0 — the other loops' in-flight lemmas go into the checkpoint and resume
+next time.
+
+### Checkpointing and resuming
+
+A parallel run writes a **version-2** checkpoint to the same
+`<dag>.checkpoint.json` beside the DAG: one slot per loop, each holding that
+loop's iteration budget and its in-flight round (or none), plus the shared
+reject list. The file is written atomically at the same safe boundaries the
+serial run uses. The two checkpoint versions are not interchangeable: a
+serial (v1) checkpoint is not a valid parallel one — a parallel run ignores
+it and starts fresh from the DAG — and a parallel (v2) checkpoint is not a
+valid serial one either, so `--fresh` or deleting the file is the way to get
+back to the serial run from a parallel one.
+
+Re-run the same command with the same `--parallel N` to resume: every
+loop's budget continues rather than resets, and a loop that was mid-proof
+goes back to the prover at the checkpointed round. The checkpoint records how
+many loops wrote it, and a run with a different loop count does not load it
+(it starts fresh from the DAG instead; the lemmas are kept either way). The
+rest of [Cancelling a run (Ctrl-C) and resuming](#cancelling-a-run-ctrl-c-and-resuming)
+holds unchanged: Ctrl-C stops every loop and writes the checkpoint first;
+a checkpoint without a `dag.json` is discarded; `--fresh` restarts the
+budgets from 1 and keeps the DAG.
+
 ## Project layout
 
 ```
 agents/
   planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md   # default agent prompts (one reviser for rejects and overflows)
+  parallel/                                    # parallel-mode prompts
+    parallel_planner.md  parallel_lemma_generator.md
   parsing.md                               # references parser prompt
 src/
   main.py              # the proof loop (planner → selector → prover → verifier → reviser)

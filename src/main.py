@@ -160,7 +160,8 @@ import os
 import re
 import signal
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+import threading
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -265,6 +266,8 @@ THINK = {
     "verifier_3": True,
     "reviser": True,
     "parser": True,   # parsing.py: reading mathematics, then extracting it
+    "parallel_planner": True,
+    "parallel_lemma_generator": True,
 }
 
 # Sampling. The presence penalty is the delicate one: it pushes the model off
@@ -304,6 +307,8 @@ TEMPERATURES = {
                         # collapse into one review of the first pass.
     "reviser": 0.7,    # Diagnosing a failure is planning-scale judgement.
     "parser": 0.3,     # Extracting from a fixed source, not exploring.
+    "parallel_planner": 0.3,          # Steering a run, not exploring one.
+    "parallel_lemma_generator": 0.6,  # Proposing lemmas is generation.
 }
 
 # Pi-style compaction on the context wall: a truncated call is resumed by
@@ -391,6 +396,32 @@ PLANNER_SCHEMA: Dict[str, Any] = {
     ],
 }
 
+# Parallel mode: the planner no longer proposes lemmas (the lemma generator
+# does), so its schema drops candidate_lemmas and adds the ordered priorities
+# the generator works from. The generator reuses _LEMMA_SCHEMA for its batch.
+PARALLEL_PLANNER_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "is_conjecture_proved": {"type": "boolean"},
+        "is_conjecture_disproved": {"type": "boolean"},
+        "plan_summary": {"type": "string"},
+        "priorities": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "is_conjecture_proved",
+        "is_conjecture_disproved",
+        "plan_summary",
+    ],
+}
+
+PARALLEL_LEMMA_GENERATOR_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "candidate_lemmas": {"type": "array", "items": _LEMMA_SCHEMA},
+    },
+    "required": ["candidate_lemmas"],
+}
+
 # The selector picks by id, but "one of these particular ids" is not
 # something a grammar can enforce, so the offered ids are listed in the
 # prompt and the answer is checked against them in select_lemma(), which
@@ -457,9 +488,16 @@ def load_dag() -> Dict[str, Any]:
 
 
 def save_dag(dag: Dict[str, Any]) -> None:
-    """Save updated DAG state to file, creating it if needed."""
-    with open(DAG_FILE, "w", encoding="utf-8") as f:
+    """Save updated DAG state to file, creating it if needed.
+
+    Whole-file write: temp file beside the DAG, then os.replace, the
+    checkpoint's way. The parallel loops read the DAG from several threads
+    at once, and a plain open("w") lets a reader catch the file mid-write
+    (an empty or half-formed file) and crash the loop on the parse."""
+    tmp = DAG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(dag, f, indent=2)
+    os.replace(tmp, DAG_FILE)
 
 
 # ----------------------------------------------------------------------------
@@ -478,6 +516,17 @@ _LIVE_STATE: Dict[str, Any] = {
     "in_flight": None,
 }
 _sigint_count = 0
+# The live ParallelState, or None outside a parallel run. The SIGINT handler
+# checks it first so a Ctrl-C in parallel mode snapshots the shared state
+# (version-2 checkpoint) instead of the serial _LIVE_STATE, which a parallel
+# run never updates.
+_PARALLEL: "ParallelState" = None
+# The DAG file lock, held across load-then-save by every DAG writer that
+# can run concurrently with another: the serial success boundary and each
+# parallel loop's. Two writers can't add the same id twice or clobber
+# each other's addition. Readers reload under it too (fresh per round), so
+# a loop never plans or proves against a stale DAG.
+DAG_LOCK = threading.Lock()
 
 
 def checkpoint_path_for(dag_path: str) -> str:
@@ -549,6 +598,20 @@ def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
             verbose)
         discard_checkpoint()
         return None
+    version = data.get("version")
+    if version == 2:
+        # A parallel-mode checkpoint is valid state for a parallel run; the
+        # serial loader must not read it as (and discard it as) a corrupt
+        # serial one. Re-running without --parallel is a different shape of
+        # run, so the honest answer is "re-run with --parallel".
+        log(f"⚠️  {os.path.basename(CHECKPOINT_FILE)} is a parallel-mode "
+            f"checkpoint; re-run with --parallel to resume it.", verbose)
+        return None
+    if version not in (None, 1):
+        log(f"⚠️  Checkpoint {CHECKPOINT_FILE} has an unknown version "
+            f"({version!r}); ignoring it.", verbose)
+        discard_checkpoint()
+        return None
     iteration = data.get("iteration")
     if not isinstance(iteration, int) or iteration < 1:
         log(f"⚠️  Checkpoint {CHECKPOINT_FILE} has no usable iteration; ignoring it.",
@@ -595,6 +658,116 @@ def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
     }
 
 
+def _validate_in_flight(raw: Any) -> Optional[Dict[str, Any]]:
+    """The in-flight state a resuming prover round is handed, or None.
+
+    The shape the serial and parallel checkpoints share: the lemma id, the
+    target as the reviser last left it, the prover round to re-run, the
+    feedback and reject notes it carries, and the last proof of it (the one
+    just rejected — what the reviser judges its difficulty by).
+    """
+    if not isinstance(raw, dict):
+        return None
+    lemma_id = str(raw.get("lemma_id") or "")
+    target = raw.get("target")
+    attempt = raw.get("attempt")
+    statement = (
+        str(target.get("statement") or "").strip() if isinstance(target, dict) else ""
+    )
+    if not (
+        lemma_id
+        and statement
+        and isinstance(attempt, int)
+        and 1 <= attempt <= MAX_PROOF_ATTEMPTS
+    ):
+        return None
+    clean_target: Dict[str, Any] = {"id": lemma_id, "statement": statement}
+    if isinstance(target.get("aim"), str) and target["aim"].strip():
+        clean_target["aim"] = target["aim"]
+    return {
+        "lemma_id": lemma_id,
+        "target": clean_target,
+        "attempt": attempt,
+        "feedback": [n for n in (raw.get("feedback") or []) if isinstance(n, str)],
+        "attempt_notes": [
+            n for n in (raw.get("attempt_notes") or []) if isinstance(n, str)
+        ],
+        "last_proof": str(raw.get("last_proof") or ""),
+    }
+
+
+def load_parallel_checkpoint(
+    loop_ids: List[str], verbose: bool = True
+) -> Optional[Dict[str, Any]]:
+    """Read and validate the version-2 (parallel-mode) checkpoint.
+
+    Returns {"loops": {loop_id: {"in_flight", "iterations_used"}},
+    "failed_attempts"}, or None when there is nothing to resume. A
+    checkpoint written by a run with a different set of loops is ignored
+    rather than half-applied: per-loop slots are not transferable between
+    runs of different shape. As with the serial loader, a file that is not
+    ours to interpret is left alone unless it is corrupt.
+    """
+    if not CHECKPOINT_FILE or not os.path.exists(CHECKPOINT_FILE):
+        return None
+    try:
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        log(f"⚠️  Checkpoint {CHECKPOINT_FILE} is unreadable ({e}); ignoring it.",
+            verbose)
+        return None
+    if not isinstance(data, dict) or data.get("version") != 2:
+        log(f"⚠️  {os.path.basename(CHECKPOINT_FILE)} is not a parallel-mode "
+            f"(v2) checkpoint; ignoring it.", verbose)
+        return None
+    raw_loops = data.get("loops")
+    if not isinstance(raw_loops, dict) or set(raw_loops) != set(loop_ids):
+        log(f"⚠️  {os.path.basename(CHECKPOINT_FILE)} was written by a run "
+            f"with a different set of loops; ignoring it.", verbose)
+        return None
+    failed_raw = data.get("failed_attempts")
+    if not isinstance(failed_raw, dict):
+        log(f"⚠️  {os.path.basename(CHECKPOINT_FILE)} has no usable "
+            f"failed-attempts section; ignoring it.", verbose)
+        return None
+    failed_attempts: Dict[str, List[str]] = {
+        k: [n for n in v if isinstance(n, str)]
+        for k, v in failed_raw.items()
+        if isinstance(v, list)
+    }
+    loops: Dict[str, Dict[str, Any]] = {}
+    for lid in loop_ids:
+        raw = raw_loops.get(lid)
+        if not isinstance(raw, dict):
+            raw = {}
+        in_flight = _validate_in_flight(raw.get("in_flight"))
+        if in_flight is None and isinstance(raw, dict) and raw.get("in_flight") is not None:
+            log(f"⚠️  {os.path.basename(CHECKPOINT_FILE)} has a malformed "
+                f"in-flight record for {lid}; that loop starts fresh.", verbose)
+        iterations_used = raw.get("iterations_used", 0)
+        if not isinstance(iterations_used, int) or iterations_used < 0:
+            iterations_used = 0
+        loops[lid] = {"in_flight": in_flight, "iterations_used": iterations_used}
+    return {"loops": loops, "failed_attempts": failed_attempts}
+
+
+def _atomic_write_checkpoint_file(data: Dict[str, Any], verbose: bool) -> None:
+    """The shared atomic write: temp file beside the checkpoint, then
+    os.replace over it. Readers see either the whole old file or the whole
+    new one, never a half-written mix."""
+    if not CHECKPOINT_FILE:
+        return
+    tmp = CHECKPOINT_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, CHECKPOINT_FILE)
+    except OSError as e:
+        log(f"⚠️  Could not write checkpoint {CHECKPOINT_FILE}: {e}", verbose)
+
+
 def discard_checkpoint() -> None:
     """Remove the checkpoint file if present.
 
@@ -621,6 +794,20 @@ def _on_sigint(signum, frame) -> None:
     if _sigint_count > 1:
         print("\nForced exit.", file=sys.stderr)
         os._exit(130)
+    if _PARALLEL is not None:
+        # Parallel mode: the shared state is the checkpoint. Ask every thread
+        # to stop at its next boundary, snapshot the whole run under the
+        # state lock, and exit; the daemon threads die with the process and
+        # the next run resumes from the snapshot.
+        _PARALLEL.request_stop()
+        print("\n⏹ Interrupted — writing checkpoint...", file=sys.stderr)
+        _PARALLEL.write_checkpoint()
+        print(
+            f"   {os.path.basename(CHECKPOINT_FILE)} written. Re-run the same "
+            f"command to resume where this run stopped.",
+            file=sys.stderr,
+        )
+        sys.exit(130)
     print("\n⏹ Interrupted — writing checkpoint...", file=sys.stderr)
     state = _LIVE_STATE
     if (
@@ -1562,6 +1749,7 @@ def select_lemma(
     plan_summary: str,
     failed_attempts: Dict[str, List[str]],
     verbose: bool,
+    proposer: str = "the planner",
 ) -> Dict[str, Any]:
     """Ask the selector agent to pick, from the candidates that survived
     screening, the one it judges most likely to come through the prover and
@@ -1581,7 +1769,7 @@ def select_lemma(
         f"Previously rejected attempts (routes the prover and the verifiers "
         f"have already found wanting):\n"
         f"{json.dumps(failed_attempts, indent=2)}\n\n"
-        f"Candidate lemmas, in the order the planner offered them. Exactly "
+        f"Candidate lemmas, in the order {proposer} offered them. Exactly "
         f"one will be sent to the prover; choose from these only:\n"
         f"{json.dumps(usable, indent=2)}"
     )
@@ -1695,52 +1883,588 @@ def _run_verifier(
     return decision, justification
 
 
-# ----------------------------------------------------------------------------
-# Main loop
-# ----------------------------------------------------------------------------
-def run_loop(verbose: bool = True) -> Dict[str, Any]:
-    """Execute the multi-agent theorem proving loop.
+def run_proof_loop(
+    *,
+    verbose: bool,
+    conjecture: str,
+    prover_sys: str,
+    reviser_sys: str,
+    reference_block: str,
+    reviser_ref_block: str,
+    references: List[Dict[str, Any]],
+    verifier_sys: Dict[str, str],
+    ref_ids: Set[str],
+    initial: Optional[Dict[str, Any]],
+    fresh_target: Optional[Dict[str, Any]],
+    on_round,
+    on_proof,
+    failed_attempts: Dict[str, List[str]],
+    failed_lock: "threading.Lock",
+    get_dag,
+    toggle_hotkey,
+    should_stop=None,
+) -> Dict[str, Any]:
+    """Steps 2-5 of the proof loop: prover -> verifiers -> reviser, shared
+    by the serial run and by every parallel loop.
 
-    Args:
-        verbose: If True, print progress to the console.
+    `should_stop`, when given, is polled before every prover round: the
+    parallel loops pass the run's stop test so a resolution or a Ctrl-C
+    stops a loop between rounds instead of letting it spend the rest of its
+    prover budget on a lemma no one will keep. A stop returns the current
+    position marked "stopped" — the last on_round already published the
+    resumable round, so the caller keeps it for the next run. The serial
+    run passes nothing (its stop is the KeyboardInterrupt).
 
-    Returns:
-        The final DAG, so callers running with --no-verbose still get a result.
+    `initial` is the in-flight state a cancelled prover round left behind
+    (None for a fresh start); when given, the engine re-runs that round with
+    that feedback instead of starting from attempt 1. `fresh_target` is the
+    lemma the caller picked for a fresh start; it is ignored when resuming.
+
+    The engine never touches the DAG or the checkpoint itself: `on_round` is
+    called at each prover round with the in-flight state that round
+    establishes (the caller publishes it and checkpoints it), and `on_proof`
+    is called with the lemma's DAG node when a proof survives all three
+    verifier checks (the caller commits it). Every failed_attempts mutation
+    happens under `failed_lock` — a formality in the serial run, where the
+    lock is never contended, and what keeps the shared reject list coherent
+    in a parallel one.
+
+    Returns {"proved", "lemma_id", "target", "proof", "attempt_notes"}. The
+    caller records the final failure when not proved (from attempt_notes)
+    and clears its in-flight state; the engine leaves no other traces.
     """
-    global MODE            # the hotkey and the menu both retarget it mid-run
+    resuming = initial is not None
+    in_flight = initial if initial is not None else {}
+    proof = ""  # bound before the return; the overflow-break paths skip the assignment
 
-    conjecture = load_file(CONJECTURE_FILE)
-    if not conjecture:
-        log(f"{CONJECTURE_FILE} is empty — write your conjecture there first.", verbose)
-        return load_dag()
+    if resuming:
+        lemma_id = in_flight["lemma_id"]
+        target: Dict[str, Any] = in_flight["target"]
+        aim = str(target.get("aim") or "proof").strip().lower()
+        if aim not in ("proof", "counterexample"):
+            aim = "proof"
+    else:
+        lemma_id = fresh_target["id"]
+        # The target is the statement only: the candidate's other fields
+        # (priority, notes) steer the loops, not the prover.
+        aim = str(fresh_target.get("aim") or "proof").strip().lower()
+        if aim not in ("proof", "counterexample"):
+            aim = "proof"
+        target: Dict[str, Any] = {
+            "id": lemma_id,
+            "statement": fresh_target["statement"],
+        }
+        if aim != "proof":
+            target["aim"] = aim
+    # The prover sees only the most recent failure: feedback is rebuilt
+    # after each rejected round, so a retry reads the last verdict and
+    # diagnosis, not the history of every earlier attempt. That history
+    # is kept for the planner in failed_attempts — decomposing or
+    # rerouting is its job, not the prover's.
+    if resuming:
+        feedback: List[str] = list(in_flight.get("feedback") or [])
+        attempt_notes: List[str] = list(in_flight.get("attempt_notes") or [])
+        first_attempt = in_flight["attempt"]
+        last_proof = str(in_flight.get("last_proof") or "")
+    else:
+        feedback: List[str] = []
+        attempt_notes: List[str] = list(failed_attempts.get(lemma_id, []))
+        first_attempt = 1
+        last_proof = ""
+    proved = False
+    attempt = first_attempt
+    # `attempt` is a while-loop counter rather than a for-range because the
+    # reviser can reset it: a lemma it decomposes into a smaller one starts
+    # its own prover rounds from 1 (see the new_lemma branch below).
+    while attempt <= MAX_PROOF_ATTEMPTS:
+        if should_stop is not None and should_stop():
+            return {
+                "proved": False,
+                "lemma_id": lemma_id,
+                "target": target,
+                "proof": last_proof,
+                "attempt_notes": attempt_notes,
+                "stopped": True,
+            }
+        dag = get_dag()
+        # Checkpoint: this prover round is now the resumable position. If
+        # the run is cancelled anywhere inside it, the next run re-runs
+        # the round with this target and this feedback — the round's own
+        # in-flight call is lost, nothing completed before it is.
+        in_flight_state = {
+            "lemma_id": lemma_id,
+            "target": target,
+            "attempt": attempt,
+            "feedback": feedback,
+            "attempt_notes": attempt_notes,
+            "last_proof": last_proof,
+        }
+        on_round(in_flight_state)
+        log(
+            f"📝 Proof attempt {attempt}/{MAX_PROOF_ATTEMPTS} for {lemma_id}.",
+            verbose,
+        )
 
-    planner_sys = load_file(PROMPT_PATHS["planner.md"])
-    selector_sys = load_file(PROMPT_PATHS["selector.md"])
-    prover_sys = load_file(PROMPT_PATHS["prover.md"])
-    # One prompt per verification step; VERIFIER_AGENTS names the three.
-    verifier_sys = {name: load_file(PROMPT_PATHS[name]) for name in VERIFIER_AGENTS}
-    # One reviser for both failures: a rejected proof, and a prover that
-    # overflowed the context window. The user message tells it which case it
-    # is — a full rejected proof with the verifier's reasoning, or a
-    # summarised trace plus the partial answer.
-    reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
+        # ---------------- Step 2: Prover ----------------
+        # prover.md instructs the model to reply with {"lemma_id",
+        # "cited_lemmas", "proof"}. We parse that JSON locally rather than
+        # via a second model call, so the proof text can never be abridged
+        # or paraphrased; if the model ignored the format, its content is
+        # taken verbatim as the proof.
+        prover_user = (
+            f"Conjecture:\n{conjecture}\n\n"
+            f"Available proved lemmas:\n"
+            f"{json.dumps(prover_context(dag), indent=2)}"
+            f"{reference_block}\n\n"
+            f"Lemma to prove:\n{json.dumps(target, indent=2)}\n"
+            + (
+                f"\nFeedback from the previous attempt "
+                f"(the most recent rejection only):\n"
+                f"{json.dumps(feedback, indent=2)}"
+                if feedback
+                else ""
+            )
+        )
+        proof_text, prover_status, prover_partial = reason(
+            prover_sys, prover_user, "prover", THINK["prover"], verbose
+        )
+        toggle_hotkey()
 
-    empty = [name for name, text in (
-        ("planner.md", planner_sys), ("selector.md", selector_sys),
-        ("prover.md", prover_sys), *verifier_sys.items(),
-        ("reviser.md", reviser_sys),
-    ) if not text]
-    if empty:
-        # A missing system prompt does not crash — it produces an agent with
-        # no instructions, which fails in ways that look like model problems.
-        log(f"Missing or empty prompt files: {', '.join(empty)}. Aborting.", verbose)
-        return load_dag()
+        if prover_status == "ceiling":
+            # The prover exhausted the window and the compaction rescue
+            # (bounded by MAX_COMPACTION_PASSES) could not finish it. The
+            # partial work is still worth reading: compact it one last time
+            # and let the reviser pick a smaller lemma or revise the
+            # statement from it, instead of discarding it and asking the
+            # planner to decompose blind.
+            report = _incomplete_report(
+                "prover", prover_partial or {}, verbose,
+            )
+            if not report:
+                log(
+                    f"⛔ Lemma {lemma_id} is too large to prove in one call "
+                    f"and left nothing to build on. Asking the planner to "
+                    f"decompose it.",
+                    verbose,
+                )
+                attempt_notes.append(
+                    "Lemma too large: the prover exhausted its entire token "
+                    "budget without completing a proof and left nothing to "
+                    "resume from. Decompose this into smaller, "
+                    "independently provable lemmas rather than re-proposing "
+                    "it."
+                )
+                break
+            log(
+                f"⛔ Lemma {lemma_id} overflowed the context window after "
+                f"{MAX_COMPACTION_PASSES} compaction passes; asking the "
+                f"reviser to pick a smaller lemma or revise the statement "
+                f"from the partial proof.",
+                verbose,
+            )
+            overflow_user = (
+                f"Conjecture:\n{conjecture}\n\n"
+                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+                f"{reviser_ref_block}\n\n"
+                f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
+                f"{report}"
+            )
+            revision_text, _revision_status, _revision_partial = reason(
+                reviser_sys, overflow_user, "reviser",
+                THINK["reviser"], verbose,
+            )
+            toggle_hotkey()
+            revision_res = _parse_reviser_decision(revision_text, verbose)
+            action = str(revision_res.get("action") or "").strip().lower()
+            diagnosis = str(revision_res.get("diagnosis") or "").strip()
+            new_id = str(revision_res.get("new_id") or "").strip()
+            new_stmt = str(revision_res.get("new_statement") or "").strip()
+            overflow_feedback = [
+                f"Prover: the proof of {lemma_id} overflowed the context "
+                f"window after {MAX_COMPACTION_PASSES} compaction passes; "
+                f"the reviser is choosing a smaller lemma or a corrected "
+                f"statement from the partial work."
+            ]
+            if diagnosis:
+                overflow_feedback.append(f"Reviser's diagnosis: {diagnosis}")
+            if (
+                action == "new_lemma"
+                and new_id
+                and new_stmt
+                and new_id not in dag["lemmas"]
+            ):
+                # The reviser found a smaller lemma worth trying. Set the
+                # overflowing lemma aside (its history is recorded under its
+                # own id) and start the prover on the smaller lemma with a
+                # fresh budget and no inherited verdict.
+                old_id = lemma_id
+                failed_attempts[old_id] = (
+                    list(attempt_notes)
+                    + list(overflow_feedback)
+                    + [
+                        f"Overflowed: {old_id} ran out of the prover's "
+                        f"context window; the reviser is instead trying "
+                        f"{new_id}."
+                    ]
+                )
+                lemma_id = new_id
+                target = {"id": lemma_id, "statement": new_stmt}
+                if aim != "proof":
+                    target["aim"] = aim
+                attempt_notes = [
+                    f"Overflowed from {old_id}: the prover ran out of the "
+                    f"context window; the reviser is trying the smaller "
+                    f"{lemma_id} instead."
+                ]
+                feedback = []
+                last_proof = ""
+                attempt = 1
+                log(
+                    f"↻ Prover overflowed {old_id}; now trying the smaller "
+                    f"lemma {lemma_id}:\n{new_stmt}",
+                    verbose,
+                )
+                continue
+            if (
+                action == "revise_statement"
+                and new_stmt
+                and new_stmt != target["statement"]
+            ):
+                # The partial work shows the statement is false or badly
+                # posed, and the reviser has corrected it. The lemma keeps
+                # its id and its attempt budget — the overflowing round
+                # still counts — and the prover re-runs on the correction
+                # with this round's feedback, the way a rejected-proof
+                # revision does.
+                target = {"id": lemma_id, "statement": new_stmt}
+                if aim != "proof":
+                    target["aim"] = aim
+                last_proof = ""
+                overflow_feedback.append(
+                    f"Revised statement proposed: {new_stmt}"
+                )
+                feedback = overflow_feedback
+                attempt_notes.extend(overflow_feedback)
+                attempt += 1
+                log(
+                    f"↻ Reviser revised the lemma after the overflow; the "
+                    f"prover starts again from:\n{new_stmt}",
+                    verbose,
+                )
+                continue
+            log(
+                "⛔ Reviser could not pick a usable smaller lemma or "
+                "revised statement from the partial proof; the planner "
+                "will decompose.",
+                verbose,
+            )
+            attempt_notes.extend(overflow_feedback)
+            attempt_notes.append(
+                "Lemma too large: the prover exhausted its context window "
+                "and the reviser could neither split it further nor "
+                "revise its statement. Decompose into smaller, "
+                "independently provable lemmas."
+            )
+            break
 
-    # references.md, if parsing.py produced one. The prover gets the full
-    # collection unconditionally — it is the tool that cites — so it is
-    # rendered once here and reused on every attempt.
+        proof = proof_text
+        declared: Optional[List[str]] = None
+        prover_res = parse_json_or_none(proof_text)
+        if prover_res is not None:
+            candidate = prover_res.get("proof")
+            if isinstance(candidate, str) and candidate.strip():
+                proof = candidate.strip()
+            raw_cited = prover_res.get("cited_lemmas")
+            if isinstance(raw_cited, list):
+                declared = [str(c).strip() for c in raw_cited if str(c).strip()]
+
+        if not proof:
+            log(f"❌ Prover produced no proof for {lemma_id}.", verbose)
+            attempt_notes.append("Prover returned nothing.")
+            break
+
+        # The last proof of this lemma: what the verifiers are about to
+        # check, what the reviser will judge its difficulty by, and what
+        # the checkpoint records beside the in-flight state.
+        last_proof = proof
+
+        # The DAG's edges now come from here. An empty declared list is
+        # taken at face value — a proof from first principles has no
+        # dependencies — but a missing one means the prover ignored its
+        # format, and scanning the text beats recording a lemma as
+        # standing on nothing.
+        if declared is None:
+            dep_ids = scan_citations(proof, dag, references)
+            if dep_ids:
+                log(
+                    f"  ℹ️  Prover declared no citations; recovered "
+                    f"{', '.join(dep_ids)} from the proof text.",
+                    verbose,
+                )
+        else:
+            # Citations may name DAG lemmas or parsed references; the
+            # verifier's context is the union of the two, so both are
+            # kept. A name in neither set is dropped, and the verifier is
+            # about to see a proof that leans on a result absent from its
+            # context, which is exactly the unjustified step it is meant
+            # to catch.
+            dep_ids = [c for c in declared if c in dag["lemmas"] or c in ref_ids]
+            phantom = [
+                c for c in declared if c not in dag["lemmas"] and c not in ref_ids
+            ]
+            if phantom:
+                log(
+                    f"  ⚠️  Prover cited ids that are neither lemmas nor "
+                    f"references: {', '.join(phantom)}.",
+                    verbose,
+                )
+
+        log(
+            f"✍️ Proof generated for {lemma_id} ({len(proof)} chars"
+            f"{', cites ' + ', '.join(dep_ids) if dep_ids else ', no citations'}).",
+            verbose,
+        )
+
+        # ---------------- Step 3: the three verifier checks -----------
+        # Three atomic checks, one per verifier agent, in the order
+        # verifier_1, verifier_2, verifier_3. Each is a single call to its
+        # own agent; one reject ends the counting and carries its
+        # reasoning to the reviser; only a proof that survives all three
+        # is accepted.
+        verifier_user = (
+            f"Conjecture:\n{conjecture}\n\n"
+            f"Cited results (statements of exactly the lemmas and "
+            f"references the proof declares it used; nothing else is "
+            f"available to it):\n"
+            f"{json.dumps(verifier_context(dag, dep_ids, references), indent=2)}\n\n"
+            f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
+            f"Proposed proof:\n{proof}"
+        )
+        reject_just: Optional[str] = None
+        for step, agent in enumerate(VERIFIER_AGENTS, 1):
+            role = agent[:-3]   # "verifier_1.md" -> "verifier_1"
+            decision, justification = _run_verifier(
+                role, verifier_sys[agent], verifier_user, verbose,
+            )
+            log(
+                f"🔍 Verifier {step}/{len(VERIFIER_AGENTS)} ({role}): "
+                f"{decision.upper() or '???'} — {justification}",
+                verbose,
+            )
+            if decision != "accept":
+                reject_just = justification
+                break
+
+        if reject_just is None:
+            # ---------------- Step 4: DAG update ----------------
+            # All three verifier checks accepted the same proof.
+            log(
+                f"✅ Lemma {lemma_id} passed all {len(VERIFIER_AGENTS)} "
+                f"verifier checks. Adding to DAG.",
+                verbose,
+            )
+            on_proof(lemma_id, {
+                "statement": target["statement"],
+                "proof": proof,
+                "dependencies": dep_ids,
+            })
+            with failed_lock:
+                failed_attempts.pop(lemma_id, None)
+            proved = True
+            break
+
+        # ---------------- Step 5: Reviser ----------------
+        log(
+            f"❌ Proof rejected for {lemma_id}. Sending the proof and the "
+            f"verdict to the reviser.",
+            verbose,
+        )
+        reviser_user = (
+            f"Conjecture:\n{conjecture}\n\n"
+            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+            f"{reviser_ref_block}\n\n"
+            f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
+            f"The last proof of this lemma (the one just rejected; judge "
+            f"the lemma's difficulty from it):\n{proof}\n\n"
+            f"Verifier's reasoning (why the proof failed):\n{reject_just}"
+        )
+        revision_text, _revision_status, _partial = reason(
+            reviser_sys, reviser_user, "reviser", THINK["reviser"], verbose
+        )
+        toggle_hotkey()
+
+        revision_res: Optional[Dict[str, Any]] = None
+        if revision_text:
+            # reviser.md demands raw JSON output; extraction is the
+            # fallback.
+            revision_res = parse_json_or_none(revision_text)
+            if revision_res is None:
+                revision_res = extract(
+                    "Extract the revision decision. action is one of "
+                    "'keep', 'revise_statement' or 'new_lemma': 'keep' if "
+                    "the statement is kept unchanged, 'revise_statement' "
+                    "only if the text proposes a changed statement for the "
+                    "same lemma, 'new_lemma' only if the text proposes a "
+                    "different, smaller lemma to prove instead. Copy "
+                    "new_statement verbatim; it is the empty string when "
+                    "the statement is kept. Copy new_id verbatim; it is the "
+                    "empty string unless action is 'new_lemma'. If the text "
+                    "uses 'statement_revision' instead of 'action', map "
+                    "true to 'revise_statement' and false to 'keep'.",
+                    revision_text,
+                    REVISER_SCHEMA,
+                    "reviser",
+                    verbose,
+                )
+        else:
+            log(
+                "⚠️  Reviser returned nothing; the verdict alone goes back "
+                "to the prover.",
+                verbose,
+            )
+        revision_res = revision_res or {}
+
+        # `action` is the current contract; older per-conjecture
+        # overrides that still emit statement_revision are read the old
+        # way so they keep working.
+        action = str(revision_res.get("action") or "").strip().lower()
+        if action not in ("keep", "revise_statement", "new_lemma"):
+            action = (
+                "revise_statement"
+                if bool(revision_res.get("statement_revision", False))
+                else "keep"
+            )
+        diagnosis = str(revision_res.get("diagnosis") or "").strip()
+        new_id = str(revision_res.get("new_id") or "").strip()
+        new_stmt = str(revision_res.get("new_statement") or "").strip()
+
+        feedback = [f"Verifier: {reject_just}"]
+        if diagnosis:
+            feedback.append(f"Reviser's diagnosis: {diagnosis}")
+
+        if (
+            action == "new_lemma"
+            and new_id
+            and new_stmt
+            and new_id not in dag["lemmas"]
+        ):
+            # Decomposition: the target is too hard to prove as stated.
+            # Record the old lemma's history — and why it was set aside —
+            # under its own id, then restart the prover on the smaller
+            # lemma with a fresh attempt budget and no inherited verdict.
+            old_id = lemma_id
+            # The current round's rejection is the old lemma's last word;
+            # fold it into its history before we set the lemma aside.
+            with failed_lock:
+                failed_attempts[old_id] = (
+                    list(attempt_notes)
+                    + list(feedback)
+                    + [
+                        f"Decomposed: {old_id} was judged too hard to prove "
+                        f"as stated; the reviser is instead trying {new_id}."
+                    ]
+                )
+            lemma_id = new_id
+            target = {"id": lemma_id, "statement": new_stmt}
+            if aim != "proof":
+                target["aim"] = aim
+            attempt_notes = [
+                f"Decomposed from {old_id} by the reviser (the original "
+                f"target was judged too hard to prove as stated)."
+            ]
+            # A fresh lemma has no rejection of its own, so the prover
+            # starts clean rather than inheriting the old proof's verdict.
+            feedback = []
+            last_proof = ""
+            attempt = 1
+            log(
+                f"↻ Reviser decomposed {old_id}; the prover now starts on "
+                f"the smaller lemma {lemma_id}:\n{new_stmt}",
+                verbose,
+            )
+            continue
+
+        if action == "revise_statement" and new_stmt and new_stmt != target["statement"]:
+            target = {"id": lemma_id, "statement": new_stmt}
+            if aim != "proof":
+                target["aim"] = aim
+            last_proof = ""
+            log(
+                f"↻ Reviser revised the lemma; the prover starts again "
+                f"from:\n{new_stmt}",
+                verbose,
+            )
+            feedback.append(f"Revised statement proposed: {new_stmt}")
+        elif action == "revise_statement":
+            log(
+                "⚠️  Reviser flagged a statement revision but gave none "
+                "usable; keeping the statement.",
+                verbose,
+            )
+        elif action == "new_lemma":
+            # The reviser wanted to decompose but the new id was missing or
+            # already taken; fall back to keeping the statement.
+            log(
+                "⚠️  Reviser proposed a new lemma with a missing or "
+                "already-taken id; keeping the statement instead.",
+                verbose,
+            )
+        else:
+            log(
+                "↻ Reviser kept the statement; the prover re-tries with "
+                "the verdict as feedback.",
+                verbose,
+            )
+        attempt_notes.extend(feedback)
+        attempt += 1
+        # Loop continues: the next prover round works on `target`, with
+        # only this round's feedback.
+
+    return {
+        "proved": proved,
+        "lemma_id": lemma_id,
+        "target": target,
+        "proof": proof,
+        "attempt_notes": attempt_notes,
+        "stopped": False,
+    }
+
+
+def _serial_on_round(
+    iteration: int,
+    failed_attempts: Dict[str, List[str]],
+    state: Dict[str, Any],
+    verbose: bool,
+) -> None:
+    """The serial round boundary: publish the in-flight state into
+    _LIVE_STATE (the SIGINT handler's source) and into the checkpoint, so a
+    Ctrl-C mid-round re-runs exactly that round."""
+    _LIVE_STATE["in_flight"] = state
+    save_checkpoint(iteration, failed_attempts, state, verbose)
+
+
+def _serial_on_proof(
+    lemma_id: str, node: Dict[str, Any], verbose: bool
+) -> None:
+    """The serial success boundary: add the lemma to the DAG, reading it
+    fresh under the DAG lock so the write composes with any later reader."""
+    with DAG_LOCK:
+        dag = load_dag()
+        dag["lemmas"][lemma_id] = node
+        save_dag(dag)
+
+
+def _build_reference_blocks(
+    verbose: bool,
+) -> Tuple[List[Dict[str, Any]], str, str, str]:
+    """The reference context the prompts carry, built once per run.
+
+    The prover gets the full collection unconditionally — it is the tool
+    that cites — so it is rendered once here and reused on every attempt.
+    The serial run and the parallel threads share these strings; they are
+    read-only once built.
+    """
     references = load_references()
-    ref_ids = {str(r["id"]) for r in references}
     prover_refs = [
         {
             "id": r["id"],
@@ -1793,20 +2517,71 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
     else:
         planner_ref_block = ""
         reviser_ref_block = ""
+    return references, reference_block, planner_ref_block, reviser_ref_block
 
-    # comments.md, if the operator left one: free-form notes on possible
-    # approaches to a proof or counterexample, handed to the planner verbatim
-    # on every iteration. The planner is the only agent that reads it, and
-    # an absent file degrades to the pre-comments prompt, the way the
-    # reference blocks do.
+
+def _build_comments_block() -> str:
+    """comments.md, if the operator left one: free-form notes on possible
+    approaches to a proof or counterexample, handed to the planner verbatim
+    on every iteration. The planner is the only agent that reads it, and an
+    absent file degrades to the pre-comments prompt, the way the reference
+    blocks do."""
     comments = load_file(COMMENTS_FILE)
-    comments_block = (
+    return (
         "\n\nHuman comments (the operator's notes on possible approaches to a "
         "proof or counterexample; suggestions to weigh, not instructions):\n"
         + comments
         if comments
         else ""
     )
+
+
+# ----------------------------------------------------------------------------
+# Main loop
+# ----------------------------------------------------------------------------
+def run_loop(verbose: bool = True) -> Dict[str, Any]:
+    """Execute the multi-agent theorem proving loop.
+
+    Args:
+        verbose: If True, print progress to the console.
+
+    Returns:
+        The final DAG, so callers running with --no-verbose still get a result.
+    """
+    global MODE            # the hotkey and the menu both retarget it mid-run
+
+    conjecture = load_file(CONJECTURE_FILE)
+    if not conjecture:
+        log(f"{CONJECTURE_FILE} is empty — write your conjecture there first.", verbose)
+        return load_dag()
+
+    planner_sys = load_file(PROMPT_PATHS["planner.md"])
+    selector_sys = load_file(PROMPT_PATHS["selector.md"])
+    prover_sys = load_file(PROMPT_PATHS["prover.md"])
+    # One prompt per verification step; VERIFIER_AGENTS names the three.
+    verifier_sys = {name: load_file(PROMPT_PATHS[name]) for name in VERIFIER_AGENTS}
+    # One reviser for both failures: a rejected proof, and a prover that
+    # overflowed the context window. The user message tells it which case it
+    # is — a full rejected proof with the verifier's reasoning, or a
+    # summarised trace plus the partial answer.
+    reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
+
+    empty = [name for name, text in (
+        ("planner.md", planner_sys), ("selector.md", selector_sys),
+        ("prover.md", prover_sys), *verifier_sys.items(),
+        ("reviser.md", reviser_sys),
+    ) if not text]
+    if empty:
+        # A missing system prompt does not crash — it produces an agent with
+        # no instructions, which fails in ways that look like model problems.
+        log(f"Missing or empty prompt files: {', '.join(empty)}. Aborting.", verbose)
+        return load_dag()
+
+    references, reference_block, planner_ref_block, reviser_ref_block = (
+        _build_reference_blocks(verbose)
+    )
+    ref_ids = {str(r["id"]) for r in references}
+    comments_block = _build_comments_block()
 
     # Checkpoint restore: the DAG is reloaded from disk every iteration, so a
     # cancelled run leaves only run-level state to restore — where the
@@ -2089,470 +2864,41 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         # *is* the decision to let the models settle it; asking again
         # afterwards would put the operator back in the loop they just
         # delegated out of. If you want a say over this lemma, assert it.
-        if resuming:
-            target: Dict[str, Any] = in_flight["target"]
-        else:
-            target: Dict[str, Any] = {"id": lemma_id, "statement": lemma_stmt}
-            if aim != "proof":
-                target["aim"] = aim
-        # The prover sees only the most recent failure: feedback is rebuilt
-        # after each rejected round, so a retry reads the last verdict and
-        # diagnosis, not the history of every earlier attempt. That history
-        # is kept for the planner in failed_attempts — decomposing or
-        # rerouting is its job, not the prover's.
-        if resuming:
-            feedback: List[str] = list(in_flight.get("feedback") or [])
-            attempt_notes: List[str] = list(in_flight.get("attempt_notes") or [])
-            first_attempt = in_flight["attempt"]
-            last_proof = str(in_flight.get("last_proof") or "")
-        else:
-            feedback: List[str] = []
-            attempt_notes: List[str] = list(failed_attempts.get(lemma_id, []))
-            first_attempt = 1
-            last_proof = ""
-        proved = False
-        attempt = first_attempt
-        # `attempt` is a while-loop counter rather than a for-range because the
-        # reviser can reset it: a lemma it decomposes into a smaller one starts
-        # its own prover rounds from 1 (see the new_lemma branch below).
-        while attempt <= MAX_PROOF_ATTEMPTS:
-            # Checkpoint: this prover round is now the resumable position. If
-            # the run is cancelled anywhere inside it, the next run re-runs
-            # the round with this target and this feedback — the round's own
-            # in-flight call is lost, nothing completed before it is.
-            in_flight_state = {
-                "lemma_id": lemma_id,
-                "target": target,
-                "attempt": attempt,
-                "feedback": feedback,
-                "attempt_notes": attempt_notes,
-                "last_proof": last_proof,
-            }
-            _LIVE_STATE["in_flight"] = in_flight_state
-            save_checkpoint(iteration, failed_attempts, in_flight_state, verbose)
-            log(
-                f"📝 Proof attempt {attempt}/{MAX_PROOF_ATTEMPTS} for {lemma_id}.",
-                verbose,
-            )
-
-            # ---------------- Step 2: Prover ----------------
-            # prover.md instructs the model to reply with {"lemma_id",
-            # "cited_lemmas", "proof"}. We parse that JSON locally rather than
-            # via a second model call, so the proof text can never be abridged
-            # or paraphrased; if the model ignored the format, its content is
-            # taken verbatim as the proof.
-            prover_user = (
-                f"Conjecture:\n{conjecture}\n\n"
-                f"Available proved lemmas:\n"
-                f"{json.dumps(prover_context(dag), indent=2)}"
-                f"{reference_block}\n\n"
-                f"Lemma to prove:\n{json.dumps(target, indent=2)}\n"
-                + (
-                    f"\nFeedback from the previous attempt "
-                    f"(the most recent rejection only):\n"
-                    f"{json.dumps(feedback, indent=2)}"
-                    if feedback
-                    else ""
-                )
-            )
-            proof_text, prover_status, prover_partial = reason(
-                prover_sys, prover_user, "prover", THINK["prover"], verbose
-            )
-            check_mode_toggle(verbose)
-
-            if prover_status == "ceiling":
-                # The prover exhausted the window and the compaction rescue
-                # (bounded by MAX_COMPACTION_PASSES) could not finish it. The
-                # partial work is still worth reading: compact it one last time
-                # and let the reviser pick a smaller lemma or revise the
-                # statement from it, instead of discarding it and asking the
-                # planner to decompose blind.
-                report = _incomplete_report(
-                    "prover", prover_partial or {}, verbose,
-                )
-                if not report:
-                    log(
-                        f"⛔ Lemma {lemma_id} is too large to prove in one call "
-                        f"and left nothing to build on. Asking the planner to "
-                        f"decompose it.",
-                        verbose,
-                    )
-                    attempt_notes.append(
-                        "Lemma too large: the prover exhausted its entire token "
-                        "budget without completing a proof and left nothing to "
-                        "resume from. Decompose this into smaller, "
-                        "independently provable lemmas rather than re-proposing "
-                        "it."
-                    )
-                    break
-                log(
-                    f"⛔ Lemma {lemma_id} overflowed the context window after "
-                    f"{MAX_COMPACTION_PASSES} compaction passes; asking the "
-                    f"reviser to pick a smaller lemma or revise the statement "
-                    f"from the partial proof.",
-                    verbose,
-                )
-                overflow_user = (
-                    f"Conjecture:\n{conjecture}\n\n"
-                    f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
-                    f"{reviser_ref_block}\n\n"
-                    f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
-                    f"{report}"
-                )
-                revision_text, _revision_status, _revision_partial = reason(
-                    reviser_sys, overflow_user, "reviser",
-                    THINK["reviser"], verbose,
-                )
-                check_mode_toggle(verbose)
-                revision_res = _parse_reviser_decision(revision_text, verbose)
-                action = str(revision_res.get("action") or "").strip().lower()
-                diagnosis = str(revision_res.get("diagnosis") or "").strip()
-                new_id = str(revision_res.get("new_id") or "").strip()
-                new_stmt = str(revision_res.get("new_statement") or "").strip()
-                overflow_feedback = [
-                    f"Prover: the proof of {lemma_id} overflowed the context "
-                    f"window after {MAX_COMPACTION_PASSES} compaction passes; "
-                    f"the reviser is choosing a smaller lemma or a corrected "
-                    f"statement from the partial work."
-                ]
-                if diagnosis:
-                    overflow_feedback.append(f"Reviser's diagnosis: {diagnosis}")
-                if (
-                    action == "new_lemma"
-                    and new_id
-                    and new_stmt
-                    and new_id not in dag["lemmas"]
-                ):
-                    # The reviser found a smaller lemma worth trying. Set the
-                    # overflowing lemma aside (its history is recorded under its
-                    # own id) and start the prover on the smaller lemma with a
-                    # fresh budget and no inherited verdict.
-                    old_id = lemma_id
-                    failed_attempts[old_id] = (
-                        list(attempt_notes)
-                        + list(overflow_feedback)
-                        + [
-                            f"Overflowed: {old_id} ran out of the prover's "
-                            f"context window; the reviser is instead trying "
-                            f"{new_id}."
-                        ]
-                    )
-                    lemma_id = new_id
-                    target = {"id": lemma_id, "statement": new_stmt}
-                    if aim != "proof":
-                        target["aim"] = aim
-                    attempt_notes = [
-                        f"Overflowed from {old_id}: the prover ran out of the "
-                        f"context window; the reviser is trying the smaller "
-                        f"{lemma_id} instead."
-                    ]
-                    feedback = []
-                    last_proof = ""
-                    attempt = 1
-                    log(
-                        f"↻ Prover overflowed {old_id}; now trying the smaller "
-                        f"lemma {lemma_id}:\n{new_stmt}",
-                        verbose,
-                    )
-                    continue
-                if (
-                    action == "revise_statement"
-                    and new_stmt
-                    and new_stmt != target["statement"]
-                ):
-                    # The partial work shows the statement is false or badly
-                    # posed, and the reviser has corrected it. The lemma keeps
-                    # its id and its attempt budget — the overflowing round
-                    # still counts — and the prover re-runs on the correction
-                    # with this round's feedback, the way a rejected-proof
-                    # revision does.
-                    target = {"id": lemma_id, "statement": new_stmt}
-                    if aim != "proof":
-                        target["aim"] = aim
-                    last_proof = ""
-                    overflow_feedback.append(
-                        f"Revised statement proposed: {new_stmt}"
-                    )
-                    feedback = overflow_feedback
-                    attempt_notes.extend(overflow_feedback)
-                    attempt += 1
-                    log(
-                        f"↻ Reviser revised the lemma after the overflow; the "
-                        f"prover starts again from:\n{new_stmt}",
-                        verbose,
-                    )
-                    continue
-                log(
-                    "⛔ Reviser could not pick a usable smaller lemma or "
-                    "revised statement from the partial proof; the planner "
-                    "will decompose.",
-                    verbose,
-                )
-                attempt_notes.extend(overflow_feedback)
-                attempt_notes.append(
-                    "Lemma too large: the prover exhausted its context window "
-                    "and the reviser could neither split it further nor "
-                    "revise its statement. Decompose into smaller, "
-                    "independently provable lemmas."
-                )
-                break
-
-            proof = proof_text
-            declared: Optional[List[str]] = None
-            prover_res = parse_json_or_none(proof_text)
-            if prover_res is not None:
-                candidate = prover_res.get("proof")
-                if isinstance(candidate, str) and candidate.strip():
-                    proof = candidate.strip()
-                raw_cited = prover_res.get("cited_lemmas")
-                if isinstance(raw_cited, list):
-                    declared = [str(c).strip() for c in raw_cited if str(c).strip()]
-
-            if not proof:
-                log(f"❌ Prover produced no proof for {lemma_id}.", verbose)
-                attempt_notes.append("Prover returned nothing.")
-                break
-
-            # The last proof of this lemma: what the verifiers are about to
-            # check, what the reviser will judge its difficulty by, and what
-            # the checkpoint records beside the in-flight state.
-            last_proof = proof
-
-            # The DAG's edges now come from here. An empty declared list is
-            # taken at face value — a proof from first principles has no
-            # dependencies — but a missing one means the prover ignored its
-            # format, and scanning the text beats recording a lemma as
-            # standing on nothing.
-            if declared is None:
-                dep_ids = scan_citations(proof, dag, references)
-                if dep_ids:
-                    log(
-                        f"  ℹ️  Prover declared no citations; recovered "
-                        f"{', '.join(dep_ids)} from the proof text.",
-                        verbose,
-                    )
-            else:
-                # Citations may name DAG lemmas or parsed references; the
-                # verifier's context is the union of the two, so both are
-                # kept. A name in neither set is dropped, and the verifier is
-                # about to see a proof that leans on a result absent from its
-                # context, which is exactly the unjustified step it is meant
-                # to catch.
-                dep_ids = [c for c in declared if c in dag["lemmas"] or c in ref_ids]
-                phantom = [
-                    c for c in declared if c not in dag["lemmas"] and c not in ref_ids
-                ]
-                if phantom:
-                    log(
-                        f"  ⚠️  Prover cited ids that are neither lemmas nor "
-                        f"references: {', '.join(phantom)}.",
-                        verbose,
-                    )
-
-            log(
-                f"✍️ Proof generated for {lemma_id} ({len(proof)} chars"
-                f"{', cites ' + ', '.join(dep_ids) if dep_ids else ', no citations'}).",
-                verbose,
-            )
-
-            # ---------------- Step 3: the three verifier checks -----------
-            # Three atomic checks, one per verifier agent, in the order
-            # verifier_1, verifier_2, verifier_3. Each is a single call to its
-            # own agent; one reject ends the counting and carries its
-            # reasoning to the reviser; only a proof that survives all three
-            # is accepted.
-            verifier_user = (
-                f"Conjecture:\n{conjecture}\n\n"
-                f"Cited results (statements of exactly the lemmas and "
-                f"references the proof declares it used; nothing else is "
-                f"available to it):\n"
-                f"{json.dumps(verifier_context(dag, dep_ids, references), indent=2)}\n\n"
-                f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
-                f"Proposed proof:\n{proof}"
-            )
-            reject_just: Optional[str] = None
-            for step, agent in enumerate(VERIFIER_AGENTS, 1):
-                role = agent[:-3]   # "verifier_1.md" -> "verifier_1"
-                decision, justification = _run_verifier(
-                    role, verifier_sys[agent], verifier_user, verbose,
-                )
-                log(
-                    f"🔍 Verifier {step}/{len(VERIFIER_AGENTS)} ({role}): "
-                    f"{decision.upper() or '???'} — {justification}",
-                    verbose,
-                )
-                if decision != "accept":
-                    reject_just = justification
-                    break
-
-            if reject_just is None:
-                # ---------------- Step 4: DAG update ----------------
-                # All three verifier checks accepted the same proof.
-                log(
-                    f"✅ Lemma {lemma_id} passed all {len(VERIFIER_AGENTS)} "
-                    f"verifier checks. Adding to DAG.",
-                    verbose,
-                )
-                dag["lemmas"][lemma_id] = {
-                    "statement": target["statement"],
-                    "proof": proof,
-                    "dependencies": dep_ids,
-                }
-                save_dag(dag)
-                failed_attempts.pop(lemma_id, None)
-                proved = True
-                break
-
-            # ---------------- Step 5: Reviser ----------------
-            log(
-                f"❌ Proof rejected for {lemma_id}. Sending the proof and the "
-                f"verdict to the reviser.",
-                verbose,
-            )
-            reviser_user = (
-                f"Conjecture:\n{conjecture}\n\n"
-                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
-                f"{reviser_ref_block}\n\n"
-                f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
-                f"The last proof of this lemma (the one just rejected; judge "
-                f"the lemma's difficulty from it):\n{proof}\n\n"
-                f"Verifier's reasoning (why the proof failed):\n{reject_just}"
-            )
-            revision_text, _revision_status, _partial = reason(
-                reviser_sys, reviser_user, "reviser", THINK["reviser"], verbose
-            )
-            check_mode_toggle(verbose)
-
-            revision_res: Optional[Dict[str, Any]] = None
-            if revision_text:
-                # reviser.md demands raw JSON output; extraction is the
-                # fallback.
-                revision_res = parse_json_or_none(revision_text)
-                if revision_res is None:
-                    revision_res = extract(
-                        "Extract the revision decision. action is one of "
-                        "'keep', 'revise_statement' or 'new_lemma': 'keep' if "
-                        "the statement is kept unchanged, 'revise_statement' "
-                        "only if the text proposes a changed statement for the "
-                        "same lemma, 'new_lemma' only if the text proposes a "
-                        "different, smaller lemma to prove instead. Copy "
-                        "new_statement verbatim; it is the empty string when "
-                        "the statement is kept. Copy new_id verbatim; it is the "
-                        "empty string unless action is 'new_lemma'. If the text "
-                        "uses 'statement_revision' instead of 'action', map "
-                        "true to 'revise_statement' and false to 'keep'.",
-                        revision_text,
-                        REVISER_SCHEMA,
-                        "reviser",
-                        verbose,
-                    )
-            else:
-                log(
-                    "⚠️  Reviser returned nothing; the verdict alone goes back "
-                    "to the prover.",
-                    verbose,
-                )
-            revision_res = revision_res or {}
-
-            # `action` is the current contract; older per-conjecture
-            # overrides that still emit statement_revision are read the old
-            # way so they keep working.
-            action = str(revision_res.get("action") or "").strip().lower()
-            if action not in ("keep", "revise_statement", "new_lemma"):
-                action = (
-                    "revise_statement"
-                    if bool(revision_res.get("statement_revision", False))
-                    else "keep"
-                )
-            diagnosis = str(revision_res.get("diagnosis") or "").strip()
-            new_id = str(revision_res.get("new_id") or "").strip()
-            new_stmt = str(revision_res.get("new_statement") or "").strip()
-
-            feedback = [f"Verifier: {reject_just}"]
-            if diagnosis:
-                feedback.append(f"Reviser's diagnosis: {diagnosis}")
-
-            if (
-                action == "new_lemma"
-                and new_id
-                and new_stmt
-                and new_id not in dag["lemmas"]
-            ):
-                # Decomposition: the target is too hard to prove as stated.
-                # Record the old lemma's history — and why it was set aside —
-                # under its own id, then restart the prover on the smaller
-                # lemma with a fresh attempt budget and no inherited verdict.
-                old_id = lemma_id
-                # The current round's rejection is the old lemma's last word;
-                # fold it into its history before we set the lemma aside.
-                failed_attempts[old_id] = (
-                    list(attempt_notes)
-                    + list(feedback)
-                    + [
-                        f"Decomposed: {old_id} was judged too hard to prove "
-                        f"as stated; the reviser is instead trying {new_id}."
-                    ]
-                )
-                lemma_id = new_id
-                target = {"id": lemma_id, "statement": new_stmt}
-                if aim != "proof":
-                    target["aim"] = aim
-                attempt_notes = [
-                    f"Decomposed from {old_id} by the reviser (the original "
-                    f"target was judged too hard to prove as stated)."
-                ]
-                # A fresh lemma has no rejection of its own, so the prover
-                # starts clean rather than inheriting the old proof's verdict.
-                feedback = []
-                last_proof = ""
-                attempt = 1
-                log(
-                    f"↻ Reviser decomposed {old_id}; the prover now starts on "
-                    f"the smaller lemma {lemma_id}:\n{new_stmt}",
-                    verbose,
-                )
-                continue
-
-            if action == "revise_statement" and new_stmt and new_stmt != target["statement"]:
-                target = {"id": lemma_id, "statement": new_stmt}
-                if aim != "proof":
-                    target["aim"] = aim
-                last_proof = ""
-                log(
-                    f"↻ Reviser revised the lemma; the prover starts again "
-                    f"from:\n{new_stmt}",
-                    verbose,
-                )
-                feedback.append(f"Revised statement proposed: {new_stmt}")
-            elif action == "revise_statement":
-                log(
-                    "⚠️  Reviser flagged a statement revision but gave none "
-                    "usable; keeping the statement.",
-                    verbose,
-                )
-            elif action == "new_lemma":
-                # The reviser wanted to decompose but the new id was missing or
-                # already taken; fall back to keeping the statement.
-                log(
-                    "⚠️  Reviser proposed a new lemma with a missing or "
-                    "already-taken id; keeping the statement instead.",
-                    verbose,
-                )
-            else:
-                log(
-                    "↻ Reviser kept the statement; the prover re-tries with "
-                    "the verdict as feedback.",
-                    verbose,
-                )
-            attempt_notes.extend(feedback)
-            attempt += 1
-            # Loop continues: the next prover round works on `target`, with
-            # only this round's feedback.
+        # The shared engine (run_proof_loop, above) owns steps 2-5; the
+        # serial run hands it the serial versions of the round and success
+        # boundaries: publish the in-flight state into _LIVE_STATE and the
+        # checkpoint, and commit proved lemmas to the DAG. The lock is a
+        # formality here — one thread — and the engine's contract does not
+        # change between the two modes.
+        serial_failed_lock = threading.Lock()
+        result = run_proof_loop(
+            verbose=verbose,
+            conjecture=conjecture,
+            prover_sys=prover_sys,
+            reviser_sys=reviser_sys,
+            reference_block=reference_block,
+            reviser_ref_block=reviser_ref_block,
+            references=references,
+            verifier_sys=verifier_sys,
+            ref_ids=ref_ids,
+            initial=in_flight if resuming else None,
+            fresh_target=None if resuming else next_lemma,
+            on_round=lambda state: _serial_on_round(
+                iteration, failed_attempts, state, verbose
+            ),
+            on_proof=lambda lid, node: _serial_on_proof(lid, node, verbose),
+            failed_attempts=failed_attempts,
+            failed_lock=serial_failed_lock,
+            get_dag=load_dag,
+            toggle_hotkey=lambda: check_mode_toggle(verbose),
+        )
+        lemma_id = result["lemma_id"]
+        proved = result["proved"]
 
         # ---------------- Step 6: Record the outcome for the planner --------
         if not proved:
-            if attempt_notes:
-                failed_attempts[lemma_id] = attempt_notes
+            if result["attempt_notes"]:
+                failed_attempts[lemma_id] = result["attempt_notes"]
             log(
                 f"↷ Lemma {lemma_id} left unproved after the proof loop; the "
                 f"planner will see the feedback.",
@@ -2571,6 +2917,1017 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         f"conjecture (proved or disproved). The checkpoint keeps the budget "
         f"position: re-run with a larger --max-iterations to continue, or "
         f"--fresh to restart it. The DAG is kept either way.",
+        verbose,
+    )
+    return load_dag()
+
+
+# ----------------------------------------------------------------------------
+# Parallel mode
+#
+# N proof loops share one DAG, one version-2 checkpoint, and one
+# possible-lemma buffer, steered by two extra threads:
+#
+#   planner    re-plans the shared strategy whenever the DAG changes
+#   generator  keeps the buffer stocked with fresh candidate lemmas
+#   loop-N     pulls a lemma from the buffer, runs the shared proof engine
+#              (run_proof_loop) on it, records the outcome, repeats
+#
+# When --mode human, loop 0 is the operator's loop: each fresh start goes
+# to the menu with the buffer as its candidate list — the parallel version
+# of the serial shortlist menu — and the hotkey toggles it between the menu
+# and automation exactly as in the serial run. Every write to the shared
+# state goes through ParallelState, and every write to the DAG goes through
+# the DAG lock with a fresh read, so a lemma can never be added twice and a
+# reader can never see a half-state.
+# ----------------------------------------------------------------------------
+
+_QUIT = object()  # sentinel: the human loop asked the run to stop
+
+
+class LemmaBuffer:
+    """The shared possible-lemma list: exactly N+5 fixed slots.
+
+    The generator fills the empty slots; the proof loops claim them. The
+    slots are the flow control — a full buffer means the loops are behind,
+    and the generator waits for a slot instead of piling up work. Claiming
+    is atomic: a selector that picked a lemma another loop has taken in the
+    meantime is re-run on what remains, so two loops never work on one id.
+    """
+
+    def __init__(self, size: int) -> None:
+        # Each slot is {"lemma": candidate, "claimed_by": loop id or None},
+        # or None while the slot is empty.
+        self.slots: List[Optional[Dict[str, Any]]] = [None] * size
+        self.cond = threading.Condition()
+
+    def __len__(self) -> int:
+        with self.cond:
+            return len(self.slots)
+
+    def snapshot(self) -> List[Dict[str, Any]]:
+        """The current contents in slot order — what the menu renders and
+        the generator's prompt carries."""
+        with self.cond:
+            return [
+                {"lemma": e["lemma"], "claimed_by": e["claimed_by"]}
+                for e in self.slots
+                if e is not None
+            ]
+
+    def _unclaimed_locked(self) -> List[Dict[str, Any]]:
+        # Call with self.cond held — the lock is not reentrant, so the
+        # public unclaimed() below is the only way in from the outside.
+        return [
+            e["lemma"]
+            for e in self.slots
+            if e is not None and e["claimed_by"] is None
+        ]
+
+    def unclaimed(self) -> List[Dict[str, Any]]:
+        with self.cond:
+            return self._unclaimed_locked()
+
+    def has_room(self) -> bool:
+        with self.cond:
+            return any(e is None for e in self.slots)
+
+    def fill(self, candidates: List[Dict[str, Any]]) -> int:
+        """Put fresh candidates into the empty slots, first come first
+        served, skipping any whose id already sits in the buffer. Returns
+        how many landed."""
+        added = 0
+        with self.cond:
+            for cand in candidates:
+                if any(
+                    e is not None and e["lemma"]["id"] == cand["id"]
+                    for e in self.slots
+                ):
+                    continue
+                for i, e in enumerate(self.slots):
+                    if e is None:
+                        self.slots[i] = {"lemma": cand, "claimed_by": None}
+                        added += 1
+                        break
+            if added:
+                self.cond.notify_all()
+        return added
+
+    def claim(self, loop_id: str, selector) -> Optional[Dict[str, Any]]:
+        """The atomic pick: snapshot the unclaimed lemmas, let the selector
+        choose outside the lock (its LLM call is never made under it), then
+        commit under the lock — and if the choice was claimed in the
+        meantime, re-run the selector on what remains. Returns the claimed
+        candidate, or None when the buffer runs out under the feet."""
+        while True:
+            with self.cond:
+                usable = self._unclaimed_locked()
+                if not usable:
+                    return None
+            chosen = selector(usable)
+            if chosen is None:
+                return None
+            with self.cond:
+                for e in self.slots:
+                    if (
+                        e is not None
+                        and e["lemma"]["id"] == chosen["id"]
+                        and e["claimed_by"] is None
+                    ):
+                        e["claimed_by"] = loop_id
+                        self.cond.notify_all()
+                        return e["lemma"]
+                # Stolen between snapshot and commit: go around again.
+
+    def claim_id(self, loop_id: str, lemma_id: str) -> Optional[Dict[str, Any]]:
+        """Claim a named lemma — the human loop's pick. Same atomicity as
+        claim(): None when the id is not in the buffer unclaimed."""
+        with self.cond:
+            for e in self.slots:
+                if (
+                    e is not None
+                    and e["lemma"]["id"] == lemma_id
+                    and e["claimed_by"] is None
+                ):
+                    e["claimed_by"] = loop_id
+                    self.cond.notify_all()
+                    return e["lemma"]
+        return None
+
+    def consume(self, lemma_id: str) -> None:
+        """Free the slot a settled lemma occupied. Proved, disproved by
+        decomposition, or abandoned, the lemma has left the list either
+        way; the id's territory is the generator's to offer again.
+        No-op when the id is not in the buffer (a written lemma)."""
+        with self.cond:
+            for i, e in enumerate(self.slots):
+                if e is not None and e["lemma"]["id"] == lemma_id:
+                    self.slots[i] = None
+                    self.cond.notify_all()
+                    return
+
+    def wait_for(self, predicate, wake: threading.Event) -> bool:
+        """Sleep while predicate() is false. True when it holds, False
+        when `wake` (a stop) fires first."""
+        with self.cond:
+            while not predicate():
+                if wake.is_set():
+                    return False
+                self.cond.wait()
+            return True
+
+
+class ParallelState:
+    """Everything the parallel threads share, plus the checkpoint writer.
+
+    One lock per concern, never held across an LLM call:
+      state_lock    the per-loop slots, the plan, the DAG version
+      failed_lock   the shared reject list
+      DAG_LOCK      the DAG file itself (module global)
+    The checkpoint is a whole-file rewrite — the loop slots snapshotted
+    under state_lock, the reject list under failed_lock, then one atomic
+    replace — so the file is always a consistent state even though many
+    threads poke at it.
+    """
+
+    def __init__(self, loop_ids: List[str], max_iterations: int) -> None:
+        self.buffer = LemmaBuffer(len(loop_ids) + 5)
+        self.loops: Dict[str, Dict[str, Any]] = {
+            lid: {"in_flight": None, "iterations_used": 0} for lid in loop_ids
+        }
+        self.max_iterations = max_iterations
+        self.plan: Optional[Dict[str, Any]] = None
+        self.plan_stale = False
+        self.plan_cond = threading.Condition()
+        self.dag_version = 0
+        self.failed_attempts: Dict[str, List[str]] = {}
+        self.failed_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.resolution: Optional[str] = None
+        self.state_lock = threading.Lock()
+        # How many proof loops are still inside their loops. The stop the
+        # planner and generator wait on may only fire when this reaches zero:
+        # a loop that has spent its budget may still be running the engine on
+        # its final claim, and stopping it mid-engine would orphan a lemma
+        # that was claimed, budgeted, and never proved.
+        self.live_loops = len(loop_ids)
+
+    # -- run control ------------------------------------------------------
+
+    def running(self) -> bool:
+        return not self.stop_event.is_set()
+
+    def note_loop_exit(self) -> bool:
+        """A proof loop left its loop. True if it was the last one out."""
+        with self.state_lock:
+            self.live_loops = max(0, self.live_loops - 1)
+            return self.live_loops == 0
+
+    def request_stop(self) -> None:
+        self._stop_all()
+
+    def set_resolution(self, kind: str) -> None:
+        with self.state_lock:
+            if self.resolution is not None:
+                return
+            self.resolution = kind
+        self._stop_all()
+
+    def _stop_all(self) -> None:
+        self.stop_event.set()
+        with self.buffer.cond:
+            self.buffer.cond.notify_all()
+        with self.plan_cond:
+            self.plan_cond.notify_all()
+
+    # -- the plan ----------------------------------------------------------
+
+    def wait_for_work(self) -> bool:
+        """Planner: sleep until there is no plan, or a stale one."""
+        with self.plan_cond:
+            while self.plan is not None and not self.plan_stale:
+                if self.stop_event.is_set():
+                    return False
+                self.plan_cond.wait()
+            return True
+
+    def wait_for_plan(self) -> bool:
+        """Generator: sleep until some plan exists. A stale one still
+        steers the generator — it keeps the buffer stocked while the
+        planner catches up — so only the first plan is waited for."""
+        with self.plan_cond:
+            while self.plan is None:
+                if self.stop_event.is_set():
+                    return False
+                self.plan_cond.wait()
+            return True
+
+    def install_plan(
+        self, plan: Dict[str, Any], dag_version_before: int
+    ) -> bool:
+        """Install a plan. Returns True when the DAG moved while it was
+        being written: the plan is installed already marked stale, so the
+        planner goes straight back around — a plan is never left steering
+        a DAG it was not written for."""
+        with self.state_lock:
+            self.plan = {
+                "plan_summary": str(plan.get("plan_summary") or "").strip(),
+                "priorities": [
+                    p
+                    for p in (plan.get("priorities") or [])
+                    if isinstance(p, dict) and str(p.get("id") or "").strip()
+                ],
+            }
+            moved = self.dag_version > dag_version_before
+            self.plan_stale = moved
+        with self.plan_cond:
+            self.plan_cond.notify_all()
+        return moved
+
+    def mark_plan_stale(self) -> None:
+        """The operator's 'replan' and the DAG changes both land here."""
+        with self.plan_cond:
+            self.plan_stale = True
+            self.plan_cond.notify_all()
+
+    def plan_snapshot(self) -> Optional[Dict[str, Any]]:
+        with self.state_lock:
+            if self.plan is None:
+                return None
+            return {
+                "plan_summary": self.plan["plan_summary"],
+                "priorities": list(self.plan["priorities"]),
+            }
+
+    # -- per-loop slots -----------------------------------------------------
+
+    def iterations_used(self, loop_id: str) -> int:
+        with self.state_lock:
+            return self.loops[loop_id]["iterations_used"]
+
+    def begin_lemma(self, loop_id: str) -> None:
+        """A fresh lemma starts: spend one of the loop's iterations and
+        checkpoint the spend, so a cancelled run does not re-spend it."""
+        with self.state_lock:
+            self.loops[loop_id]["iterations_used"] += 1
+        self.write_checkpoint()
+
+    def set_in_flight(
+        self, loop_id: str, state: Optional[Dict[str, Any]]
+    ) -> None:
+        """The engine's round boundary: publish this loop's resumable
+        position (None when its lemma is settled)."""
+        with self.state_lock:
+            self.loops[loop_id]["in_flight"] = state
+        self.write_checkpoint()
+
+    def take_in_flight(self, loop_id: str) -> Optional[Dict[str, Any]]:
+        """This loop's pending round at start-of-run.
+
+        Deliberately not cleared: the engine's first on_round replaces the
+        published state, and until then the position stays visible — the
+        generator's duplicate check sees the lemma is taken, and a crash
+        before the first on_round leaves the old round to re-take, losing
+        nothing. The budget was already spent when the lemma was claimed,
+        so re-taking it never spends an iteration twice."""
+        with self.state_lock:
+            pending = self.loops[loop_id]["in_flight"]
+            return dict(pending) if pending is not None else None
+
+    def in_flight_ids(self) -> Set[str]:
+        """The lemmas the loops are holding in flight right now: a fresh
+        run's buffer starts empty, so without this the generator could
+        re-offer a lemma whose loop is about to resume it, and two loops
+        could then prove the same lemma in parallel."""
+        with self.state_lock:
+            return {
+                d["in_flight"]["lemma_id"]
+                for d in self.loops.values()
+                if d.get("in_flight") is not None
+            }
+
+    # -- the DAG -------------------------------------------------------------
+
+    def add_lemma(self, lemma_id: str, node: Dict[str, Any]) -> None:
+        """Commit a lemma to the shared DAG — the atomic part of the
+        design. Read the DAG fresh under the DAG lock, add the lemma,
+        write it back whole; then bump the version the planner watches,
+        clear the lemma's reject notes, mark the plan stale (the DAG
+        changed, so the plan owes a re-read), and checkpoint. The version
+        is visible only after the file is down, so a replan triggered by
+        it always sees the new lemma."""
+        with DAG_LOCK:
+            dag = load_dag()
+            dag["lemmas"][lemma_id] = node
+            save_dag(dag)
+        with self.state_lock:
+            self.dag_version += 1
+        with self.failed_lock:
+            self.failed_attempts.pop(lemma_id, None)
+        self.mark_plan_stale()
+        self.write_checkpoint()
+
+    def dag_version_snapshot(self) -> int:
+        with self.state_lock:
+            return self.dag_version
+
+    # -- the shared reject list -----------------------------------------------
+
+    def record_failure(self, lemma_id: str, notes: List[str]) -> None:
+        with self.failed_lock:
+            self.failed_attempts[lemma_id] = list(notes)
+        self.write_checkpoint()
+
+    def failed_snapshot(self) -> Dict[str, List[str]]:
+        with self.failed_lock:
+            return {k: list(v) for k, v in self.failed_attempts.items()}
+
+    # -- checkpoint -------------------------------------------------------------
+
+    def apply_checkpoint(self, cp: Dict[str, Any]) -> None:
+        with self.state_lock:
+            for lid, slot in self.loops.items():
+                entry = cp["loops"].get(lid) or {}
+                slot["in_flight"] = entry.get("in_flight")
+                slot["iterations_used"] = int(entry.get("iterations_used") or 0)
+        with self.failed_lock:
+            self.failed_attempts = {
+                str(k): [n for n in v if isinstance(n, str)]
+                for k, v in (cp.get("failed_attempts") or {}).items()
+                if isinstance(v, list)
+            }
+
+    def write_checkpoint(self) -> None:
+        with self.state_lock:
+            loops = {
+                lid: {
+                    "in_flight": slot["in_flight"],
+                    "iterations_used": slot["iterations_used"],
+                }
+                for lid, slot in self.loops.items()
+            }
+        failed = self.failed_snapshot()
+        _atomic_write_checkpoint_file(
+            {"version": 2, "loops": loops, "failed_attempts": failed},
+            verbose=False,
+        )
+
+
+def _clean_candidate(raw: Any) -> Optional[Dict[str, Any]]:
+    """A generated or written lemma entry, validated the way the planner's
+    candidates are: an id, a non-empty statement, an aim the prover knows.
+    Anything else is dropped, not repaired — the prompt tells the generator
+    the shape, and a dropped entry costs one generator round, not a proof."""
+    if not isinstance(raw, dict):
+        return None
+    lemma_id = str(raw.get("id") or "").strip()
+    statement = str(raw.get("statement") or "").strip()
+    if not lemma_id or not statement:
+        return None
+    cand: Dict[str, Any] = {"id": lemma_id, "statement": statement}
+    aim = str(raw.get("aim") or "proof").strip().lower()
+    if aim == "counterexample":
+        cand["aim"] = aim
+    return cand
+
+
+def _parallel_planner(
+    state: ParallelState,
+    verbose: bool,
+    planner_sys: str,
+    conjecture: str,
+    comments_block: str,
+    ref_block: str,
+) -> None:
+    """The steering planner: keeps the shared strategy current.
+
+    Runs once at start (no plan yet), then whenever the DAG changes — a
+    lemma added by any loop lands in add_lemma, which marks the plan
+    stale — or the operator asks for a re-plan. If the DAG moves again
+    during the planning call itself, the plan is installed already marked
+    stale and the planner goes straight back around: no DAG change is
+    lost, and the plan that steers the loops was always written for the
+    DAG as it stood."""
+    while state.running():
+        if not state.wait_for_work():
+            return
+        if not state.running():
+            return
+        dag = load_dag()
+        dag_version_before = state.dag_version_snapshot()
+        plan = state.plan_snapshot()
+        plan_user = (
+            f"Conjecture:\n{conjecture}\n\n"
+            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+            f"{ref_block}{comments_block}\n\n"
+            f"Rejected attempts so far, keyed by lemma id (feedback from the "
+            f"loops' prover, verifier and reviser rounds; routes already "
+            f"found wanting):\n{json.dumps(state.failed_snapshot(), indent=2)}\n\n"
+            f"Current plan, if any (revise it against the DAG: keep what "
+            f"still holds, drop what is done or dead, re-order what moved):\n"
+            + (json.dumps(plan, indent=2) if plan else "(none yet)")
+            + "\n"
+        )
+        text, _status, _partial = reason(
+            planner_sys, plan_user, "parallel_planner",
+            THINK["parallel_planner"], verbose,
+        )
+        check_mode_toggle(verbose)
+        plan_res = parse_json_or_none(text) if text else None
+        if plan_res is None and text:
+            plan_res = extract(
+                "Extract the plan. The two flags are booleans; plan_summary "
+                "is a short string; priorities is a list of objects with id "
+                "and reason.",
+                text,
+                PARALLEL_PLANNER_SCHEMA,
+                "parallel_planner",
+                verbose,
+            )
+        if not plan_res or not isinstance(plan_res, dict):
+            log(
+                "⚠️  Parallel planner gave no usable plan; retrying in 10s.",
+                verbose,
+            )
+            if state.stop_event.wait(10):
+                return
+            continue
+        moved = state.install_plan(plan_res, dag_version_before)
+        if bool(plan_res.get("is_conjecture_proved")) or bool(
+            plan_res.get("is_conjecture_disproved")
+        ):
+            kind = (
+                "proved"
+                if plan_res.get("is_conjecture_proved")
+                else "disproved"
+            )
+            log(
+                f"\n🏁 Planner judges the conjecture {kind}; the loops are "
+                f"being stopped.",
+                verbose,
+            )
+            state.set_resolution(kind)
+            return
+        log(
+            "🧠 Planner set the strategy"
+            + (" — the DAG moved while it was writing, re-planning now."
+               if moved else "."),
+            verbose,
+        )
+
+
+def _parallel_generator(
+    state: ParallelState,
+    verbose: bool,
+    generator_sys: str,
+    conjecture: str,
+    ref_block: str,
+) -> None:
+    """Keeps the possible-lemma list stocked.
+
+    Each round it asks the generator for five candidate lemmas and fills
+    the buffer's empty slots with the ones that are new: an id already in
+    the DAG, the buffer, or the reject list is dropped, so no id is ever
+    claimed twice. The buffer's fixed N+5 slots are the flow control — a
+    full buffer means the loops are behind, and the generator waits for a
+    slot instead of piling up work."""
+    while state.running():
+        if not state.wait_for_plan():
+            return
+        if not state.running():
+            return
+        # Wait for a free slot first: the buffer is the queue and the
+        # generator its only writer.
+        if not state.buffer.wait_for(state.buffer.has_room, state.stop_event):
+            return
+        plan = state.plan_snapshot() or {}
+        dag = load_dag()
+        buffer_snapshot = state.buffer.snapshot()
+        # Ids the new batch must not repeat: proved, buffered (claimed or
+        # not), or already rejected.
+        known = set(dag["lemmas"].keys())
+        known |= {e["lemma"]["id"] for e in buffer_snapshot}
+        known |= set(state.failed_snapshot().keys())
+        # A lemma a loop holds in flight is off-limits too: the run
+        # resumed it, and it is not in this run's buffer.
+        known |= state.in_flight_ids()
+        gen_user = (
+            f"Conjecture:\n{conjecture}\n\n"
+            f"Current plan (follow its priorities; these are the lemmas the "
+            f"loops are working toward):\n{json.dumps(plan, indent=2)}\n\n"
+            f"Proved lemmas so far (already in the DAG; never restate "
+            f"them):\n{json.dumps(planner_dag_view(dag), indent=2)}\n\n"
+            f"Possible lemmas currently in the buffer (claimed_by marks the "
+            f"loop that has picked one up; never duplicate any of "
+            f"these):\n{json.dumps(buffer_snapshot, indent=2)}\n\n"
+            f"Rejected attempts so far, keyed by lemma id (statements and "
+            f"routes already found wanting):\n"
+            f"{json.dumps(state.failed_snapshot(), indent=2)}\n"
+        )
+        text, _status, _partial = reason(
+            generator_sys, gen_user, "parallel_lemma_generator",
+            THINK["parallel_lemma_generator"], verbose,
+        )
+        check_mode_toggle(verbose)
+        batch = parse_json_or_none(text) if text else None
+        if batch is None and text:
+            batch = extract(
+                "Extract the candidate lemmas: an object with a "
+                "candidate_lemmas list; each lemma has id, statement and "
+                "aim.",
+                text,
+                PARALLEL_LEMMA_GENERATOR_SCHEMA,
+                "parallel_lemma_generator",
+                verbose,
+            )
+        lemmas = (batch or {}).get("candidate_lemmas") or []
+        fresh: List[Dict[str, Any]] = []
+        for raw in lemmas:
+            cand = _clean_candidate(raw)
+            if cand is None or cand["id"] in known:
+                continue
+            known.add(cand["id"])
+            fresh.append(cand)
+        added = state.buffer.fill(fresh)
+        log(
+            f"🧪 Lemma generator offered {len(fresh)} new candidate(s); "
+            f"{added} entered the buffer "
+            f"({len(state.buffer.snapshot())}/{len(state.buffer)} slots full).",
+            verbose,
+        )
+        if added == 0:
+            # Nothing landed (no offer, or the buffer filled under the feet):
+            # back off so a stalled planner and a stalled generator cannot
+            # spin together.
+            if state.stop_event.wait(10):
+                return
+
+
+def _auto_claim(
+    state: ParallelState,
+    loop_id: str,
+    verbose: bool,
+    conjecture: str,
+) -> Optional[Dict[str, Any]]:
+    """The unattended claim: snapshot the unclaimed buffer, let the
+    selector agent weigh them, commit atomically. None when the buffer
+    holds nothing the loops have not already taken."""
+
+    def pick(usable: List[Dict[str, Any]]) -> Dict[str, Any]:
+        dag = load_dag()
+        plan = state.plan_snapshot() or {}
+        failed = state.failed_snapshot()
+        return select_lemma(
+            usable,
+            dag,
+            conjecture,
+            str(plan.get("plan_summary") or ""),
+            failed,
+            verbose,
+            proposer="the lemma generator",
+        )
+
+    return state.buffer.claim(loop_id, pick)
+
+
+def _parallel_human_step(
+    state: ParallelState,
+    loop_id: str,
+    verbose: bool,
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """One human planning step: the buffer on the menu, as the serial run
+    puts the planner's shortlist. Loops until the operator commits to a
+    lemma, hands the loop to automation, or quits — a quit stops the whole
+    run, not just this loop, and says so. Re-plans and asserts are
+    recorded and the menu comes right back, the serial way."""
+    global MODE
+    while True:
+        dag = load_dag()
+        snapshot = state.buffer.snapshot()
+        screened = [
+            (
+                entry["lemma"],
+                [f"claimed by {entry['claimed_by']}"]
+                if entry["claimed_by"]
+                else [],
+            )
+            for entry in snapshot
+        ]
+        plan = state.plan_snapshot() or {}
+        summary = str(plan.get("plan_summary") or "")
+        choice = interaction.choose(
+            screened, dag["lemmas"].keys(), HOTKEY, summary
+        )
+        if choice.action == "quit":
+            log(
+                "\n⏹ Stopped by the operator; the DAG and the checkpoint "
+                "are kept — re-run the same command to resume.",
+                verbose,
+            )
+            state.request_stop()
+            return "quit", None
+        if choice.action == "replan":
+            with state.failed_lock:
+                for cand, _problems in screened:
+                    for note in choice.notes:
+                        state.failed_attempts.setdefault(cand["id"], []).append(
+                            note
+                        )
+            state.mark_plan_stale()
+            state.write_checkpoint()
+            log("↩︎ Buffer rejected; the planner is asked again.", verbose)
+            continue
+        if choice.action == "auto":
+            MODE = "auto"
+            log(f"▶ {loop_id} handed to automation. {HOTKEY.hint()}", verbose)
+            return "auto", None
+        if choice.action == "assert":
+            asserted = choice.lemma or {}
+            state.add_lemma(
+                asserted["id"],
+                {
+                    "statement": asserted["statement"],
+                    "proof": "Asserted by the operator; not machine-proved.",
+                    "dependencies": [],
+                    "provenance": "operator",
+                },
+            )
+            state.buffer.consume(asserted["id"])
+            log(
+                f"🖊  Lemma {asserted['id']} accepted on your authority and "
+                f"added to the DAG unproved.",
+                verbose,
+            )
+            continue
+        # 'prove': a buffer lemma, claimed atomically, or a written one.
+        lemma = choice.lemma or {}
+        lemma_id = str(lemma.get("id") or "").strip()
+        if lemma_id in {e["lemma"]["id"] for e in snapshot}:
+            claimed = state.buffer.claim_id(loop_id, lemma_id)
+            if claimed is None:
+                log(
+                    f"  {lemma_id} was claimed in the meantime; pick another.",
+                    verbose,
+                )
+                continue
+            return "prove", claimed
+        cand = _clean_candidate(lemma)
+        if cand is None:
+            log(
+                "  That written lemma has no usable id or statement; "
+                "pick another.",
+                verbose,
+            )
+            continue
+        return "prove", cand
+
+
+def _parallel_proof_loop(
+    state: ParallelState,
+    loop_id: str,
+    loop_index: int,
+    verbose: bool,
+    conjecture: str,
+    prover_sys: str,
+    reviser_sys: str,
+    reference_block: str,
+    reviser_ref_block: str,
+    references: List[Dict[str, Any]],
+    verifier_sys: Dict[str, str],
+    ref_ids: Set[str],
+) -> None:
+    """One of the N proof loops: pull a lemma from the buffer, run the
+    shared proof engine on it, record the outcome, repeat — until the loop
+    spends its iteration budget, the run resolves, or it is stopped.
+
+    Loop 0 is the operator's while --mode human: each fresh start goes to
+    the menu first (the buffer is the shortlist), and the hotkey still
+    toggles it between the menu and automation. The engine's callbacks are
+    the loop's share of the shared state: on_round publishes the resumable
+    position, on_proof commits a lemma to the DAG, and the loop's failure
+    notes join the shared reject list under its lock."""
+    is_human = lambda: loop_index == 0 and MODE == "human"
+    log(
+        f"🚀 {loop_id} starts"
+        + (" (the human loop — it asks before each lemma)."
+           if is_human() else " (automatic)."),
+        verbose,
+    )
+    while state.running():
+        pending = state.take_in_flight(loop_id)
+        if pending is not None:
+            # A prover round a previous run cancelled mid-flight: re-run
+            # exactly that round. It does not spend a new iteration — the
+            # one it started under was already spent — so the resume is
+            # checked before the budget: a loop that exhausted its budget
+            # still finishes the lemma it died holding.
+            dag_now = load_dag()
+            if pending["lemma_id"] in dag_now.get("lemmas", {}):
+                # The stop landed after the lemma was proved: on_proof had
+                # already committed it. The serial run's same case — nothing
+                # to resume; drop the position and the buffer claim, and go
+                # about the next lemma (the spent iteration is spent).
+                state.set_in_flight(loop_id, None)
+                state.buffer.consume(pending["lemma_id"])
+                log(
+                    f"\u267b {loop_id}'s in-flight {pending['lemma_id']} is "
+                    f"already in the DAG; resuming is moot.",
+                    verbose,
+                )
+                continue
+            initial = pending
+            fresh_target = None
+            log(
+                f"♻ {loop_id} resumes {pending['lemma_id']} at prover round "
+                f"{pending['attempt']}/{MAX_PROOF_ATTEMPTS}.",
+                verbose,
+            )
+        else:
+            if state.iterations_used(loop_id) >= state.max_iterations:
+                log(
+                    f"⏹ {loop_id} has spent its budget "
+                    f"({state.max_iterations}/{state.max_iterations}).",
+                    verbose,
+                )
+                # The stop that frees the planner and generator is sent from
+                # the loop exit below, not here: this loop has spent its
+                # budget, but a sibling may still be proving the lemma it
+                # claimed on its last iteration, and a stop now would kill
+                # that engine before its lemma was ever proved.
+                break
+            if is_human():
+                action, lemma = _parallel_human_step(state, loop_id, verbose)
+                if action == "quit":
+                    # The operator ended the run, the serial way: stop every
+                    # loop (their in-flight lemmas stay in the checkpoint),
+                    # not just this one.
+                    state.request_stop()
+                    break
+                if action == "prove":
+                    fresh_target = lemma
+                else:  # 'auto': the operator delegated the pick.
+                    fresh_target = _auto_claim(
+                        state, loop_id, verbose, conjecture
+                    )
+            else:
+                fresh_target = _auto_claim(
+                    state, loop_id, verbose, conjecture
+                )
+            if fresh_target is None:
+                # Nothing unclaimed in the buffer: the generator is behind.
+                # Wait for it to fill a slot (or the run to stop).
+                if not state.buffer.wait_for(
+                    state.buffer.unclaimed, state.stop_event
+                ):
+                    break
+                continue
+            initial = None
+            # The iteration is spent the moment the lemma is claimed, the
+            # serial way: a run cancelled mid-lemma resumes it without
+            # charging the budget again.
+            state.begin_lemma(loop_id)
+        result = run_proof_loop(
+            verbose=verbose,
+            conjecture=conjecture,
+            prover_sys=prover_sys,
+            reviser_sys=reviser_sys,
+            reference_block=reference_block,
+            reviser_ref_block=reviser_ref_block,
+            references=references,
+            verifier_sys=verifier_sys,
+            ref_ids=ref_ids,
+            initial=initial,
+            fresh_target=fresh_target,
+            on_round=lambda state_dict: state.set_in_flight(
+                loop_id, state_dict
+            ),
+            on_proof=lambda lid, node: state.add_lemma(lid, node),
+            failed_attempts=state.failed_attempts,
+            failed_lock=state.failed_lock,
+            get_dag=load_dag,
+            toggle_hotkey=lambda: check_mode_toggle(verbose),
+            should_stop=lambda: not state.running(),
+        )
+        if result["stopped"]:
+            # A stop landed mid-round: the engine's last on_round already
+            # published the resumable position, and the buffer claim is
+            # kept — the lemma is still this loop's to finish.
+            break
+        # The lemma is settled one way or another: clear the resumable
+        # position (the engine's last on_round may still hold it), free the
+        # buffer slot it occupied, and record the failure where the planner
+        # and the other loops can see it.
+        state.set_in_flight(loop_id, None)
+        state.buffer.consume(result["lemma_id"])
+        if not result["proved"]:
+            if result["attempt_notes"]:
+                state.record_failure(result["lemma_id"], result["attempt_notes"])
+        # A proved lemma is already in the DAG (on_proof committed it, which
+        # bumped the version and marked the plan stale): the loop simply
+        # goes for its next lemma.
+        if not state.running():
+            break
+    # Every exit path (budget spent, human quit, a stop, the buffer waiting
+    # giving up) funnels here: announce this loop is out, and if it was the
+    # last, send the stop that frees the planner and generator — nothing
+    # more will ever be claimed or added, so there is no point left in
+    # their waiting.
+    if state.note_loop_exit():
+        state.request_stop()
+
+
+def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
+    """The parallel entry point: N proof loops around one shared DAG.
+
+    The loops share run_proof_loop() with the serial run; what is new here
+    is the shared state (ParallelState), the buffer that feeds the loops,
+    and the two threads that steer them — the planner, which re-plans
+    whenever the DAG changes, and the generator, which keeps the
+    possible-lemma list stocked. Loop 0 is the operator's while --mode
+    human. Returns the DAG, as run_loop does."""
+    global _PARALLEL
+
+    log(
+        f"\n🧵 Parallel mode: {parallel_loops} proof loop(s), one planner, "
+        f"one lemma generator, one DAG.",
+        verbose,
+    )
+
+    conjecture = load_file(CONJECTURE_FILE)
+    if not conjecture:
+        log(
+            f"{CONJECTURE_FILE} is empty — write your conjecture there "
+            f"first.",
+            verbose,
+        )
+        return load_dag()
+
+    planner_sys = load_file(PROMPT_PATHS["parallel_planner.md"])
+    generator_sys = load_file(PROMPT_PATHS["parallel_lemma_generator.md"])
+    prover_sys = load_file(PROMPT_PATHS["prover.md"])
+    # One prompt per verification step; VERIFIER_AGENTS names the three.
+    verifier_sys = {name: load_file(PROMPT_PATHS[name]) for name in VERIFIER_AGENTS}
+    reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
+    empty = [
+        name
+        for name, text in (
+            ("parallel_planner.md", planner_sys),
+            ("parallel_lemma_generator.md", generator_sys),
+            ("prover.md", prover_sys),
+            *verifier_sys.items(),
+            ("reviser.md", reviser_sys),
+        )
+        if not text
+    ]
+    if empty:
+        log(f"Missing or empty prompt files: {', '.join(empty)}. Aborting.", verbose)
+        return load_dag()
+
+    references, reference_block, planner_ref_block, reviser_ref_block = (
+        _build_reference_blocks(verbose)
+    )
+    # The planner and the generator steer by the short view (the same one
+    # the serial planner gets — empty at or above the limit, by the same
+    # rule); the prover in each loop gets the full collection through
+    # reference_block.
+    ref_block = planner_ref_block
+    ref_ids = {str(r["id"]) for r in references}
+    comments_block = _build_comments_block()
+
+    loop_ids = [f"loop-{i}" for i in range(parallel_loops)]
+    state = ParallelState(loop_ids, MAX_ITERATIONS)
+    cp = load_parallel_checkpoint(loop_ids, verbose)
+    if cp is not None and not os.path.exists(DAG_FILE):
+        # The serial run's rule, kept: deleting dag.json is how the operator
+        # resets a conjecture, and a checkpoint outliving its DAG would
+        # resurrect the old budget and in-flight lemma.
+        log("\u26a0\ufe0f  Checkpoint without a DAG file; discarding it.", verbose)
+        discard_checkpoint()
+        cp = None
+    if cp is not None:
+        state.apply_checkpoint(cp)
+        pending = sum(
+            1
+            for lid in loop_ids
+            if (cp["loops"].get(lid) or {}).get("in_flight") is not None
+        )
+        used = sum(
+            (cp["loops"].get(lid) or {}).get("iterations_used", 0)
+            for lid in loop_ids
+        )
+        log(
+            f"♻ Resumed the parallel checkpoint: {used} lemma(s) spent of "
+            f"{MAX_ITERATIONS} each, {pending} prover round(s) in flight.",
+            verbose,
+        )
+    state.write_checkpoint()
+    threads = [
+        threading.Thread(
+            target=_parallel_planner,
+            args=(state, verbose, planner_sys, conjecture,
+                  comments_block, ref_block),
+            name="parallel-planner",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_parallel_generator,
+            args=(state, verbose, generator_sys, conjecture, ref_block),
+            name="parallel-lemma-generator",
+            daemon=True,
+        ),
+    ]
+    for i, lid in enumerate(loop_ids):
+        threads.append(
+            threading.Thread(
+                target=_parallel_proof_loop,
+                args=(
+                    state,
+                    lid,
+                    i,
+                    verbose,
+                    conjecture,
+                    prover_sys,
+                    reviser_sys,
+                    reference_block,
+                    reviser_ref_block,
+                    references,
+                    verifier_sys,
+                    ref_ids,
+                ),
+                name=f"parallel-{lid}",
+                daemon=True,
+            )
+        )
+    _PARALLEL = state
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        _PARALLEL = None
+
+    if state.resolution is not None:
+        with DAG_LOCK:
+            dag = load_dag()
+            dag["conjecture"] = conjecture
+            dag["status"] = state.resolution
+            save_dag(dag)
+        discard_checkpoint()
+        log(
+            f"\n🎉 Conjecture has been {state.resolution} — the DAG "
+            f"records it and the checkpoint is cleared.",
+            verbose,
+        )
+        return dag
+    state.write_checkpoint()
+    buffer_snapshot = state.buffer.snapshot()
+    log(
+        f"\n⏹ Parallel run finished without settling the conjecture: "
+        f"the buffer still holds {len(buffer_snapshot)} candidate(s). "
+        f"The checkpoint keeps every loop's budget position and in-flight "
+        f"round: re-run the same command to continue, or --fresh to "
+        f"restart. The DAG is kept either way.",
         verbose,
     )
     return load_dag()
@@ -2653,6 +4010,20 @@ def main() -> None:
             "Ignore and delete any existing checkpoint, restarting the "
             "iteration budget from 1. The DAG itself is kept: delete "
             "dag.json for a genuinely clean run."
+        ),
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        nargs="?",
+        const=1,
+        default=None,
+        metavar="N",
+        help=(
+            "Run N proof loops in parallel, steered by one planner and one "
+            "lemma generator sharing one DAG. The human mode, when set, "
+            "takes the place of one of the loops (loop-0). "
+            "Bare --parallel is N=1."
         ),
     )
     parser.add_argument(
@@ -2754,7 +4125,10 @@ def main() -> None:
     signal.signal(signal.SIGINT, _on_sigint)
 
     try:
-        run_loop(verbose=args.verbose)
+        if args.parallel is not None:
+            run_parallel(max(1, args.parallel), verbose=args.verbose)
+        else:
+            run_loop(verbose=args.verbose)
     finally:
         HOTKEY.stop()
 

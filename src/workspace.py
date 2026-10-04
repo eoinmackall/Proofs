@@ -63,11 +63,24 @@ AGENTS_DIR = "agents"
 # that is meaningful. parsing.md is the standalone parser's (parsing.py's).
 # The three verifier_*.md files are the three atomic verification steps
 # (VERIFIER_AGENTS in main.py).
-PROMPT_FILES = (
-    "planner.md", "selector.md", "prover.md",
-    "verifier_1.md", "verifier_2.md", "verifier_3.md",
-    "reviser.md", "parsing.md",
-)
+#
+# Each entry maps the lookup name (what PROMPT_PATHS is keyed by, and what a
+# per-conjecture override file is called) to the path the project-wide default
+# lives at, relative to agents/. The parallel-mode agents keep their own
+# subdirectory on disk but stay flat in the map, so an override is always just
+# "drop a file next to conjecture.md" whatever the agent is.
+PROMPT_FILES: Dict[str, str] = {
+    "planner.md": "planner.md",
+    "selector.md": "selector.md",
+    "prover.md": "prover.md",
+    "verifier_1.md": "verifier_1.md",
+    "verifier_2.md": "verifier_2.md",
+    "verifier_3.md": "verifier_3.md",
+    "reviser.md": "reviser.md",
+    "parsing.md": "parsing.md",
+    "parallel_planner.md": "parallel/parallel_planner.md",
+    "parallel_lemma_generator.md": "parallel/parallel_lemma_generator.md",
+}
 
 
 class ConjectureNotFound(Exception):
@@ -134,13 +147,13 @@ def resolve(
 
     prompts: Dict[str, Path] = {}
     overridden: List[str] = []
-    for fname in PROMPT_FILES:
-        local = root / fname
+    for name, rel in PROMPT_FILES.items():
+        local = root / name
         if local.is_file():
-            prompts[fname] = local
-            overridden.append(fname)
+            prompts[name] = local
+            overridden.append(name)
         else:
-            prompts[fname] = project_root / AGENTS_DIR / fname
+            prompts[name] = project_root / AGENTS_DIR / rel
 
     return RunPaths(root=root, conjecture=conjecture, dag=dag,
                     references_dir=root / REFERENCES_DIRNAME,
