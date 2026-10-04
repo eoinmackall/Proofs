@@ -256,7 +256,8 @@ def run() -> None:
     ap.add_argument(
         "--host", default=None,
         help="OpenAI-compatible base URL: a local llama-server, or a hosted "
-             "API's base (e.g. https://api.openai.com/v1). Defaults to "
+             "API's base (e.g. https://api.openai.com, without the /v1 "
+             "suffix — it is added automatically). Defaults to "
              "$LLAMA_HOST or localhost:8081 (8080 is taken by open-webui).",
     )
     ap.add_argument(
@@ -289,16 +290,19 @@ def run() -> None:
     ap.add_argument(
         "--num-ctx", type=int, default=None,
         help=(
-            "Context window in tokens. Defaults to the server's own — "
-            "the -c llama-server was launched with, as probed. Lower it if "
-            "VRAM is tight."
+            "Context window in tokens. Defaults to the server's context — "
+            "the -c llama-server was launched with, as probed (lower it if "
+            "VRAM is tight) — or 65536 on a hosted --host API, where "
+            "nothing is probed. An explicit value replaces that default; "
+            "against a probed llama-server it is clamped to the ceiling."
         ),
     )
     args = ap.parse_args()
 
     # The same backend setup as main.main(): probe first, then resolve the
-    # context window — an explicit --num-ctx clamped to what the server
-    # allows, or the server's own context when it is not given.
+    # context window — an explicit --num-ctx wins, clamped only against a
+    # probed llama.cpp ceiling (a fact), or the server's own context when it
+    # is not given.
     main.BACKEND = llm_backend.make_backend(
         args.model, args.host, main.REQUEST_TIMEOUT, api_key=args.api_key,
         backend=args.backend
@@ -308,8 +312,10 @@ def run() -> None:
         ap.error(main.PROFILE.auth_error)
     if args.num_ctx is None:
         num_ctx = main.PROFILE.context_limit
-    else:
+    elif main.PROFILE.probed_llama_cpp:
         num_ctx = min(args.num_ctx, main.PROFILE.context_limit)
+    else:
+        num_ctx = args.num_ctx
     main.NUM_CTX = num_ctx
     main.REASONING_OPTIONS["num_ctx"] = num_ctx
     main.EXTRACT_OPTIONS["num_ctx"] = num_ctx
@@ -389,7 +395,15 @@ def run() -> None:
             )
             continue
         main.log(f"📖 Parsing {path.name} (~{est} tokens)…", args.verbose)
-        items = parse_file(system_prompt, text, path.name, args.verbose)
+        try:
+            items = parse_file(system_prompt, text, path.name, args.verbose)
+        except llm_backend.ContextLengthError as e:
+            # A file this long for the window is a mis-sized --num-ctx, not
+            # a bad file: say so once, with the server's own number, and
+            # stop. references.md keeps its previous contents — re-run
+            # with the corrected budget and everything re-parses.
+            main.log(main._context_length_message(e, main.NUM_CTX))
+            raise SystemExit(1)
         for item in items:
             statement = str(item.get("formal statement") or "").strip()
             key = _norm(statement)

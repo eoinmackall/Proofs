@@ -6,18 +6,13 @@ Exactly one candidate will be selected and sent to a prover. The other four will
 So each candidate must stand entirely on its own: never assume that a sibling candidate
 has been proved, and never make one candidate a step towards another.
 
-Each candidate carries an aim:
-- "proof": the lemma works toward proving the conjecture true.
-- "counterexample": the lemma works toward showing the conjecture false — a
-  statement whose proof would produce, or bring the search close to, a
-  concrete instance refuting the conjecture. Such a lemma must aim at
-  something specific (a candidate counterexample, a property that excludes
-  one, a bound no counterexample may satisfy), not at "finding a
-  counterexample" in general.
-
-You may mix the two aims across the five. A counterexample route is a
+You may mix the two routes across the five. A counterexample route is a
 legitimate route: if the conjecture looks false, the shortest way to settle
-it may be to build the refutation rather than the proof.
+it may be to build the refutation rather than the proof, so some of the
+five may work toward a concrete counterexample instead of a proof. Such a
+candidate must target something specific (a candidate counterexample, a
+property that excludes one, a bound no counterexample may satisfy), not
+"finding a counterexample" in general.
 
 If a "Known references" list is provided, it names theorem-level results the
 prover is allowed to cite by id without proving them. 
@@ -48,20 +43,21 @@ Rules:
 - Do not re-propose an already-proved lemma statement.
 - If a lemma has been rejected repeatedly, do not propose it unchanged:
   decompose it into smaller lemmas or take a different route.
-- One candidate may be the conjecture itself, stated in full, with aim
-  "proof" — but only once the lemmas it rests on are actually proved. The
-  step from those lemmas to the conjecture must be proved and verified like
-  any other; do not treat it as implicit.
+- One candidate may be the conjecture itself, stated in full — but only
+  once the lemmas it rests on are actually proved. The step from those
+  lemmas to the conjecture must be proved and verified like any other; do
+  not treat it as implicit.
 - Symmetrically, one candidate may be the full counterexample, stated in
-  full with aim "counterexample" — but only once the lemmas that build it
-  are actually proved, and it must name a concrete refuting instance, not
-  merely assert that one exists somewhere.
+  full — but only once the lemmas that build it are actually proved, and it
+  must name a concrete refuting instance, not merely assert that one exists
+  somewhere.
 - Set "is_conjecture_proved" to true ONLY if one of the proved lemmas states
   the full conjecture. When it is true, "candidate_lemmas" must be empty.
-- Set "is_conjecture_disproved" to true ONLY if one of the proved lemmas, with
-  aim "counterexample", states the full counterexample: a concrete refuting
-  instance of the conjecture, not merely the claim that one exists. When it
-  is true, "candidate_lemmas" must be empty.
+- Set "is_conjecture_disproved" to true ONLY if one of the proved lemmas
+  names a concrete instance and shows that it satisfies the conjecture's
+  hypotheses but not its conclusion — a concrete refuting instance, not
+  merely the claim that one exists. When it is true, "candidate_lemmas"
+  must be empty.
 
 Output strictly valid JSON in this exact structure, with no markdown fences and no extra text:
 {
@@ -71,28 +67,23 @@ Output strictly valid JSON in this exact structure, with no markdown fences and 
   "candidate_lemmas": [
     {
       "id": "lemma_1",
-      "statement": "Precise, self-contained statement of the candidate lemma",
-      "aim": "proof"
+      "statement": "Precise, self-contained statement of the candidate lemma"
     },
     {
       "id": "lemma_2",
-      "statement": "...",
-      "aim": "counterexample"
+      "statement": "..."
     },
     {
       "id": "lemma_3",
-      "statement": "...",
-      "aim": "proof"
+      "statement": "..."
     },
     {
       "id": "lemma_4",
-      "statement": "...",
-      "aim": "proof"
+      "statement": "..."
     },
     {
       "id": "lemma_5",
-      "statement": "...",
-      "aim": "proof"
+      "statement": "..."
     }
   ]
 }

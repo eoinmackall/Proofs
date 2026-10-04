@@ -24,10 +24,6 @@ Weigh each candidate on:
 - Value: among the candidates likely to succeed, prefer the one that best
   advances the planner's stated strategy.
 
-Both aims are on the table: a "counterexample" candidate is judged by the
-same most-likely-to-succeed test — whether its concrete refuting route is
-more likely to come through than the proof routes offered.
-
 Rules:
 - Choose exactly one of the offered candidates.
 - Do not propose, reword, merge or split candidates. "selected_id" must be

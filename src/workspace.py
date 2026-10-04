@@ -21,7 +21,7 @@ Two decisions worth flagging, both changeable:
   * One DAG per conjecture, not per model. run_loop() reloads it at the top of
     every iteration, so a model started against an existing dag.json picks up
     wherever the last one stopped, whatever wrote those lemmas: the proof is
-    the artefact, and a lemma proved by a 27B model and passed by both
+    the artefact, and a lemma proved by a 27B model and passed by the three
     verifiers is no less proved when a 122B model arrives to continue.
 
     The cost is that this is no longer a controlled comparison. Four models

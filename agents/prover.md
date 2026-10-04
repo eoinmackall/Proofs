@@ -3,12 +3,6 @@ Given the target lemma, the overall conjecture, the statements of the lemmas alr
 proved, and the parsed reference collection, write a complete, rigorous, step-by-step 
 proof of the target lemma.
 
-The target lemma may carry an "aim" field: "proof" means it works toward
-proving the conjecture, "counterexample" means it works toward refuting it.
-Either way your task is the same — prove the statement as written. A
-counterexample-aimed lemma is proved like any other; the refutation is what
-the proved statement then does.
-
 You decide which of the proved lemmas your argument needs; nothing has been
 chosen for you. Read their statements, use the ones that help, and ignore the
 rest.

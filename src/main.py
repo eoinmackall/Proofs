@@ -69,9 +69,11 @@ Proving is a loop, not a single pass
 A lemma enters the DAG only after all three verifier agents have accepted the
 same proof. Verification is three atomic steps rather than one: verifier_1,
 verifier_2 and verifier_3 are separate agents — separate prompt files and
-separate roles — each a single call, so each step can later grow its
-own focus (for now all three prompts are identical). Any single reject ends
-the counting and sends the proof to the reviser with the
+separate roles — each a single call, so each step can grow its own focus:
+the prompts are already specialized — verifier_1 checks logic and
+computations, verifier_2 specializes in logic (definitions, cited results,
+the conclusion), and verifier_3 in computations and completeness. Any single
+reject ends the counting and sends the proof to the reviser with the
 verifier's reasoning about the failure, along with the rejected proof itself
 (the last proof), the lemmas already proved, and the known references. The
 reviser decides where the fault lies: a fault in the
@@ -217,9 +219,11 @@ PLANNER_REFERENCE_LIMIT = 100
 # The verification steps: a proof enters the DAG only after every one of
 # these verifier agents has accepted it. Each is a separate agent — its own
 # prompt file and role, run as a single atomic check — rather than one
-# verifier run repeatedly, so each step can grow its own focus. For now all
-# three prompts are identical. One reject ends the counting and sends the
-# proof to the reviser.
+# verifier run repeatedly, so each step can grow its own focus, and the
+# prompts are already specialized: verifier_1 checks logic and computations,
+# verifier_2 specializes in logic (definitions, cited results, the
+# conclusion), and verifier_3 in computations and completeness. One reject
+# ends the counting and sends the proof to the reviser.
 VERIFIER_AGENTS = ("verifier_1.md", "verifier_2.md", "verifier_3.md")
 # How many prover rounds one iteration may spend on a lemma before giving it
 # up and re-planning.
@@ -236,9 +240,12 @@ HOTKEY: interaction.HotKey = interaction.NullHotKey()
 # Default context window. main() reassigns it after probing: with no
 # --num-ctx the server's own -c is used as-is (the KV cache is already
 # allocated at launch, so there is nothing to request); an explicit
-# --num-ctx always wins, clamped to the probed ceiling. This constant stands
-# in when the probe fails. 65536 matches the Qwen3.8-27B reference launch
-# line in llm_backend.py (-c 65536).
+# --num-ctx always wins — clamped only when the ceiling is a *probed*
+# llama-server -c (a fact), since on a non-llama.cpp endpoint the value on
+# record is a default, not a measurement, and clamping an explicit request
+# to a guess would defeat it. This constant stands in when the probe fails.
+# 65536 matches the Qwen3.8-27B reference launch line in llm_backend.py
+# (-c 65536).
 NUM_CTX = 65536
 # No static per-role generation budgets. reason() and extract() give every
 # call the full headroom — num_ctx minus the prompt, minus a safety margin —
@@ -368,12 +375,8 @@ _LEMMA_SCHEMA: Dict[str, Any] = {
     "properties": {
         "id": {"type": "string"},
         "statement": {"type": "string"},
-        # Which end of the question the lemma works toward. planner.md writes
-        # it and planner_candidates() defaults a missing one to "proof", so
-        # an old per-conjecture override that predates aims keeps working.
-        "aim": {"type": "string", "enum": ["proof", "counterexample"]},
     },
-    "required": ["id", "statement", "aim"],
+    "required": ["id", "statement"],
 }
 
 # minItems/maxItems are deliberately absent: llama.cpp's schema support does
@@ -527,6 +530,17 @@ _PARALLEL: "ParallelState" = None
 # each other's addition. Readers reload under it too (fresh per round), so
 # a loop never plans or proves against a stale DAG.
 DAG_LOCK = threading.Lock()
+# The checkpoint-file lock, held by ParallelState.write_checkpoint() across
+# the whole snapshot-then-replace. In parallel mode every loop's claim
+# (begin_lemma), round boundary (set_in_flight), DAG commit (add_lemma) and
+# reject note (record_failure) rewrites the checkpoint, as does the SIGINT
+# handler's snapshot, so the writers are serialised as a unit: the slots
+# and the reject list snapshotted are the ones that land in the file, and
+# an older snapshot that snapshots first but replaces last can never land
+# over a newer one. (The file stays whole even without the lock — the temp
+# file is per writer and the swap is os.replace — so the lock is about
+# which snapshot wins, not about readers seeing a half-write.)
+CHECKPOINT_LOCK = threading.Lock()
 
 
 def checkpoint_path_for(dag_path: str) -> str:
@@ -564,14 +578,7 @@ def save_checkpoint(
     }
     if in_flight is not None:
         data["in_flight"] = in_flight
-    tmp = CHECKPOINT_FILE + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-        os.replace(tmp, CHECKPOINT_FILE)
-    except OSError as e:
-        log(f"⚠️  Could not write checkpoint {CHECKPOINT_FILE}: {e}", verbose)
+    _atomic_write_checkpoint_file(data, verbose)
 
 
 def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
@@ -635,8 +642,6 @@ def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
         statement = str(target.get("statement") or "").strip() if isinstance(target, dict) else ""
         if lemma_id and statement and isinstance(attempt, int) and 1 <= attempt <= MAX_PROOF_ATTEMPTS:
             clean_target: Dict[str, Any] = {"id": lemma_id, "statement": statement}
-            if isinstance(target.get("aim"), str) and target["aim"].strip():
-                clean_target["aim"] = target["aim"]
             in_flight = {
                 "lemma_id": lemma_id,
                 "target": clean_target,
@@ -682,8 +687,6 @@ def _validate_in_flight(raw: Any) -> Optional[Dict[str, Any]]:
     ):
         return None
     clean_target: Dict[str, Any] = {"id": lemma_id, "statement": statement}
-    if isinstance(target.get("aim"), str) and target["aim"].strip():
-        clean_target["aim"] = target["aim"]
     return {
         "lemma_id": lemma_id,
         "target": clean_target,
@@ -755,10 +758,20 @@ def load_parallel_checkpoint(
 def _atomic_write_checkpoint_file(data: Dict[str, Any], verbose: bool) -> None:
     """The shared atomic write: temp file beside the checkpoint, then
     os.replace over it. Readers see either the whole old file or the whole
-    new one, never a half-written mix."""
+    new one, never a half-written mix.
+
+    The temp file is named per writer (pid + thread id), not shared: two
+    writers opening one .tmp truncate each other's in-progress dump, and
+    the first replace to land would promote the intermixed bytes to the
+    checkpoint file itself — while the other's replace then raises on the
+    already-renamed name and is swallowed as a lost update. With a private
+    tmp, os.replace alone keeps the file whole for readers even when two
+    processes write the same checkpoint; CHECKPOINT_LOCK, held by the
+    callers that snapshot shared state, is what stops an older snapshot
+    from landing over a newer one."""
     if not CHECKPOINT_FILE:
         return
-    tmp = CHECKPOINT_FILE + ".tmp"
+    tmp = f"{CHECKPOINT_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -766,6 +779,10 @@ def _atomic_write_checkpoint_file(data: Dict[str, Any], verbose: bool) -> None:
         os.replace(tmp, CHECKPOINT_FILE)
     except OSError as e:
         log(f"⚠️  Could not write checkpoint {CHECKPOINT_FILE}: {e}", verbose)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def discard_checkpoint() -> None:
@@ -829,6 +846,62 @@ def _on_sigint(signum, frame) -> None:
     else:
         print("   (no checkpoint state yet — nothing written)", file=sys.stderr)
     sys.exit(130)
+
+
+# ----------------------------------------------------------------------------
+# Server context 400s: a mis-sized window, not a transport hiccup
+# ----------------------------------------------------------------------------
+_CONTEXT_FAILURE_SEEN = False
+
+
+def _context_length_message(
+    e: "llm_backend.ContextLengthError", budget: int
+) -> str:
+    """What to tell the operator when the server 400s a call as too long.
+
+    The limit in it is the server's own number, read from the body of its
+    400 — a measurement, not this run's budget; the budget is what the run
+    asked for. Naming both, and only the flag that fixes it, keeps the
+    failure from looking like a model or a network problem."""
+    if e.prompt_tokens is not None and e.prompt_tokens >= e.server_limit:
+        return (
+            f"\n⛔ The server rejected a call as too long: the prompt alone "
+            f"({e.prompt_tokens} tokens) already exceeds its context window "
+            f"({e.server_limit} tokens), and this run budgets {budget}. No "
+            f"--num-ctx value fixes a prompt that no longer fits — the DAG "
+            f"has grown past the model's window. Re-run against a server "
+            f"launched with a larger --max-model-len, or start a fresh DAG "
+            f"for this conjecture."
+        )
+    return (
+        f"\n⛔ The server rejected a call as too long: its context window is "
+        f"{e.server_limit} tokens (the server's own number, from its 400), "
+        f"but this run budgets {budget}, so every call whose prompt plus "
+        f"generation budget outruns the window is rejected outright — a "
+        f"rejection the compaction rescue never sees, because it only "
+        f"triggers on a truncated reply. Re-run with --num-ctx "
+        f"{e.server_limit}, matched to the server's --max-model-len."
+    )
+
+
+def _fail_context_length(e: "llm_backend.ContextLengthError",
+                         stop: Any = None) -> None:
+    """Run-level handling of a server context 400: one loud message per
+    run, then the stop the caller names (parallel mode stops the shared
+    state; serial mode exits from main instead). The checkpoint is
+    untouched — it holds the last safe boundary, which is exactly where a
+    re-run with a corrected --num-ctx should resume from. Logged
+    unconditionally: a fatal the operator must see is not verbose noise."""
+    global _CONTEXT_FAILURE_SEEN
+    if not _CONTEXT_FAILURE_SEEN:
+        _CONTEXT_FAILURE_SEEN = True
+        log(_context_length_message(e, NUM_CTX))
+        log(
+            "The checkpoint is safe; re-running resumes from the last "
+            "safe boundary.",
+        )
+    if stop is not None:
+        stop()
 
 
 # ----------------------------------------------------------------------------
@@ -1696,14 +1769,8 @@ def planner_candidates(planner_res: Dict[str, Any]) -> List[Dict[str, Any]]:
         seen.add(lemma_id)
         # Any dependencies field is dropped rather than honoured: a planner
         # that volunteers one (an old per-conjecture override, or a model
-        # embellishing the schema) must not get to pre-empt the prover. A
-        # missing or unrecognised aim defaults to "proof" for the same
-        # reason: the safe reading of a candidate that predates aims is the
-        # ordinary one.
-        aim = str(item.get("aim") or "").strip().lower()
-        if aim not in ("proof", "counterexample"):
-            aim = "proof"
-        out.append({"id": lemma_id, "statement": statement, "aim": aim})
+        # embellishing the schema) must not get to pre-empt the prover.
+        out.append({"id": lemma_id, "statement": statement})
         if len(out) >= PLANNER_CANDIDATES:
             break
     return out
@@ -1940,22 +2007,14 @@ def run_proof_loop(
     if resuming:
         lemma_id = in_flight["lemma_id"]
         target: Dict[str, Any] = in_flight["target"]
-        aim = str(target.get("aim") or "proof").strip().lower()
-        if aim not in ("proof", "counterexample"):
-            aim = "proof"
     else:
         lemma_id = fresh_target["id"]
         # The target is the statement only: the candidate's other fields
         # (priority, notes) steer the loops, not the prover.
-        aim = str(fresh_target.get("aim") or "proof").strip().lower()
-        if aim not in ("proof", "counterexample"):
-            aim = "proof"
         target: Dict[str, Any] = {
             "id": lemma_id,
             "statement": fresh_target["statement"],
         }
-        if aim != "proof":
-            target["aim"] = aim
     # The prover sees only the most recent failure: feedback is rebuilt
     # after each rejected round, so a retry reads the last verdict and
     # diagnosis, not the history of every earlier attempt. That history
@@ -2109,8 +2168,6 @@ def run_proof_loop(
                 )
                 lemma_id = new_id
                 target = {"id": lemma_id, "statement": new_stmt}
-                if aim != "proof":
-                    target["aim"] = aim
                 attempt_notes = [
                     f"Overflowed from {old_id}: the prover ran out of the "
                     f"context window; the reviser is trying the smaller "
@@ -2137,8 +2194,6 @@ def run_proof_loop(
                 # with this round's feedback, the way a rejected-proof
                 # revision does.
                 target = {"id": lemma_id, "statement": new_stmt}
-                if aim != "proof":
-                    target["aim"] = aim
                 last_proof = ""
                 overflow_feedback.append(
                     f"Revised statement proposed: {new_stmt}"
@@ -2366,8 +2421,6 @@ def run_proof_loop(
                 )
             lemma_id = new_id
             target = {"id": lemma_id, "statement": new_stmt}
-            if aim != "proof":
-                target["aim"] = aim
             attempt_notes = [
                 f"Decomposed from {old_id} by the reviser (the original "
                 f"target was judged too hard to prove as stated)."
@@ -2386,8 +2439,6 @@ def run_proof_loop(
 
         if action == "revise_statement" and new_stmt and new_stmt != target["statement"]:
             target = {"id": lemma_id, "statement": new_stmt}
-            if aim != "proof":
-                target["aim"] = aim
             last_proof = ""
             log(
                 f"↻ Reviser revised the lemma; the prover starts again "
@@ -2703,8 +2754,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 planner_res = extract(
                     "Extract the plan. Copy every candidate lemma the text proposes "
                     "into candidate_lemmas, preserving the order it presents them "
-                    "in and each candidate's aim ('proof' or 'counterexample'); "
-                    "where the text gives no aim, use 'proof'. "
+                    "in. "
                     "is_conjecture_proved must be true only if the text "
                     "explicitly concludes the conjecture is fully proved; "
                     "is_conjecture_disproved must be true only if the text "
@@ -2833,17 +2883,11 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         if resuming:
             lemma_id = in_flight["lemma_id"]
             lemma_stmt = in_flight["target"]["statement"]
-            aim = str(in_flight["target"].get("aim") or "proof").strip().lower()
-            if aim not in ("proof", "counterexample"):
-                aim = "proof"
-            log(f"📌 Next Lemma [{lemma_id}] (aim: {aim}): {lemma_stmt}", verbose)
+            log(f"📌 Next Lemma [{lemma_id}]: {lemma_stmt}", verbose)
         else:
             lemma_id = next_lemma["id"]
             lemma_stmt = next_lemma["statement"]
-            aim = str(next_lemma.get("aim") or "proof").strip().lower()
-            if aim not in ("proof", "counterexample"):
-                aim = "proof"
-            log(f"📌 Next Lemma [{lemma_id}] (aim: {aim}): {lemma_stmt}", verbose)
+            log(f"📌 Next Lemma [{lemma_id}]: {lemma_stmt}", verbose)
 
         # ---------------- Steps 2-5: the proof loop ----------------
         # prover -> verifiers -> reviser, repeated within the iteration. The
@@ -3084,10 +3128,12 @@ class ParallelState:
       state_lock    the per-loop slots, the plan, the DAG version
       failed_lock   the shared reject list
       DAG_LOCK      the DAG file itself (module global)
-    The checkpoint is a whole-file rewrite — the loop slots snapshotted
-    under state_lock, the reject list under failed_lock, then one atomic
-    replace — so the file is always a consistent state even though many
-    threads poke at it.
+      CHECKPOINT_LOCK  the checkpoint's snapshot-then-replace (module global)
+    The checkpoint is a whole-file rewrite taken under CHECKPOINT_LOCK —
+    the loop slots under state_lock, the reject list under failed_lock,
+    then one atomic replace over a per-writer temp file — so the file is
+    always a consistent, current state even though many threads poke at
+    it.
     """
 
     def __init__(self, loop_ids: List[str], max_iterations: int) -> None:
@@ -3298,37 +3344,37 @@ class ParallelState:
             }
 
     def write_checkpoint(self) -> None:
-        with self.state_lock:
-            loops = {
-                lid: {
-                    "in_flight": slot["in_flight"],
-                    "iterations_used": slot["iterations_used"],
+        # CHECKPOINT_LOCK spans the snapshot and the replace: with the two
+        # separated, a writer that snapshots first could replace last and
+        # land an older state over a newer one's.
+        with CHECKPOINT_LOCK:
+            with self.state_lock:
+                loops = {
+                    lid: {
+                        "in_flight": slot["in_flight"],
+                        "iterations_used": slot["iterations_used"],
+                    }
+                    for lid, slot in self.loops.items()
                 }
-                for lid, slot in self.loops.items()
-            }
-        failed = self.failed_snapshot()
-        _atomic_write_checkpoint_file(
-            {"version": 2, "loops": loops, "failed_attempts": failed},
-            verbose=False,
-        )
+            failed = self.failed_snapshot()
+            _atomic_write_checkpoint_file(
+                {"version": 2, "loops": loops, "failed_attempts": failed},
+                verbose=False,
+            )
 
 
 def _clean_candidate(raw: Any) -> Optional[Dict[str, Any]]:
     """A generated or written lemma entry, validated the way the planner's
-    candidates are: an id, a non-empty statement, an aim the prover knows.
-    Anything else is dropped, not repaired — the prompt tells the generator
-    the shape, and a dropped entry costs one generator round, not a proof."""
+    candidates are: an id and a non-empty statement. Anything else is
+    dropped, not repaired — the prompt tells the generator the shape, and a
+    dropped entry costs one generator round, not a proof."""
     if not isinstance(raw, dict):
         return None
     lemma_id = str(raw.get("id") or "").strip()
     statement = str(raw.get("statement") or "").strip()
     if not lemma_id or not statement:
         return None
-    cand: Dict[str, Any] = {"id": lemma_id, "statement": statement}
-    aim = str(raw.get("aim") or "proof").strip().lower()
-    if aim == "counterexample":
-        cand["aim"] = aim
-    return cand
+    return {"id": lemma_id, "statement": statement}
 
 
 def _parallel_planner(
@@ -3473,8 +3519,8 @@ def _parallel_generator(
         if batch is None and text:
             batch = extract(
                 "Extract the candidate lemmas: an object with a "
-                "candidate_lemmas list; each lemma has id, statement and "
-                "aim.",
+                "candidate_lemmas list; each lemma has an id and a "
+                "statement.",
                 text,
                 PARALLEL_LEMMA_GENERATOR_SCHEMA,
                 "parallel_lemma_generator",
@@ -3861,17 +3907,42 @@ def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
             verbose,
         )
     state.write_checkpoint()
+    # A server context 400 (a mis-sized --num-ctx) would otherwise kill
+    # one thread with a traceback while its siblings keep 400-storming;
+    # these wrappers turn it into the one loud message plus a stop of the
+    # shared state, so the run ends cleanly with its checkpoint intact.
+    def _planner_thread() -> None:
+        try:
+            _parallel_planner(state, verbose, planner_sys, conjecture,
+                              comments_block, ref_block)
+        except llm_backend.ContextLengthError as e:
+            _fail_context_length(e, stop=state.request_stop)
+
+    def _generator_thread() -> None:
+        try:
+            _parallel_generator(state, verbose, generator_sys, conjecture,
+                                ref_block)
+        except llm_backend.ContextLengthError as e:
+            _fail_context_length(e, stop=state.request_stop)
+
+    def _proof_thread(i: int, lid: str) -> None:
+        try:
+            _parallel_proof_loop(
+                state, lid, i, verbose, conjecture, prover_sys, reviser_sys,
+                reference_block, reviser_ref_block, references, verifier_sys,
+                ref_ids,
+            )
+        except llm_backend.ContextLengthError as e:
+            _fail_context_length(e, stop=state.request_stop)
+
     threads = [
         threading.Thread(
-            target=_parallel_planner,
-            args=(state, verbose, planner_sys, conjecture,
-                  comments_block, ref_block),
+            target=_planner_thread,
             name="parallel-planner",
             daemon=True,
         ),
         threading.Thread(
-            target=_parallel_generator,
-            args=(state, verbose, generator_sys, conjecture, ref_block),
+            target=_generator_thread,
             name="parallel-lemma-generator",
             daemon=True,
         ),
@@ -3879,21 +3950,8 @@ def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
     for i, lid in enumerate(loop_ids):
         threads.append(
             threading.Thread(
-                target=_parallel_proof_loop,
-                args=(
-                    state,
-                    lid,
-                    i,
-                    verbose,
-                    conjecture,
-                    prover_sys,
-                    reviser_sys,
-                    reference_block,
-                    reviser_ref_block,
-                    references,
-                    verifier_sys,
-                    ref_ids,
-                ),
+                target=_proof_thread,
+                args=(i, lid),
                 name=f"parallel-{lid}",
                 daemon=True,
             )
@@ -3956,7 +4014,8 @@ def main() -> None:
     parser.add_argument(
         "--host", default=None,
         help="OpenAI-compatible base URL: a local llama-server, or a hosted "
-             "API's base (e.g. https://api.openai.com/v1). Defaults to "
+             "API's base (e.g. https://api.openai.com, without the /v1 "
+             "suffix — it is added automatically). Defaults to "
              "$LLAMA_HOST or localhost:8081 (8080 is taken by open-webui).",
     )
     parser.add_argument(
@@ -4029,9 +4088,11 @@ def main() -> None:
     parser.add_argument(
         "--num-ctx", type=int, default=None,
         help=(
-            "Context window in tokens. Defaults to the server's own — "
-            "the -c llama-server was launched with, as probed. Lower it if "
-            "VRAM is tight."
+            "Context window in tokens. Defaults to the server's context — "
+            "the -c llama-server was launched with, as probed (lower it if "
+            "VRAM is tight) — or 65536 on a hosted --host API, where "
+            "nothing is probed. An explicit value replaces that default; "
+            "against a probed llama-server it is clamped to the ceiling."
         ),
     )
     parser.add_argument(
@@ -4065,13 +4126,17 @@ def main() -> None:
     if PROFILE.auth_error:
         parser.error(PROFILE.auth_error)
 
-    # Resolve the context window: an explicit --num-ctx wins (clamped to the
-    # probed ceiling); with no argument, take the server's own context — see
-    # the NUM_CTX comment.
+    # Resolve the context window: an explicit --num-ctx wins. It is clamped
+    # only against a *probed* ceiling — the -c a real llama-server reports,
+    # which is a fact (the KV cache is fixed at launch). On a non-llama.cpp
+    # endpoint the recorded ceiling is a default, not a measurement, so the
+    # explicit value replaces it; see the NUM_CTX comment.
     if args.num_ctx is None:
         NUM_CTX = PROFILE.context_limit
-    else:
+    elif PROFILE.probed_llama_cpp:
         NUM_CTX = min(args.num_ctx, PROFILE.context_limit)
+    else:
+        NUM_CTX = args.num_ctx
     REASONING_OPTIONS["num_ctx"] = NUM_CTX
     EXTRACT_OPTIONS["num_ctx"] = NUM_CTX
     # The banner warns when an *explicit* --num-ctx is clamped; in the auto
@@ -4129,6 +4194,9 @@ def main() -> None:
             run_parallel(max(1, args.parallel), verbose=args.verbose)
         else:
             run_loop(verbose=args.verbose)
+    except llm_backend.ContextLengthError as e:
+        _fail_context_length(e)
+        sys.exit(1)
     finally:
         HOTKEY.stop()
 

@@ -33,9 +33,9 @@ first one whose condition is met.
    is false or badly posed: a counterexample, a contradiction with a known
    reference, or an identified error in its quantifiers or hypotheses.
    Correct the statement so that the evidence no longer applies, changing
-   no more than the evidence requires. The lemma keeps its id and its aim
-   (a step toward proving the conjecture, or a step toward a
-   counterexample to it).
+   no more than the evidence requires. The lemma keeps its id and its role
+   in the overall strategy (a step toward proving the conjecture, or a step
+   toward a counterexample to it).
 
 3. "new_lemma": choose this in every other case.
 

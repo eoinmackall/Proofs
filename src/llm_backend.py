@@ -45,8 +45,9 @@ Usage from main.py:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -101,6 +102,50 @@ class Profile:
 # card and defaults: profile.sampling above stays empty by default, and the
 # per-call options in main.py layer on top of it. num_predict is the same idea
 # — a per-call budget in main.py, sized by the workload, not a model property.
+
+
+# ---------------------------------------------------------------------------
+# Errors the server's own 400s make
+# ---------------------------------------------------------------------------
+
+class ContextLengthError(RuntimeError):
+    """The server rejected a call: the prompt plus the requested generation
+    outruns its context window.
+
+    server_limit is the server's own number, parsed from the body of its
+    400 (OpenAI- and vLLM-style); prompt_tokens is the prompt size the
+    server reported, when it gave one. This is a configuration fact, not a
+    transport hiccup: within a run the prompt only grows, so a call of this
+    shape cannot succeed on retry. It is deliberately not a
+    requests.RequestException, so the "transport error" retry loops in
+    main.reason / main.extract do not swallow it and burn three attempts
+    on a 400 that is guaranteed to repeat."""
+
+    def __init__(self, server_limit: int,
+                 prompt_tokens: Optional[int] = None) -> None:
+        self.server_limit = server_limit
+        self.prompt_tokens = prompt_tokens
+        super().__init__(
+            f"server rejected the call: its context window is "
+            f"{server_limit} tokens"
+            + (f" but the prompt alone is {prompt_tokens} tokens"
+               if prompt_tokens is not None else "")
+        )
+
+
+# OpenAI- and vLLM-style context-length 400. The body names the server's
+# real window; a client that budgets above it gets this instead of a
+# truncated reply, and the only fix is to budget to the server.
+def _context_limit_from_error(text: str) -> Tuple[Optional[int], Optional[int]]:
+    """(server_limit, prompt_tokens) out of a 400 body; (None, None) when
+    the body is not a context-length error."""
+    m = re.search(
+        r"maximum context length is (\d+) tokens?", text, re.IGNORECASE)
+    if m is None:
+        return None, None
+    p = re.search(
+        r"your prompt contains (\d+) input tokens", text, re.IGNORECASE)
+    return int(m.group(1)), (int(p.group(1)) if p is not None else None)
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +366,10 @@ class OpenAICompatibleBackend:
 
         r = requests.post(f"{self.host}/v1/chat/completions", json=payload,
                           timeout=self.timeout, headers=self._headers)
+        if r.status_code >= 400:
+            limit, prompt_tokens = _context_limit_from_error(r.text)
+            if limit is not None:
+                raise ContextLengthError(limit, prompt_tokens)
         r.raise_for_status()
         body = r.json()
         # Fold this call's real usage into the running chars/token estimate:
@@ -332,7 +381,15 @@ class OpenAICompatibleBackend:
         msg = choice.get("message") or {}
         return Reply(
             content=msg.get("content") or "",
-            thinking=msg.get("reasoning_content") or "",
+            # Which key holds the trace depends on the server: vLLM used
+            # `reasoning_content` up through v0.15, renamed it to `reasoning`
+            # in v0.16 and dropped the old key from responses, so read both.
+            # In the overlap window (v0.11.1+) the two carry the same value.
+            # Either way the field is only populated when the server runs
+            # with --reasoning-parser (e.g. `qwen3`); without one the model's
+            # think tags stay inline in content and _split_inline_thinking
+            # (main.py) splits them out.
+            thinking=msg.get("reasoning_content") or msg.get("reasoning") or "",
             truncated=choice.get("finish_reason") == "length",
             usage=body.get("usage") or {},
         )
@@ -341,7 +398,8 @@ class OpenAICompatibleBackend:
 # 8080 is llama-server's own default, but it is also open-webui's, and on this
 # machine open-webui has it. Launch llama-server with --port 8081 to match.
 # For a hosted API, pass its base URL as --host (e.g.
-# https://api.openai.com/v1) — it does not use this default at all.
+# https://api.openai.com, without the /v1 suffix) — it does not use this
+# default at all.
 # The probe makes a wrong guess loud rather than silent: open-webui has no
 # /props route, so it 404s and you get default_generation_settings=None
 # instead of a confusing half-working session against the wrong service.
@@ -430,17 +488,27 @@ def describe(prof: Profile, requested_ctx: int) -> str:
             "top_k/min_p are dropped)."
         )
     if requested_ctx > prof.context_limit:
-        if prof.is_llama_cpp:
+        if prof.probed_llama_cpp:
             lines.append(
-                f"  ⚠️  --num-ctx {requested_ctx} exceeds the server's {prof.context_limit}. "
-                f"llama-server fixes this at launch: restart it with "
-                f"-c {requested_ctx}. Clamping to {prof.context_limit} for now."
+                f"  ⚠️  --num-ctx {requested_ctx} exceeds the server's "
+                f"{prof.context_limit}. llama-server fixes this at launch: "
+                f"restart it with -c {requested_ctx}. Clamping to "
+                f"{prof.context_limit} for now."
             )
         else:
+            # A default, not a measurement — and main() lets an explicit
+            # --num-ctx replace it there instead of clamping to a guess. If
+            # the provider's real window is smaller than the budget, the
+            # first call that outruns it is 400'd and chat() turns that
+            # into a loud stop naming the server's own number
+            # (ContextLengthError).
             lines.append(
-                f"  ⚠️  --num-ctx {requested_ctx} exceeds the {prof.context_limit} "
-                f"on record (a default for non-llama.cpp endpoints). "
-                f"Clamping; pass a larger --num-ctx if the model allows it."
+                f"  ℹ️  --num-ctx {requested_ctx} replaces the "
+                f"{prof.context_limit} default on record (this endpoint "
+                f"reports no context limit). If the provider's real window "
+                f"is smaller, the first call that outruns it is 400'd and "
+                f"the run stops with the server's own number and the "
+                f"--num-ctx to re-run with."
             )
     if not prof.probe_ok and not prof.key_verified:
         lines.append(

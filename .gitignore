@@ -2,6 +2,9 @@ __pycache__/
 conjectures/algebra_example/references/*
 .comments
 *.checkpoint.json
+# Per-writer temp files a crashed checkpoint write can leave behind
+# (named <checkpoint>.<pid>.<thread>.tmp).
+*.checkpoint.json.*.tmp
 # Never commit API keys (README "Backend": --api-key / $LLM_API_KEY).
 .env
 .env.*

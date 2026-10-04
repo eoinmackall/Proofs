@@ -39,9 +39,10 @@ from where it was when you last spoke.
 
 Set "is_conjecture_proved" to true ONLY if one of the proved lemmas states
 the full conjecture. Set "is_conjecture_disproved" to true ONLY if one of the
-proved lemmas, with aim "counterexample", states the full counterexample: a
-concrete refuting instance of the conjecture, not merely the claim that one
-exists. When either is true, the plan and priorities may be empty.
+proved lemmas names a concrete instance and shows that it satisfies the
+conjecture's hypotheses but not its conclusion — a concrete refuting
+instance, not merely the claim that one exists. When either is true, the
+plan and priorities may be empty.
 
 Output strictly valid JSON in this exact structure, with no markdown fences
 and no extra text:

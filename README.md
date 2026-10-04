@@ -17,9 +17,9 @@ Each iteration:
 
 1. **Planner** (`planner.md`) reads the conjecture, the lemmas proved so far,
    and any previously rejected attempts, and proposes
-   `PLANNER_CANDIDATES` (5) candidate lemmas, best-first. Each candidate
-   carries an *aim* — `proof` (work toward the conjecture being true) or
-   `counterexample` (work toward refuting it).
+   `PLANNER_CANDIDATES` (5) candidate lemmas, best-first, working either
+   toward a proof of the conjecture or — where it looks false — toward a
+   concrete counterexample to it.
 2. **Selection** picks exactly one candidate:
    - `--mode auto`: `screen_candidates()` filters out candidates whose ids are
      already in the DAG, and when more than one survives, the **selector**
@@ -37,7 +37,10 @@ Each iteration:
 4. **Verifiers** (`verifier_1.md`, `verifier_2.md`, `verifier_3.md`) check it
    adversarially — logic *and* arithmetic. Verification is three atomic
    steps, one per agent; a lemma enters the DAG only after all three have
-   accepted it. (The three files are currently identical.)
+   accepted it. The three prompts are specialized: `verifier_1.md` checks
+   logic and computations, `verifier_2.md` specializes in logic (definitions,
+   cited results, the conclusion), and `verifier_3.md` in computations and
+   completeness.
 5. **Reviser** (`reviser.md`) handles a reject, judging the lemma's
    difficulty from the rejected proof itself (the *last proof*), which it
    sees alongside the lemmas already proved and the known references. It
@@ -90,6 +93,21 @@ lemma's id and the prover re-runs on it. Only when there is nothing left
 to build on, or the reviser has neither a usable smaller lemma nor a usable
 revision, does the lemma fall back to the planner's decomposition escape
 hatches.
+
+All of that assumes the server *answers* the call and merely cuts it off.
+When the window the run budgets (`NUM_CTX`) is larger than the window the
+server actually has — a `--host` API, where nothing is probed, or a
+`--num-ctx` above the server's own limit — the server does not truncate:
+OpenAI- and vLLM-style servers answer a call whose prompt plus requested
+generation outruns their window with a 400 that names the real ceiling
+("maximum context length is X tokens"). `chat()` reads that ceiling out of
+the 400 and raises `ContextLengthError` rather than a transport error, so
+no retry loop burns its attempts on a 400 that is guaranteed to repeat, and
+the run stops with the fix spelled out: `--num-ctx X`, matched to the
+server's `--max-model-len` — or, when the prompt alone already exceeds the
+window, the fact that no `--num-ctx` fixes that and the DAG has grown past
+the model. The checkpoint is untouched, so the corrected re-run resumes
+from the last safe boundary.
 
 ### Backend
 
@@ -146,7 +164,7 @@ python src/main.py --conjecture algebra_example --parallel 3 --mode human
 
 # or against a hosted API instead of a local llama-server
 LLM_API_KEY=sk-... python src/main.py --conjecture algebra_example \
-    --host https://api.openai.com/v1 --model gpt-4o
+    --host https://api.openai.com --model gpt-4o
 
 # once, before proving: parse the conjecture's reference collection
 python src/parsing.py --conjecture algebra_example
@@ -162,7 +180,7 @@ python src/parsing.py --conjecture algebra_example
 | --- | --- | --- |
 | `--conjecture NAME` | `algebra_example` | A directory under `conjectures/` holding a `conjecture.md`. |
 | `--model NAME` | `qwen3.8-27b` | Model name: the `--alias` llama-server was launched with, or a provider's model id (e.g. `gpt-4o`). |
-| `--host URL` | `http://localhost:8081` | OpenAI-compatible base URL — a local llama-server, or a hosted API's base (e.g. `https://api.openai.com/v1`). `$LLAMA_HOST` overrides the default; 8080 is taken by open-webui. |
+| `--host URL` | `http://localhost:8081` | OpenAI-compatible base URL — a local llama-server, or a hosted API's base (e.g. `https://api.openai.com`, without the `/v1` suffix — it is added automatically). `$LLAMA_HOST` overrides the default; 8080 is taken by open-webui. |
 | `--api-key KEY` | `$LLM_API_KEY` | Sent as `Authorization: Bearer <key>`. Needed for a hosted API; leave unset for a plain local llama-server. |
 | `--backend {auto,llamacpp,openai}` | `auto` | Which dialect of the OpenAI-compatible endpoint to speak: the full llama.cpp option set (with thinking suppressed for schema calls), or the standard OpenAI set. `auto` takes the probe's answer; the other two force it, for when the probe can't see the real server. |
 | `--dag PATH` | `conjectures/<name>/dag.json` | Use a separate DAG file (e.g. to isolate a model's run). |
@@ -170,7 +188,7 @@ python src/parsing.py --conjecture algebra_example
 | `--max-proof-attempts N` | 3 | Prover rounds per lemma before it is given up. |
 | `--fresh` | off | Ignore and delete the checkpoint (`<dag>.checkpoint.json`), restarting the iteration budget from 1. The DAG is kept. |
 | `--parallel [N]` | off | Run N proof loops in parallel around one shared DAG, steered by one planner and one lemma generator. Bare `--parallel` is N=1. `--mode human`, when set, takes the place of one of the loops (loop-0). See [Parallel mode](#parallel-mode). |
-| `--num-ctx N` | the server's own (probed) | Context window in tokens. Defaults to the server's context — the `-c` llama-server was launched with, as probed. Lower it if VRAM is tight. |
+| `--num-ctx N` | the server's own (probed) | Context window in tokens. On a local llama-server: defaults to the `-c` it was launched with, as probed — lower it if VRAM is tight — and an explicit value is clamped to that ceiling. On a hosted `--host` API nothing is probed, so the default is 65536 and an explicit value replaces it. Budgeting above the server's own window is caught at once from the server's 400, which names its real limit and the `--num-ctx` to re-run with. |
 | `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
 | `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
 | `--verbose / --no-verbose` | on | Console logging. |
