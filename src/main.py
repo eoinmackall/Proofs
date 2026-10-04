@@ -2146,11 +2146,15 @@ def run_proof_loop(
             ]
             if diagnosis:
                 overflow_feedback.append(f"Reviser's diagnosis: {diagnosis}")
+            # The id test reads the DAG fresh: the round's snapshot is
+            # stale in a parallel run, and a decomposition onto an
+            # already-proved id would burn rounds that add_lemma's
+            # commit-time guard would drop anyway.
             if (
                 action == "new_lemma"
                 and new_id
                 and new_stmt
-                and new_id not in dag["lemmas"]
+                and new_id not in get_dag()["lemmas"]
             ):
                 # The reviser found a smaller lemma worth trying. Set the
                 # overflowing lemma aside (its history is recorded under its
@@ -2397,11 +2401,15 @@ def run_proof_loop(
         if diagnosis:
             feedback.append(f"Reviser's diagnosis: {diagnosis}")
 
+        # The id test reads the DAG fresh: the round's snapshot is stale
+        # in a parallel run, and a decomposition onto an already-proved id
+        # would burn rounds that add_lemma's commit-time guard would drop
+        # anyway.
         if (
             action == "new_lemma"
             and new_id
             and new_stmt
-            and new_id not in dag["lemmas"]
+            and new_id not in get_dag()["lemmas"]
         ):
             # Decomposition: the target is too hard to prove as stated.
             # Record the old lemma's history — and why it was set aside —
@@ -2982,8 +2990,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 # of the serial shortlist menu — and the hotkey toggles it between the menu
 # and automation exactly as in the serial run. Every write to the shared
 # state goes through ParallelState, and every write to the DAG goes through
-# the DAG lock with a fresh read, so a lemma can never be added twice and a
-# reader can never see a half-state.
+# add_lemma's id check under the DAG lock, so an already-proved lemma can
+# never be overwritten and a reader can never see a half-state.
 # ----------------------------------------------------------------------------
 
 _QUIT = object()  # sentinel: the human loop asked the run to stop
@@ -3294,16 +3302,27 @@ class ParallelState:
 
     # -- the DAG -------------------------------------------------------------
 
-    def add_lemma(self, lemma_id: str, node: Dict[str, Any]) -> None:
+    def add_lemma(self, lemma_id: str, node: Dict[str, Any]) -> bool:
         """Commit a lemma to the shared DAG — the atomic part of the
         design. Read the DAG fresh under the DAG lock, add the lemma,
         write it back whole; then bump the version the planner watches,
         clear the lemma's reject notes, mark the plan stale (the DAG
         changed, so the plan owes a re-read), and checkpoint. The version
         is visible only after the file is down, so a replan triggered by
-        it always sees the new lemma."""
+        it always sees the new lemma.
+
+        The id check and the write are one step under the same lock: a
+        lemma whose id is already in the DAG is never overwritten, because
+        two loops can land on one id — the reviser decomposes against the
+        DAG as it stood at the top of its own round, and the id it picks
+        can also sit in the buffer where a sibling is proving it. The
+        first proof stands, and the caller learns of the collision from
+        the False return. Returns True when the lemma was added, False
+        when the id was already taken."""
         with DAG_LOCK:
             dag = load_dag()
+            if lemma_id in dag["lemmas"]:
+                return False
             dag["lemmas"][lemma_id] = node
             save_dag(dag)
         with self.state_lock:
@@ -3312,6 +3331,7 @@ class ParallelState:
             self.failed_attempts.pop(lemma_id, None)
         self.mark_plan_stale()
         self.write_checkpoint()
+        return True
 
     def dag_version_snapshot(self) -> int:
         with self.state_lock:
@@ -3629,7 +3649,7 @@ def _parallel_human_step(
             return "auto", None
         if choice.action == "assert":
             asserted = choice.lemma or {}
-            state.add_lemma(
+            added = state.add_lemma(
                 asserted["id"],
                 {
                     "statement": asserted["statement"],
@@ -3639,11 +3659,20 @@ def _parallel_human_step(
                 },
             )
             state.buffer.consume(asserted["id"])
-            log(
-                f"🖊  Lemma {asserted['id']} accepted on your authority and "
-                f"added to the DAG unproved.",
-                verbose,
-            )
+            if added:
+                log(
+                    f"🖊  Lemma {asserted['id']} accepted on your authority "
+                    f"and added to the DAG unproved.",
+                    verbose,
+                )
+            else:
+                # A sibling loop committed this id while the menu was up:
+                # its entry stands, the assertion is dropped.
+                log(
+                    f"⚠️  Lemma {asserted['id']} entered the DAG in the "
+                    f"meantime; the existing entry stands.",
+                    verbose,
+                )
             continue
         # 'prove': a buffer lemma, claimed atomically, or a written one.
         lemma = choice.lemma or {}
@@ -3772,6 +3801,29 @@ def _parallel_proof_loop(
             # serial way: a run cancelled mid-lemma resumes it without
             # charging the budget again.
             state.begin_lemma(loop_id)
+        def on_proof(lid: str, node: Dict[str, Any]) -> None:
+            # add_lemma checks the id against the DAG as it stands at
+            # write time, not as it stood at the top of this loop's round,
+            # so a sibling that committed the same id in the meantime
+            # keeps its proof and this one is dropped rather than stacked
+            # on top of it. The collision goes on the shared reject list,
+            # under the id it happened under, where the planner and the
+            # other loops can see it.
+            if state.add_lemma(lid, node):
+                return
+            log(
+                f"⚠️  {loop_id}: lemma {lid} was already in the DAG when "
+                f"this proof was committed (two routes proved the same "
+                f"id); the first proof stands, this one is dropped.",
+                verbose,
+            )
+            with state.failed_lock:
+                state.failed_attempts.setdefault(lid, []).append(
+                    "Id collision: a second proof of this id was dropped "
+                    "at commit time because the lemma was already in the "
+                    "DAG; steer fresh work away from this id."
+                )
+            state.write_checkpoint()
         result = run_proof_loop(
             verbose=verbose,
             conjecture=conjecture,
@@ -3787,7 +3839,7 @@ def _parallel_proof_loop(
             on_round=lambda state_dict: state.set_in_flight(
                 loop_id, state_dict
             ),
-            on_proof=lambda lid, node: state.add_lemma(lid, node),
+            on_proof=on_proof,
             failed_attempts=state.failed_attempts,
             failed_lock=state.failed_lock,
             get_dag=load_dag,

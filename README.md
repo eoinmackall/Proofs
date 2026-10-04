@@ -247,6 +247,15 @@ the selector is re-run on what remains, so two loops never work on one id. A
 claimed lemma keeps its slot until it is settled — proved or given up after
 `MAX_PROOF_ATTEMPTS` rounds — or the operator asserts it from the menu.
 
+The buffer is not the only route to an id: a reviser that decomposes a hard
+lemma picks a fresh id the buffer does not know about, and two loops can
+land on the same id (both decompose to it, or one decomposes to it while a
+sibling proves the buffer's copy of it). The commit to the DAG checks the id
+under the DAG lock, and the first proof wins: a colliding proof is dropped,
+the first-committed statement and proof stand, and the collision is recorded
+on the shared reject list so the planner can steer fresh work away from the
+id.
+
 ### The planner and the generator
 
 - **Planner** (`agents/parallel/parallel_planner.md`) sets direction, not
