@@ -251,10 +251,11 @@ The buffer is not the only route to an id: a reviser that decomposes a hard
 lemma picks a fresh id the buffer does not know about, and two loops can
 land on the same id (both decompose to it, or one decomposes to it while a
 sibling proves the buffer's copy of it). The commit to the DAG checks the id
-under the DAG lock, and the first proof wins: a colliding proof is dropped,
-the first-committed statement and proof stand, and the collision is recorded
-on the shared reject list so the planner can steer fresh work away from the
-id.
+under the DAG lock and the first proof stands under the id; a colliding
+proof is never dropped — it is committed under a fresh non-colliding id
+(`P1_2`, `P1_3`, ...), marked with `"renamed_from": "P1"` so the DAG stays
+self-explanatory, and the rename is recorded on the shared reject list so
+the planner can see that the two proofs may state different things.
 
 ### The planner and the generator
 

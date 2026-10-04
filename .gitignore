@@ -1,5 +1,6 @@
 __pycache__/
 conjectures/algebra_example/references/*
+conjectures/semisimplicity/
 .comments
 *.checkpoint.json
 # Per-writer temp files a crashed checkpoint write can leave behind

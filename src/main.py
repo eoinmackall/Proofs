@@ -503,6 +503,31 @@ def save_dag(dag: Dict[str, Any]) -> None:
     os.replace(tmp, DAG_FILE)
 
 
+def commit_lemma_to_dag(
+    lemma_id: str, node: Dict[str, Any]
+) -> Tuple[str, bool]:
+    """Commit node to the DAG under lemma_id, or under a fresh
+    non-colliding id if lemma_id is already taken. The id check and the
+    write are one step under the DAG lock, so the check can never go
+    stale: a writer that finds its id taken commits under lemma_id_2 (or
+    _3, ...) rather than over the first proof, and the renamed node
+    carries "renamed_from" so the DAG stays self-explanatory. Returns
+    (committed_id, renamed)."""
+    with DAG_LOCK:
+        dag = load_dag()
+        if lemma_id not in dag["lemmas"]:
+            dag["lemmas"][lemma_id] = node
+            save_dag(dag)
+            return lemma_id, False
+        suffix = 2
+        while f"{lemma_id}_{suffix}" in dag["lemmas"]:
+            suffix += 1
+        committed_id = f"{lemma_id}_{suffix}"
+        dag["lemmas"][committed_id] = {**node, "renamed_from": lemma_id}
+        save_dag(dag)
+        return committed_id, True
+
+
 # ----------------------------------------------------------------------------
 # Checkpointing: the state a cancelled run leaves behind, so the next run
 # resumes instead of starting over. The DAG itself is the permanent record;
@@ -526,9 +551,11 @@ _sigint_count = 0
 _PARALLEL: "ParallelState" = None
 # The DAG file lock, held across load-then-save by every DAG writer that
 # can run concurrently with another: the serial success boundary and each
-# parallel loop's. Two writers can't add the same id twice or clobber
-# each other's addition. Readers reload under it too (fresh per round), so
-# a loop never plans or proves against a stale DAG.
+# parallel loop's. Two writers can't clobber each other's addition —
+# commit_lemma_to_dag checks the id under the lock, and a writer that
+# finds its id taken commits under a fresh one. Readers reload under it
+# too (fresh per round), so a loop never plans or proves against a stale
+# DAG.
 DAG_LOCK = threading.Lock()
 # The checkpoint-file lock, held by ParallelState.write_checkpoint() across
 # the whole snapshot-then-replace. In parallel mode every loop's claim
@@ -644,6 +671,7 @@ def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
             clean_target: Dict[str, Any] = {"id": lemma_id, "statement": statement}
             in_flight = {
                 "lemma_id": lemma_id,
+                "claimed_id": str(raw.get("claimed_id") or lemma_id),
                 "target": clean_target,
                 "attempt": attempt,
                 "feedback": [n for n in (raw.get("feedback") or []) if isinstance(n, str)],
@@ -669,7 +697,11 @@ def _validate_in_flight(raw: Any) -> Optional[Dict[str, Any]]:
     The shape the serial and parallel checkpoints share: the lemma id, the
     target as the reviser last left it, the prover round to re-run, the
     feedback and reject notes it carries, and the last proof of it (the one
-    just rejected — what the reviser judges its difficulty by).
+    just rejected — what the reviser judges its difficulty by). The claim
+    id is kept beside the lemma id for the same reason the engine does:
+    a decomposition may have moved the prover off the claimed id, and the
+    buffer slot to free on settle is keyed on the claim. Checkpoints from
+    before the field existed fall back to the lemma id.
     """
     if not isinstance(raw, dict):
         return None
@@ -689,6 +721,7 @@ def _validate_in_flight(raw: Any) -> Optional[Dict[str, Any]]:
     clean_target: Dict[str, Any] = {"id": lemma_id, "statement": statement}
     return {
         "lemma_id": lemma_id,
+        "claimed_id": str(raw.get("claimed_id") or lemma_id),
         "target": clean_target,
         "attempt": attempt,
         "feedback": [n for n in (raw.get("feedback") or []) if isinstance(n, str)],
@@ -1991,24 +2024,40 @@ def run_proof_loop(
     called at each prover round with the in-flight state that round
     establishes (the caller publishes it and checkpoints it), and `on_proof`
     is called with the lemma's DAG node when a proof survives all three
-    verifier checks (the caller commits it). Every failed_attempts mutation
-    happens under `failed_lock` — a formality in the serial run, where the
-    lock is never contended, and what keeps the shared reject list coherent
-    in a parallel one.
+    verifier checks (the caller commits it and returns the id it committed
+    under — the lemma's id, unless that id was already taken and the
+    commit renamed it). Every failed_attempts mutation happens under
+    `failed_lock` — a formality in the serial run, where the lock is never
+    contended, and what keeps the shared reject list coherent in a parallel
+    one.
 
-    Returns {"proved", "lemma_id", "target", "proof", "attempt_notes"}. The
+    Returns {"proved", "lemma_id", "committed_id", "claimed_id", "target",
+    "proof", "attempt_notes"}. committed_id is the id the proof was
+    committed under (None when not proved); the caller's on_proof decides
+    it. claimed_id is the id this claim started from: lemma_id is wherever
+    the prover ended up, and a decomposition may have moved it, so the
+    caller frees its buffer slot keyed on claimed_id, not lemma_id. The
     caller records the final failure when not proved (from attempt_notes)
     and clears its in-flight state; the engine leaves no other traces.
     """
     resuming = initial is not None
     in_flight = initial if initial is not None else {}
     proof = ""  # bound before the return; the overflow-break paths skip the assignment
+    committed_id: Optional[str] = None  # set when on_proof commits
 
     if resuming:
         lemma_id = in_flight["lemma_id"]
+        # The claim id is the id this claim started from, kept apart from
+        # the target because a decomposition may have moved the prover onto
+        # a different lemma since the claim: the buffer slot to free on
+        # settle is keyed on the claim, not on wherever the prover ended
+        # up. Checkpoints written before this field existed carry only the
+        # target's id; the fallback is the old behavior.
+        claimed_id = str(in_flight.get("claimed_id") or lemma_id)
         target: Dict[str, Any] = in_flight["target"]
     else:
         lemma_id = fresh_target["id"]
+        claimed_id = lemma_id
         # The target is the statement only: the candidate's other fields
         # (priority, notes) steer the loops, not the prover.
         target: Dict[str, Any] = {
@@ -2040,6 +2089,8 @@ def run_proof_loop(
             return {
                 "proved": False,
                 "lemma_id": lemma_id,
+                "committed_id": None,
+                "claimed_id": claimed_id,
                 "target": target,
                 "proof": last_proof,
                 "attempt_notes": attempt_notes,
@@ -2052,6 +2103,7 @@ def run_proof_loop(
         # in-flight call is lost, nothing completed before it is.
         in_flight_state = {
             "lemma_id": lemma_id,
+            "claimed_id": claimed_id,
             "target": target,
             "attempt": attempt,
             "feedback": feedback,
@@ -2316,19 +2368,23 @@ def run_proof_loop(
 
         if reject_just is None:
             # ---------------- Step 4: DAG update ----------------
-            # All three verifier checks accepted the same proof.
+            # All three verifier checks accepted the same proof. The
+            # reject notes are cleared before the commit so that a commit
+            # renamed under a taken id (on_proof returns a different id)
+            # can still record its note under the original id afterwards
+            # without this pop wiping it.
             log(
                 f"✅ Lemma {lemma_id} passed all {len(VERIFIER_AGENTS)} "
                 f"verifier checks. Adding to DAG.",
                 verbose,
             )
-            on_proof(lemma_id, {
+            with failed_lock:
+                failed_attempts.pop(lemma_id, None)
+            committed_id = on_proof(lemma_id, {
                 "statement": target["statement"],
                 "proof": proof,
                 "dependencies": dep_ids,
             })
-            with failed_lock:
-                failed_attempts.pop(lemma_id, None)
             proved = True
             break
 
@@ -2482,6 +2538,8 @@ def run_proof_loop(
     return {
         "proved": proved,
         "lemma_id": lemma_id,
+        "committed_id": committed_id,
+        "claimed_id": claimed_id,
         "target": target,
         "proof": proof,
         "attempt_notes": attempt_notes,
@@ -2504,13 +2562,14 @@ def _serial_on_round(
 
 def _serial_on_proof(
     lemma_id: str, node: Dict[str, Any], verbose: bool
-) -> None:
-    """The serial success boundary: add the lemma to the DAG, reading it
-    fresh under the DAG lock so the write composes with any later reader."""
-    with DAG_LOCK:
-        dag = load_dag()
-        dag["lemmas"][lemma_id] = node
-        save_dag(dag)
+) -> str:
+    """The serial success boundary: commit the lemma through the same
+    check-and-write as the parallel run, so the engine's on_proof
+    contract — return the id the lemma was committed under — holds in both
+    modes. A serial run has a single writer, so the id is never already
+    taken and the rename branch stays cold."""
+    committed, _renamed = commit_lemma_to_dag(lemma_id, node)
+    return committed
 
 
 def _build_reference_blocks(
@@ -2990,8 +3049,9 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 # of the serial shortlist menu — and the hotkey toggles it between the menu
 # and automation exactly as in the serial run. Every write to the shared
 # state goes through ParallelState, and every write to the DAG goes through
-# add_lemma's id check under the DAG lock, so an already-proved lemma can
-# never be overwritten and a reader can never see a half-state.
+# the check-and-write in commit_lemma_to_dag under the DAG lock, so a node
+# can never be overwritten (a colliding id is renamed, not clobbered) and
+# a reader can never see a half-state.
 # ----------------------------------------------------------------------------
 
 _QUIT = object()  # sentinel: the human loop asked the run to stop
@@ -3302,36 +3362,29 @@ class ParallelState:
 
     # -- the DAG -------------------------------------------------------------
 
-    def add_lemma(self, lemma_id: str, node: Dict[str, Any]) -> bool:
+    def add_lemma(self, lemma_id: str, node: Dict[str, Any]) -> str:
         """Commit a lemma to the shared DAG — the atomic part of the
-        design. Read the DAG fresh under the DAG lock, add the lemma,
-        write it back whole; then bump the version the planner watches,
-        clear the lemma's reject notes, mark the plan stale (the DAG
-        changed, so the plan owes a re-read), and checkpoint. The version
-        is visible only after the file is down, so a replan triggered by
-        it always sees the new lemma.
-
-        The id check and the write are one step under the same lock: a
-        lemma whose id is already in the DAG is never overwritten, because
-        two loops can land on one id — the reviser decomposes against the
-        DAG as it stood at the top of its own round, and the id it picks
-        can also sit in the buffer where a sibling is proving it. The
-        first proof stands, and the caller learns of the collision from
-        the False return. Returns True when the lemma was added, False
-        when the id was already taken."""
-        with DAG_LOCK:
-            dag = load_dag()
-            if lemma_id in dag["lemmas"]:
-                return False
-            dag["lemmas"][lemma_id] = node
-            save_dag(dag)
+        design. The commit itself is check-and-write under the DAG lock
+        (commit_lemma_to_dag): two loops can land on one id — the reviser
+        decomposes against the DAG as it stood at the top of its own
+        round, and the id it picks can also sit in the buffer where a
+        sibling is proving it — and a caller that finds its id taken
+        takes a fresh non-colliding id (lemma_id_2, ...) instead, so no
+        node is ever overwritten and no proof is dropped. Then bump the
+        version the planner watches, clear the lemma's reject notes, mark
+        the plan stale (the DAG changed, so the plan owes a re-read), and
+        checkpoint. The version is visible only after the file is down, so
+        a replan triggered by it always sees the new lemma. Returns the id
+        the lemma was committed under — lemma_id unless it was already
+        taken."""
+        committed, _renamed = commit_lemma_to_dag(lemma_id, node)
         with self.state_lock:
             self.dag_version += 1
         with self.failed_lock:
             self.failed_attempts.pop(lemma_id, None)
         self.mark_plan_stale()
         self.write_checkpoint()
-        return True
+        return committed
 
     def dag_version_snapshot(self) -> int:
         with self.state_lock:
@@ -3649,7 +3702,7 @@ def _parallel_human_step(
             return "auto", None
         if choice.action == "assert":
             asserted = choice.lemma or {}
-            added = state.add_lemma(
+            committed = state.add_lemma(
                 asserted["id"],
                 {
                     "statement": asserted["statement"],
@@ -3659,7 +3712,7 @@ def _parallel_human_step(
                 },
             )
             state.buffer.consume(asserted["id"])
-            if added:
+            if committed == asserted["id"]:
                 log(
                     f"🖊  Lemma {asserted['id']} accepted on your authority "
                     f"and added to the DAG unproved.",
@@ -3667,10 +3720,11 @@ def _parallel_human_step(
                 )
             else:
                 # A sibling loop committed this id while the menu was up:
-                # its entry stands, the assertion is dropped.
+                # its entry stands under the id, the assertion goes in
+                # under the renamed one.
                 log(
-                    f"⚠️  Lemma {asserted['id']} entered the DAG in the "
-                    f"meantime; the existing entry stands.",
+                    f"🖊  Lemma {asserted['id']} entered the DAG in the "
+                    f"meantime; yours went in as {committed}.",
                     verbose,
                 )
             continue
@@ -3743,7 +3797,9 @@ def _parallel_proof_loop(
                 # to resume; drop the position and the buffer claim, and go
                 # about the next lemma (the spent iteration is spent).
                 state.set_in_flight(loop_id, None)
-                state.buffer.consume(pending["lemma_id"])
+                state.buffer.consume(
+                    pending.get("claimed_id") or pending["lemma_id"]
+                )
                 log(
                     f"\u267b {loop_id}'s in-flight {pending['lemma_id']} is "
                     f"already in the DAG; resuming is moot.",
@@ -3801,29 +3857,33 @@ def _parallel_proof_loop(
             # serial way: a run cancelled mid-lemma resumes it without
             # charging the budget again.
             state.begin_lemma(loop_id)
-        def on_proof(lid: str, node: Dict[str, Any]) -> None:
+        def on_proof(lid: str, node: Dict[str, Any]) -> str:
             # add_lemma checks the id against the DAG as it stands at
-            # write time, not as it stood at the top of this loop's round,
-            # so a sibling that committed the same id in the meantime
-            # keeps its proof and this one is dropped rather than stacked
-            # on top of it. The collision goes on the shared reject list,
-            # under the id it happened under, where the planner and the
-            # other loops can see it.
-            if state.add_lemma(lid, node):
-                return
-            log(
-                f"⚠️  {loop_id}: lemma {lid} was already in the DAG when "
-                f"this proof was committed (two routes proved the same "
-                f"id); the first proof stands, this one is dropped.",
-                verbose,
-            )
-            with state.failed_lock:
-                state.failed_attempts.setdefault(lid, []).append(
-                    "Id collision: a second proof of this id was dropped "
-                    "at commit time because the lemma was already in the "
-                    "DAG; steer fresh work away from this id."
+            # write time, not as it stood at the top of this loop's round:
+            # a sibling that committed the same id in the meantime keeps
+            # its proof under the id, and this one is committed under a
+            # fresh non-colliding id rather than dropped or stacked on
+            # top of it. The rename goes on the shared reject list, under
+            # the id it happened under, where the planner and the other
+            # loops can see that the two proofs may state different
+            # things.
+            committed = state.add_lemma(lid, node)
+            if committed != lid:
+                log(
+                    f"↻ {loop_id}: lemma {lid} was taken by another route "
+                    f"while this proof was in flight; committed under "
+                    f"{committed} instead.",
+                    verbose,
                 )
-            state.write_checkpoint()
+                with state.failed_lock:
+                    state.failed_attempts.setdefault(lid, []).append(
+                        f"Id collision: this loop's proof of {lid} was "
+                        f"committed under {committed} because the id was "
+                        f"already in the DAG; the two proofs may state "
+                        f"different things."
+                    )
+                state.write_checkpoint()
+            return committed
         result = run_proof_loop(
             verbose=verbose,
             conjecture=conjecture,
@@ -3853,10 +3913,15 @@ def _parallel_proof_loop(
             break
         # The lemma is settled one way or another: clear the resumable
         # position (the engine's last on_round may still hold it), free the
-        # buffer slot it occupied, and record the failure where the planner
-        # and the other loops can see it.
+        # buffer slot the claim occupied, and record the failure where the
+        # planner and the other loops can see it. The slot is keyed on the
+        # claim id, not on the final target: a decomposition settles on a
+        # lemma the buffer never held, so freeing by the final id would
+        # leak the claim's slot and the generator would never be told the
+        # claimed id is free. The failure note, by contrast, belongs on
+        # the final target — that is the statement that was actually tried.
         state.set_in_flight(loop_id, None)
-        state.buffer.consume(result["lemma_id"])
+        state.buffer.consume(result["claimed_id"])
         if not result["proved"]:
             if result["attempt_notes"]:
                 state.record_failure(result["lemma_id"], result["attempt_notes"])
