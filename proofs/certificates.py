@@ -1,4 +1,4 @@
-"""Certificates: the record that a lemma was accepted (.comments, "Certificates").
+"""Certificates: the record that a lemma was accepted.
 
 Certificates are stored in the conjecture's certificates/ directory, one
 JSONL file per user, named for the user who issued them — the verifier:
@@ -6,14 +6,14 @@ JSONL file per user, named for the user who issued them — the verifier:
     conjectures/NAME/certificates/<verifier>.jsonl
 
 The file's first line is the owner's identity — the config's user.id,
-user.name and user.email, one JSON object, the same keys config.py holds
-(".comments", "User identity") — the per-user files' header, the way the
-user's DAG file carries it at the top of its object. It is written and
-refreshed by the owner's own runs — the only runs that write the file —
-and every rewrite carries it through at the top. It is metadata about the file, not a certificate: load() does
-not return it, and a line is the header by carrying user.id — a key a
-certificate line never has, its identity field being user_id — with none
-of a certificate's key fields.
+user.name and user.email, one JSON object, the same keys config.py holds —
+the per-user files' header, the way the user's DAG file carries it at the
+top of its object. It is written and refreshed by the owner's own runs — the
+only runs that write the file — and every rewrite carries it through at the
+top. It is metadata about the file, not a certificate: load() does not
+return it, and a line is the header by carrying user.id — a key a
+certificate line never has, its identity field being user_id — with none of
+a certificate's key fields.
 
 Below the header, one line per certificate, one JSON object per line,
 fields in this order:
@@ -205,8 +205,8 @@ def load_all(conjecture_dir: Union[str, os.PathLike]) -> List[Dict[str, Any]]:
 
 def is_valid(cert: Mapping[str, Any], current_hash: str) -> bool:
     """A certificate is valid only if its hash matches the lemma's current
-    Merkle hash (.comments, "Certificates"). current_hash is the hash the
-    caller recomputed from the DAG and references.md as they stand now
+    Merkle hash. current_hash is the hash the caller recomputed from the
+    DAG and references.md as they stand now
     (merkle.Merkle over load_dag()'s lemmas and load_references()): the
     certificate's own hash is frozen at the moment of acceptance, so the
     comparison is against a fresh computation, never against itself."""
@@ -233,13 +233,13 @@ def record(
 ) -> Dict[str, Any]:
     """Record one certificate in the verifier's file, or update it.
 
-    The upsert rule of .comments: a line with the same (user_id, lemma_id,
-    hash, verifier, model) already there gets its count incremented and
-    its date updated to this run's, and no duplicate line is appended;
-    otherwise a new line with count 1 is appended. The file is rewritten
-    whole and atomically (temp file beside it, os.replace). Returns the
-    line as written: the existing line with its new count and date, or the
-    new one.
+    The upsert rule (see the module docstring): a line with the same
+    (user_id, lemma_id, hash, verifier, model) already there gets its count
+    incremented and its date updated to this run's, and no duplicate line is
+    appended; otherwise a new line with count 1 is appended. The file is
+    rewritten whole and atomically (temp file beside it, os.replace).
+    Returns the line as written: the existing line with its new count and
+    date, or the new one.
 
     user is the verifier's identity (header()'s mapping) as the caller's
     config holds it: the file's header line, written and refreshed on every
@@ -311,8 +311,8 @@ def prune(
     hashes: Mapping[Tuple[str, str], Optional[str]],
     user: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Drop the user's certificates that no longer match (".comments",
-    "Prune").
+    """Drop the user's certificates that no longer match: the file side
+    of proofs prune (main.prune_entry()).
 
     hashes is the conjecture's lemmas with the hash each has now, keyed
     by the (user_id, lemma_id) pair: merkle.Merkle over the complete
@@ -320,15 +320,15 @@ def prune(
     same files makes, with a pair the DAG holds but cannot hash (a
     citation cycle) present as None. A line is kept only if its pair has
     a hash and the line's hash field equals it — a certificate is valid
-    only while it matches the lemma's current hash (".comments",
-    "Certificates"), so a line for a lemma that is no longer in the DAG,
-    or that no longer has a hash, matches nothing now and goes.
+    only while it matches the lemma's current hash, so a line for a lemma
+    that is no longer in the DAG, or that no longer has a hash, matches
+    nothing now and goes.
 
     Only the certificates user_id issued are pruned: the user's own file,
     certificates/<user_id>.jsonl, is the only one read and rewritten, so
-    the other users' files are never touched (".comments", "Prune"), and
-    within it a line whose verifier is someone else (a hand edit) is kept
-    verbatim rather than judged. The file is left alone entirely when every line still
+    the other users' files are never touched, and within it a line whose
+    verifier is someone else (a hand edit) is kept verbatim rather than
+    judged. The file is left alone entirely when every line still
     matches and the header it carries is still the one the caller's
     config holds. The rewrite is atomic in record()'s sense (temp file
     beside it, os.replace), runs under the same process lock, and keeps a

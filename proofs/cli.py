@@ -17,45 +17,55 @@ which supplies the lemma's user_id, so a lemma is identified by the pair
 (user_id, lemma_id). For export, PATH may also be the conjecture directory
 itself, in which case the complete DAG is written.
 
-parse and run are the tools that already exist: they forward to parsing.run()
-and main.main() with DIR as --conjecture, and pass anything after DIR
-(--model, --mode, --max-iterations, --parallel, ...) through unchanged.
-verify, repair and prune are implemented (".comments", "Verify",
-"Refutations", "Repair", "Prune"): verify and repair are the verification
-path — verify runs the three verifier checks on a lemma that is already in
-the DAG (a rejection writes the lemma's refutation file, an acceptance its
-certificate, and the lemma's stale refutations give their justifications
-to the verifiers either way), repair is addressed to one refutation file
-by its path and re-verifies the lemma with the refutation's justification
-as input, the file being deleted when the proof is accepted; a rejected
-proof is re-proven through the prover, verifier and reviser, committed in
-place under the lemma's own user_id and lemma_id, and the lemmas that
-depend on it are re-verified up the chain, each re-proved if its
-re-verification rejects it; prune
-recomputes the Merkle hash of every lemma of the conjecture and drops the
-current user's certificates that no longer match — the ones that user
-issued as verifier — never touching another user's file; status reports,
-for each lemma in the named lemma's dependency closure, every valid
-certificate — a line of any user's certificate file whose hash matches the lemma's current Merkle
-hash — with its verifier, model, date and count, reading the DAG files,
-references.md and the certificate files and writing nothing (".comments",
-"Status"); export writes the DAG as a LaTeX document in dependency order —
-with a user's DAG file, that user's lemmas, and with a lemma id, that
-lemma and everything it cites; with the conjecture directory, the complete
-DAG — to a .tex file in the directory -o/--out names (proof.tex,
-<user_id>_proof.tex or <user_id>--<lemma_id>_proof.tex; the directory is
-created if it is not there yet), reading the DAG files, references.md and
-conjecture.md and writing nothing else (".comments", "Export"). -o/--out
-is required: the document is the user's artifact, not the project's data,
-so it never lands in the project on its own.
+This module validates the arguments and hands each command to its entry
+point, where the command's own docstring says what it does:
 
-`new` creates conjectures/NAME/ with empty references/, dags/ and
-certificates/ directories, an empty conjecture.md and comments.md, and a
-references.md holding the empty collection []. It refuses a NAME that is
-already there.
+  * parse and run forward to parsing.run() and main.main() with DIR as
+    --conjecture, and pass anything after DIR (--model, --mode,
+    --max-iterations, --parallel, ...) through unchanged.
+  * verify (main.verify_entry) runs the three verifier checks on a lemma
+    that is already in the DAG: a rejection writes a refutation file
+    (refutations.py), an acceptance a certificate (certificates.py), and
+    the lemma's stale refutations give their justifications to the
+    verifiers either way.
+  * repair (main.repair_entry) is addressed to one refutation file by its
+    path. It re-verifies the lemma with the refutation's justification as
+    input, deleting the file when the proof is accepted; a rejected proof
+    is re-proven through the prover, verifier and reviser, committed in
+    place under the lemma's own user_id and lemma_id, and the lemmas that
+    depend on it are re-verified up the chain, each re-proved if its
+    re-verification rejects it.
+  * prune (main.prune_entry) recomputes the Merkle hash of every lemma of
+    the conjecture and drops the current user's certificates that no
+    longer match — the ones that user issued as verifier — never touching
+    another user's file.
+  * status (main.status_entry) reports, for each lemma in the named
+    lemma's dependency closure, every valid certificate — a line of any
+    user's certificate file whose hash matches the lemma's current Merkle
+    hash — with its verifier, model, date and count. It writes nothing.
+  * export (main.export_entry, export.py) writes the DAG as a LaTeX
+    document in dependency order — with a user's DAG file, that user's
+    lemmas, and with a lemma id, that lemma and everything it cites; with
+    the conjecture directory, the complete DAG — to proof.tex,
+    <user_id>_proof.tex or <user_id>--<lemma_id>_proof.tex in the
+    directory -o/--out names, created if it is not there yet. -o/--out is
+    required: the document is the user's artifact, not the project's
+    data, so it never lands in the project on its own.
+  * new creates conjectures/NAME/ with empty references/, dags/ and
+    certificates/ directories, an empty conjecture.md and comments.md,
+    and a references.md holding the empty collection []. It refuses a
+    NAME that is already there.
 
-Every command except `config` and `new` acts as the user the config's user.id names
-(see .comments, "User identity"): the id is read from the config, and a
+None of the commands run git: users share a conjecture's files by
+committing, pushing and pulling them by hand. Every file a command writes
+belongs to the user running it (their DAG file, their certificate file, a
+refutation named for them), so two users' work never lands in the same
+file. The exceptions are verify and repair: an acceptance deletes the
+lemma's refutations whoever wrote them, and repair rewrites the repaired
+lemma in its owner's DAG file.
+
+Every command except `config` and `new` acts as the user the config's
+user.id names (see config.py): the id is read from the config, and a
 run without one fails and names the command that sets it — proofs does not
 ask, as git does not. The config lives in ~/.config/proofs/config, outside
 the repository, and is never committed; its keys (user.id, user.name,
@@ -101,15 +111,17 @@ def _add_backend_flags(sp: argparse.ArgumentParser, help_for: str) -> None:
     sp.add_argument(
         "--model",
         default=main_mod.MODEL_NAME,
-        help="the model the work runs under (default: main's)",
+        help=f"the model the work runs under (default: {main_mod.MODEL_NAME})",
     )
     sp.add_argument(
-        "--host", default=None, help="host:port (default: llm_backend's)"
+        "--host", default=None,
+        help="OpenAI-compatible base URL (default: $LLAMA_HOST or "
+             "http://localhost:8081)",
     )
     sp.add_argument(
         "--api-key",
         default=None,
-        help="the backend's API key (default: the backend's environment variable)",
+        help="the backend's API key (default: $LLM_API_KEY)",
     )
     sp.add_argument(
         "--backend",
@@ -608,8 +620,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # The run's user, resolved before any subcommand (see .comments,
-    # "User identity"): the config's user.id, and a run without one fails
+    # The run's user, resolved before any subcommand (see config.py):
+    # the config's user.id, and a run without one fails
     # and names the command that sets it. The config subcommand acts on
     # the config itself, and new only lays out files, so both run without
     # a resolved user.

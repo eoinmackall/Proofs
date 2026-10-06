@@ -1,4 +1,4 @@
-"""Refutations: the record that a lemma was rejected (.comments, "Refutations").
+"""Refutations: the record that a lemma was rejected.
 
 A refutation is a file in the conjecture's refutations/ directory, one file
 per rejection, named for the lemma's owner, the lemma, the verifier and the
@@ -119,8 +119,8 @@ def name_for(
     user_id: str, lemma_id: str, verifier: str, when: str
 ) -> str:
     """The refutation file's name: the owner, the lemma, the verifier and
-    the full timestamp, in that order, the way the .comments names the
-    file. when is an ISO 8601 stamp (now_iso())."""
+    the full timestamp, in that order (see the module docstring). when is
+    an ISO 8601 stamp (now_iso())."""
     return (
         f"{_safe(user_id)}--{_safe(lemma_id)}--{_safe(verifier)}"
         f"--{_name_stamp(when)}.json"
@@ -162,12 +162,11 @@ def record(
     """Write one refutation file for a rejection of the lemma and return
     its path.
 
-    The file is the rejection as it happened: the lemma by its owner and
-    id, its Merkle hash at the moment of the rejection (the caller
-    recomputed it, the way record_certificate recomputes a certificate's
-    hash), the user whose run rejected it and the model under which the
-    rejection happened, the moment, the verdict, and the model's
-    justification.
+    The file is the rejection as it happened: the lemma by its owner and id,
+    its Merkle hash at the moment of the rejection (the caller recomputed
+    it, the way main.record_certificate recomputes a certificate's hash),
+    the user whose run rejected it and the model under which the rejection
+    happened, the moment, the verdict, and the model's justification.
 
     Two rejections of the same lemma by the same verifier in the same
     second are two different events and both are kept: the first takes
@@ -250,7 +249,7 @@ def for_lemma(
 
 def is_counting(ref: Mapping[str, Any], current_hash: str) -> bool:
     """Whether a refutation counts: only while its hash matches the
-    lemma's current Merkle hash (.comments, "Refutations").
+    lemma's current Merkle hash.
 
     The same rule certificates.py checks for an acceptance, checked for
     the record of a rejection. current_hash is the hash the caller

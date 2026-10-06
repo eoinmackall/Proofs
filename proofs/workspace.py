@@ -5,9 +5,12 @@ Layout:
     conjectures/
       algebra_example/
         conjecture.md              <- required, the only mandatory file
-        dags/                      <- per-user DAG files: <user_id>_dag.json
-        references/                <- maintainer-local inputs for parsing.py (gitignored)
-        references.md              <- committed: strict-JSON refs, parsing.py's output
+        dags/                      <- committed: per-user DAG files, <user_id>_dag.json,
+                                      and (gitignored) each user's <user_id>_dag.checkpoint.json
+        certificates/              <- committed: per-verifier acceptances, <user_id>.jsonl
+        refutations/               <- committed: one file per rejection, created on first write
+        references/                <- maintainer-local inputs for proofs parse (gitignored)
+        references.md              <- committed: strict-JSON refs, proofs parse's output
         comments.md                <- optional, gitignored: this user's notes, passed to the planner
         prover.md                  <- optional per-conjecture prompt override
       some_other_problem/
@@ -16,23 +19,24 @@ Layout:
     agents/
       planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md  <- project-wide defaults
 
-Two decisions worth flagging, both changeable:
+Three decisions worth flagging, all changeable:
 
   * One DAG file per user, not per model or per run:
-    conjectures/NAME/dags/<user_id>_dag.json. run_loop() merges every file in
-    dags/ into the complete DAG at the top of every iteration, so a user
-    started against an existing conjecture picks up wherever everyone else
-    stopped, whatever wrote those lemmas: the proof is the artefact, and a
-    lemma proved by one person and passed by the three verifiers is no less
-    proved when another person arrives to continue. Each lemma stores the
-    user_id and lemma_id that identify it, and a lemma_id is unique only
-    within one user's file — which is why the merge is keyed by the pair
-    (user_id, lemma_id). The run writes new lemmas to the current user's file
-    only, and never to another user's.
+    conjectures/NAME/dags/<user_id>_dag.json. load_dag() merges every file
+    in dags/ into the complete DAG each time it is called, so a user who
+    pulls an existing conjecture picks up wherever everyone else stopped,
+    whatever wrote those lemmas: the proof is the artefact, and a lemma one
+    person proved and certified is no less proved when another person
+    arrives to continue. Each lemma stores the user_id and lemma_id that
+    identify it, and a lemma_id is unique only within one user's file —
+    which is why the merge is keyed by the pair (user_id, lemma_id). A run
+    writes new lemmas to the current user's file only, never to another
+    user's, so users exchanging files through git rarely edit the same one
+    (proofs repair's in-place rewrite of a lemma is the exception).
 
-    The cost is the same as the old per-model sharing: users running against
-    the same conjecture are collaborating, not competing, and their results
-    are entangled from the first shared lemma.
+    The cost: users running against the same conjecture are collaborating,
+    not competing, and their results are entangled from the first shared
+    lemma.
 
   * Prompt files are looked up in the conjecture directory first, then in
     agents/. Nothing changes unless you drop a file in; it just means a
@@ -43,10 +47,10 @@ Two decisions worth flagging, both changeable:
     The input directory is the conjecture's maintainer's local working copy
     of the source material — gitignored, never committed. The output,
     references.md, is the committed reference collection: the maintainer
-    writes it with parsing.py and commits it with the conjecture, and every
+    writes it with proofs parse and commits it with the conjecture, and every
     other user pulls it and never regenerates it. The proving loop only ever
     reads references.md; a result a user needs that is missing is requested
-    from the maintainer, who parses it in (.comments, "References").
+    from the maintainer, who parses it in (see parsing.py).
 """
 
 from __future__ import annotations
@@ -81,9 +85,9 @@ REFERENCES_FILENAME = "references.md"
 # Free-form operator notes on possible approaches to a proof or
 # counterexample. Read once per run and handed to the planner verbatim on
 # every iteration; the planner is the only agent that sees it, and a
-# conjecture directory without the file runs exactly as before. Gitignored
+# conjecture directory without the file runs without the section. Gitignored
 # and never committed or shared: each user keeps their own copy in their
-# own clone (see .comments, "Comments").
+# own clone (see the README's "Comments" section).
 COMMENTS_FILENAME = "comments.md"
 AGENTS_DIR = "agents"
 # Every prompt the loop can load, and therefore every per-conjecture override
@@ -325,7 +329,7 @@ def describe(paths: RunPaths) -> str:
         n_files = sum(1 for p in paths.references_dir.iterdir() if p.is_file())
         lines.append(
             f"  references={paths.references_dir.name}/ ({n_files} file(s) for "
-            f"parsing.py)"
+            f"proofs parse)"
         )
     if paths.references.is_file():
         try:

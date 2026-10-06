@@ -13,16 +13,16 @@ of preference:
 
   * A probe  — read off the server at startup, so it is correct for whatever
     is actually loaded, no matter what the alias is: the context ceiling, the
-    thinking support, and the name of the model that is loaded (the file name
-    a llama-server reports in /props, otherwise the first id of its
-    /v1/models list). See probe().
+    thinking support, and — on a llama-server — the file name of the model
+    it has loaded, from /props. See probe(). Where there is no /props, the
+    model that answered is read off each reply instead (recorded_model()).
   * Transport  — HOW to talk to the server. Real code. There is exactly one:
     the OpenAI-compatible /v1/chat/completions endpoint. llama.cpp's
     llama-server serves it locally; a hosted API (OpenAI, OpenRouter,
     DeepSeek, ...) serves it at its base URL. The same transport covers both.
     The only difference is that a hosted API wants an
     `Authorization: Bearer <key>` header, which this module sends whenever an
-    API key is supplied (--api_key or $LLM_API_KEY).
+    API key is supplied (--api-key or $LLM_API_KEY).
 
 The dialect of that endpoint — which sampling fields it accepts, and whether
 schema calls must have thinking suppressed — is a probe decision by default
@@ -36,9 +36,9 @@ a model you have not seen before runs on its own card and its defaults.
 
 Usage from main.py:
 
-    from llm_backend import make_backend
-    BACKEND = make_backend(args.model, args.host, api_key=args.api_key,
-                           backend=args.backend)
+    BACKEND = llm_backend.make_backend(args.model, args.host,
+                                       api_key=args.api_key,
+                                       backend=args.backend)
     PROFILE = BACKEND.probe()
     if PROFILE.auth_error:            # a supplied key the API rejected
         raise SystemExit(PROFILE.auth_error)
@@ -64,15 +64,13 @@ import requests
 class Profile:
     """What we know about the loaded model. Probed where possible."""
     name: str
-    # The name the server itself gives the model it has loaded, recorded at
-    # startup (".comments", "Model name"): the file name of the model a
-    # llama-server has loaded, read off /props, or — on an endpoint with no
-    # /props — the first id of its /v1/models list. None when the server
-    # reported nothing. Kept apart from name, which is what --model asked for
-    # (an alias or a provider id the server may ignore).
+    # The file name of the model a llama-server has loaded, read off /props
+    # by probe(). None on an endpoint with no /props. Kept apart from name,
+    # which is what --model asked for: a llama-server ignores the request's
+    # model field and answers with whatever it loaded.
     model_name: Optional[str] = None
     context_limit: int = 65536     # ceiling of the server's KV cache (tokens).
-                                   # --num_ctx must fit inside this.
+                                   # --num-ctx must fit inside this.
     supports_thinking: bool = False
     probe_ok: bool = False         # False => everything below is a guess
     # Transport facts, set by probe(). is_llama_cpp decides the option set;
@@ -160,7 +158,7 @@ def _context_limit_from_error(text: str) -> Tuple[Optional[int], Optional[int]]:
 
 
 # ---------------------------------------------------------------------------
-# The model name the server reports (".comments", "Model name")
+# The model name the server reports (Profile.model_name)
 # ---------------------------------------------------------------------------
 
 def _model_name_from_props(body: Dict[str, Any]) -> Optional[str]:
@@ -179,28 +177,6 @@ def _model_name_from_props(body: Dict[str, Any]) -> Optional[str]:
         value = body.get(key)
         if isinstance(value, str) and value:
             return value
-    return None
-
-
-def _model_id_from_models(response: "requests.Response") -> Optional[str]:
-    """The first model id an OpenAI-compatible /v1/models lists, or None.
-
-    The "otherwise" route for the recorded model name (".comments",
-    "Model name"): a hosted API or other server serves no /props, but the
-    model list every OpenAI-compatible endpoint has is there, and its first
-    id is the model that will serve the run."""
-    try:
-        body = response.json()
-    except ValueError:
-        return None
-    data = body.get("data") if isinstance(body, dict) else None
-    if not isinstance(data, list):
-        return None
-    for entry in data:
-        if isinstance(entry, dict):
-            mid = entry.get("id")
-            if isinstance(mid, str) and mid:
-                return mid
     return None
 
 
@@ -225,6 +201,10 @@ class Reply:
     truncated: bool = False
     usage: Dict[str, Any] = field(default_factory=dict)
     tool_calls: List[ToolCall] = field(default_factory=list)
+    # The reply's own "model" field: on a hosted API, the model that
+    # actually answered (often with a version suffix the request did not
+    # carry). A llama-server puts its --alias here, whatever was requested.
+    model: str = ""
 
 
 # The shapes a refusal of the `tools` field itself takes: llama-server's
@@ -304,6 +284,24 @@ class OpenAICompatibleBackend:
             {"Authorization": f"Bearer {api_key}"} if api_key else {}
         )
         self.profile: Optional[Profile] = None
+        # The "model" field of the latest reply: on a hosted API, the model
+        # that actually answered. See recorded_model().
+        self.served_model: Optional[str] = None
+
+    def recorded_model(self) -> str:
+        """The name certificates and refutations record for the model that
+        did the work.
+
+        On a llama-server, the file name /props reports: the request's
+        model field is ignored there, and the reply's model field is the
+        server's --alias, which says nothing about the weights. Elsewhere,
+        the model named in the latest reply, which is the model that
+        answered — for a hosted API, the one --model selected, often with
+        its version suffix. Before any reply, or when a server names
+        nothing, the --model name is the best record there is."""
+        if self.profile is not None and self.profile.model_name:
+            return self.profile.model_name
+        return self.served_model or self.model
 
     def _is_llama_cpp(self) -> bool:
         """Full llama.cpp option set + thinking knobs, or standard OpenAI?
@@ -336,9 +334,8 @@ class OpenAICompatibleBackend:
           instead of letting every call in the run 401 (a 401/403 there is a
           definite rejection and is surfaced as auth_error; a 404 (endpoint
           absent) or a network error is not an auth failure, so it is left
-          alone), and when /props gave no model name: the first id in the
-          server's model list is then the model we record (".comments",
-          "Model name").
+          alone). Its list of models is not used for naming: on a hosted
+          API it is the provider's whole catalogue, in no useful order.
 
         The probe's measurements (context ceiling, thinking support) are kept
         either way — they describe the server that is actually there. What
@@ -375,16 +372,14 @@ class OpenAICompatibleBackend:
                 or "reasoning_effort" in template
             )
             # The file name of the model the server has loaded
-            # (".comments", "Model name").
+            # (Profile.model_name).
             prof.model_name = _model_name_from_props(body)
             prof.probe_ok = True
 
-        # The /v1/models call does two jobs at once: verify a supplied key,
-        # and — when /props gave no model name — record the model the
-        # endpoint serves (".comments", "Model name"). A 401/403 with no key
-        # at all is expected (an unauthenticated call to a hosted API), not
-        # an auth failure, so auth_error stays key-gated.
-        if self.api_key or prof.model_name is None:
+        # The /v1/models call verifies a supplied key. A 401/403 with no
+        # key at all is expected (an unauthenticated call to a hosted API),
+        # not an auth failure, so the call is key-gated.
+        if self.api_key:
             try:
                 rm = requests.get(f"{self.host}/v1/models", timeout=30,
                                   headers=self._headers)
@@ -398,10 +393,7 @@ class OpenAICompatibleBackend:
                         f"$LLM_API_KEY and that it matches {self.host}."
                     )
                 elif rm.status_code == 200:
-                    if self.api_key:
-                        prof.key_verified = True
-                    if prof.model_name is None:
-                        prof.model_name = _model_id_from_models(rm)
+                    prof.key_verified = True
 
         # Reconcile the dialect: auto takes whatever the probe found, the
         # other backends are taken on faith. describe() flags a mismatch.
@@ -498,6 +490,9 @@ class OpenAICompatibleBackend:
                 )
         r.raise_for_status()
         body = r.json()
+        served = body.get("model")
+        if isinstance(served, str) and served:
+            self.served_model = served
         # Fold this call's real usage into the running chars/token estimate:
         # the tokens the server counted for the prompt we just sent, against
         # its char count. Every caller benefits; none has to remember to.
@@ -530,17 +525,19 @@ class OpenAICompatibleBackend:
             thinking=msg.get("reasoning_content") or msg.get("reasoning") or "",
             truncated=choice.get("finish_reason") == "length",
             usage=body.get("usage") or {},
+            model=str(body.get("model") or ""),
         )
 
 
-# 8080 is llama-server's own default, but it is also open-webui's, and on this
-# machine open-webui has it. Launch llama-server with --port 8081 to match.
-# For a hosted API, pass its base URL as --host (e.g.
-# https://api.openai.com, without the /v1 suffix) — it does not use this
-# default at all.
-# The probe makes a wrong guess loud rather than silent: open-webui has no
-# /props route, so it 404s and you get default_generation_settings=None
-# instead of a confusing half-working session against the wrong service.
+# 8080 is llama-server's own default, but it is also open-webui's, so the
+# project defaults to 8081: launch llama-server with --port 8081 to match,
+# or point $LLAMA_HOST / --host at wherever it listens. For a hosted API,
+# pass its base URL as --host (e.g. https://api.openai.com, without the /v1
+# suffix) — it does not use this default at all.
+# The probe makes a wrong guess loud rather than silent: a service with no
+# /props route (open-webui, say) 404s, and you get
+# default_generation_settings=None instead of a confusing half-working
+# session against the wrong service.
 _DEFAULT_HOST = os.environ.get("LLAMA_HOST", "http://localhost:8081")
 # Where an API key comes from when --api-key is not given. One name on
 # purpose: the key belongs to whatever --host points at, so a per-provider env

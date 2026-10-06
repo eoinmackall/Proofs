@@ -1,4 +1,4 @@
-"""The LaTeX export of a DAG (see .comments, "Export").
+"""The LaTeX export of a DAG.
 
 `proofs export PATH [lemma_id]` writes a LaTeX document of the DAG, in
 dependency order: every lemma comes after the lemmas it cites, so the
@@ -134,7 +134,7 @@ def _citations(
 ) -> Tuple[List[Tuple[str, str]], List[str]]:
     """A node's citations in the two stored fields' shapes: the cited
     lemma pairs and the cited reference ids, duplicates collapsed, the
-    file's order kept (".comments", "Citations")."""
+    file's order kept (see main.load_dag())."""
     pairs: List[Tuple[str, str]] = []
     refs: List[str] = []
     seen_pairs: set = set()

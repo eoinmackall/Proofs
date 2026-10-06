@@ -2,8 +2,7 @@
 
     ~/.config/proofs/config        (or $XDG_CONFIG_HOME/proofs/config)
 
-is a JSON object holding the user's identity, named git-style (see
-.comments, "User identity"):
+is a JSON object holding the user's identity, named git-style:
 
     {
         "user.id": "eoin",
@@ -16,7 +15,14 @@ set and read through `git config`: `proofs config --global user.id ID` sets,
 `proofs config user.id` prints, and an empty value unsets. It is per-user by
 design and lives in the home directory, so a clone of the repository never
 carries one user's identity into another's working copy — the file is never
-committed (see .comments, "User identity").
+committed.
+
+Every command but `config` and `new` acts as the user user.id names. The
+id names the user's files in a conjecture — dags/<user_id>_dag.json and
+certificates/<user_id>.jsonl — and is the verifier recorded in every
+certificate and refutation the user's runs write; a model never emits it.
+The three keys are also stamped at the top of the user's own DAG and
+certificate files, so a file read out of context still says whose it is.
 """
 
 from __future__ import annotations

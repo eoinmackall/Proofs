@@ -1,5 +1,4 @@
-"""Suspension: the state in which a lemma is not to be built on
-(".comments", "Suspension").
+"""Suspension: the state in which a lemma is not to be built on.
 
 A lemma is suspended if
 
@@ -74,7 +73,7 @@ class Suspension:
     refuted: FrozenSet[Pair]
     """...of which the suspension carries a counting refutation — a
     refutation whose hash matches the lemma's current Merkle hash, the
-    case the spec says to warn about."""
+    case the run warns about by name."""
 
     _reasons: Mapping[Pair, Tuple[str, ...]]
     """Why each pair is suspended, one clause per rule that holds of it —

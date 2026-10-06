@@ -15,9 +15,9 @@ results, and writes them to references.md as a strict JSON array:
 
 Who maintains it
 ----------------
-references.md is the conjecture's committed reference collection
-(.comments, "References"). The conjecture's maintainer is the only one who
-runs this tool: the maintainer keeps the sources in references/ (a local,
+references.md is the conjecture's committed reference collection. The
+conjecture's maintainer is the only one who runs this tool (proofs parse):
+the maintainer keeps the sources in references/ (a local,
 gitignored working copy — the raw files are never committed), parses them,
 and commits the updated references.md with the conjecture. Every other user
 pulls references.md and never regenerates it: a result they need that is
@@ -32,8 +32,8 @@ the formal statements of exactly the cited entries, and the planner sees an
 id + slogan shortlist while the collection stays below
 main.PLANNER_REFERENCE_LIMIT.
 
-This module is deliberately standalone: `python parsing.py --conjecture
-<name>` runs before, or instead of, the proving loop. It reuses main.py's
+This module is deliberately standalone: proofs parse runs before, or
+instead of, the proving loop. It reuses main.py's
 LLM plumbing — reason/extract, the JSON-repair pipeline, the compaction
 rescue — by importing it, so the two entry points share one definition of a
 failed call instead of two.
@@ -57,11 +57,10 @@ Usage
     proofs parse conjectures/algebra_example --model Qwen3.5-122B-Q4_K_M
     proofs parse conjectures/algebra_example --num-ctx 65536
 
-(also: python proofs/parsing.py --conjecture algebra_example)
-
---conjecture names a directory under conjectures/ holding a conjecture.md,
-as main.py does. Its references/ directory is the input; references.md,
-beside it, is the output.
+DIR names a conjecture directory holding a conjecture.md (proofs parse
+hands it to run() as --conjecture, as proofs run does to main.main()).
+Its references/ directory is the input; references.md, beside it, is the
+output.
 """
 
 import argparse

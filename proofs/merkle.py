@@ -1,4 +1,4 @@
-"""Merkle hashes of the DAG's lemmas (see .comments, "Merkle hash").
+"""Merkle hashes of the DAG's lemmas.
 
 A lemma's hash is the SHA-256 of a canonical JSON object holding the
 lemma's normalized statement, its normalized proof, and the sorted
@@ -47,11 +47,9 @@ citation cycle cannot be hashed in dependency order, and says so with a
 MerkleCycleError rather than recursing until it overflows.
 
 This module is deliberately standalone: it imports nothing from this
-package, and main.py imports it only if and when the loop needs it. The
-sections of .comments that key off these hashes (Certificates,
-Refutations, Suspension, Prune) and the CLI subcommands that will
-compute them (prune, verify, status, repair) can all build a Merkle
-without loading the run loop.
+package, so everything that keys off these hashes — certificates.py,
+refutations.py, suspension.py and resolution.py, and the prune, verify,
+status and repair commands — can build a Merkle without the run loop.
 """
 
 from __future__ import annotations
@@ -80,7 +78,7 @@ __all__ = [
 
 # A lemma is identified by the pair (user_id, lemma_id); a bare lemma_id
 # is unique only within one user's file, so on its own it names no
-# particular lemma (.comments, "Per-user DAGs").
+# particular lemma (see workspace.py).
 LemmaKey = Tuple[str, str]
 
 
@@ -141,7 +139,7 @@ def sha256_hex(data: bytes) -> str:
 
 def reference_hash(reference: Mapping[str, Any]) -> str:
     """A cited reference's contribution to a lemma's hash: the SHA-256 of
-    its normalized "formal statement" (.comments, "Merkle hash"). The id
+    its normalized "formal statement". The id
     and the slogan are deliberately not in it: a citation pins the
     result, not its label."""
     statement = reference.get("formal statement", "")
@@ -235,9 +233,9 @@ class Merkle:
                 self._ref_hashes[rid] = reference_hash(ref)
 
         # lemma hash, keyed by pair, cached as each is computed. Public:
-        # "each result cached" is part of the contract (.comments,
-        # "Merkle hash"), and a caller that asks the same lemma twice
-        # should be able to see that it was computed once.
+        # "each result cached" is part of the contract (see the module
+        # docstring), and a caller that asks the same lemma twice should
+        # be able to see that it was computed once.
         self.cache: Dict[LemmaKey, str] = {}
         # The hash() chain currently being computed: a second entry for a
         # pair on it is a citation cycle.
@@ -293,9 +291,9 @@ class Merkle:
 
         The cache makes the asking order irrelevant — every lemma is
         computed once, its citations first — so this is the hash of the
-        complete DAG in the shape the prune, status and certificate
-        sections of .comments consume it: a map from the (user_id,
-        lemma_id) pair to its hash."""
+        complete DAG in the shape prune, status and the certificates
+        consume it: a map from the (user_id, lemma_id) pair to its
+        hash."""
         return {pair: self.hash(*pair) for pair in self._lemmas}
 
     def reference_hash(self, ref_id: str) -> Optional[str]:
@@ -394,5 +392,5 @@ def _lemma_key(key: Any) -> LemmaKey:
     raise ValueError(
         f"{key!r} is not a (user_id, lemma_id) pair; a lemma is "
         f"identified by the pair, a bare lemma_id names no particular "
-        f"lemma (see .comments, 'Per-user DAGs')"
+        f"lemma"
     )

@@ -47,9 +47,9 @@ reject notes, and a lemma cancelled mid-proof goes straight back to the
 prover for the interrupted round rather than through planning again (which
 is what makes a mid-proof Ctrl-C cost the interrupted call, not the whole
 iteration). An interrupted call is never restored — that one is re-run —
-everything completed before it is not. When the planner settles the
-conjecture the checkpoint is deleted; `--fresh` deletes it too, without
-touching the DAG files.
+everything completed before it is not. When the conjecture is settled
+(resolution.py) the checkpoint is deleted; `--fresh` deletes it too,
+without touching the DAG files.
 
 Planning is a shortlist, not a decision
 ---------------------------------------
@@ -140,19 +140,20 @@ Usage
     proofs export conjectures/algebra_example -o ~/tex
     proofs export conjectures/algebra_example/dags/alice_dag.json lemma_42 -o ~/tex
 
-(also: python proofs/main.py --conjecture algebra_example)
+proofs run calls main() with DIR as --conjecture; verify, repair, prune,
+status and export call the *_entry functions below.
 
-parsing.py is standalone: the conjecture's maintainer points it at
-conjectures/<name>/references/ (any .tex or .md file in it), it asks the
-model for the theorem-level results, and writes them as a strict-JSON array
-to conjectures/<name>/references.md, which the maintainer commits with the
-conjecture. The reference collection is a shared, committed artefact
-(.comments, "References"): every other user pulls references.md and never
-regenerates it, and a result they need that is missing is requested from the
-maintainer. main.py only ever reads that file, and offers those references
-to the prover (citable by id), to the verifiers (the formal statements of
-the cited ones only) and to the planner and the reviser (an id + slogan
-shortlist, only while the collection is small enough to be one).
+proofs parse (parsing.py) is standalone: the conjecture's maintainer points
+it at conjectures/<name>/references/ (any .tex or .md file in it), it asks
+the model for the theorem-level results, and writes them as a strict-JSON
+array to conjectures/<name>/references.md, which the maintainer commits with
+the conjecture. The reference collection is a shared, committed artefact:
+every other user pulls references.md and never regenerates it, and a result
+they need that is missing is requested from the maintainer. main.py only
+ever reads that file, and offers those references to the prover (citable by
+id), to the verifiers (the formal statements of the cited ones only) and to
+the planner and the reviser (an id + slogan shortlist, only while the
+collection is small enough to be one).
 
 A conjecture directory may also carry a comments.md beside its
 conjecture.md: free-form operator notes on possible approaches to a proof or
@@ -160,20 +161,31 @@ a counterexample. The loop reads it once and hands it to the planner verbatim
 on every iteration as a "Human comments" section — the planner is told to
 treat it as suggestions to weigh (a viable suggested route should get one of
 the five candidates), not as instructions. No other agent sees the file, and
-a directory without one runs exactly as before. The file is gitignored and
-never committed or shared: each user keeps their own (".comments",
-"Comments").
+a directory without one runs without the section. The file is gitignored and
+never committed or shared: each user keeps their own.
 
---conjecture names a directory under conjectures/ holding a conjecture.md.
-DAG files are per user: conjectures/<name>/dags/<user_id>_dag.json holds
-the current user's lemmas (user_id from the config file, never emitted by
-a model), and the run reads every file in dags/ to see the complete DAG
-while writing new lemmas to its own file only. A lemma is identified by the
-pair (user_id, lemma_id); a lemma_id is unique only within one user's
-file, and no hashes are stored in the DAG files. Each acceptance of a
-lemma is also recorded as a certificate in
-conjectures/<name>/certificates/<verifier>.jsonl, the file of the user
-whose run accepted it, one JSON line per acceptance (.comments, "Certificates").
+Sharing a conjecture
+--------------------
+Several users work on one conjecture by committing, pushing and pulling its
+directory through git; nothing here runs git itself. DAG files are per
+user: conjectures/<name>/dags/<user_id>_dag.json holds one user's lemmas
+(user_id from the config file, never emitted by a model), and every
+command reads every file in dags/ to see the complete DAG while writing new
+lemmas to the current user's file only. A lemma is identified by the pair
+(user_id, lemma_id); a lemma_id is unique only within one user's file, and
+no hashes are stored in the DAG files.
+
+Trust is recorded beside the DAG, never in it. Each acceptance of a lemma
+is a certificate in conjectures/<name>/certificates/<verifier>.jsonl, the
+file of the user whose run accepted it (certificates.py); each rejection
+by proofs verify or proofs repair is a file in conjectures/<name>/
+refutations/ (refutations.py). Both carry the lemma's Merkle hash
+(merkle.py), so either one lapses on its own when the lemma, or anything it
+cites, changes. A lemma without a valid certificate, with a refutation
+that still matches it, or citing such a lemma is suspended (suspension.py):
+hidden from the planner, the selector and the prover until proofs verify or
+proofs repair re-accepts it. The conjecture is settled by an unsuspended
+lemma stating it, or its negation, verbatim (resolution.py).
 """
 
 import argparse
@@ -207,8 +219,10 @@ except ImportError:  # top-level modules (`python proofs/main.py`)
 # ----------------------------------------------------------------------------
 # Configuration (all overridable from the command line; see main())
 # ----------------------------------------------------------------------------
-# qwen3.8-27b — llama-server reached over the SSH tunnel on 8081
-# (the only live inference server on this machine).
+# The default --model, sent as the "model" field of every request. A hosted
+# API serves the model it names; a llama-server ignores it and answers with
+# whatever it loaded. Certificates and refutations do not record it but
+# _recorded_model(), the model that actually did the work.
 MODEL_NAME = "qwen3.8-27b"
 DEFAULT_CONJECTURE = "algebra_example"
 
@@ -218,20 +232,19 @@ BACKEND: Any = None
 PROFILE: Any = None
 
 # Resolved by workspace.resolve(): a prompt may be overridden per conjecture,
-# so these are paths rather than the bare filenames they used to be.
+# so these are paths rather than bare filenames.
 CONJECTURE_FILE = ""
 # Set in main(): the conjecture's root, the parent of DAGS_DIR. The
 # certificates/ directory with the certificate files lives here too
-# (.comments, "Certificates").
+# (see certificates.py).
 CONJECTURE_ROOT = ""
 # Set in main(): the user this run writes as, resolved from the config file
-# before the paths are (see .comments, "User identity"). The model never
+# before the paths are (see config.py). The model never
 # emits it; it is stored in every lemma the run commits.
 USER = ""
 # Set in main(): the per-user DAG files live here, one per user
 # (DAGS_DIR/<user_id>_dag.json). load_dag() merges every file in it into the
-# complete DAG; only DAG_FILE is ever written. See .comments,
-# "Per-user DAGs".
+# complete DAG; only DAG_FILE is ever written. See workspace.py.
 DAGS_DIR = ""
 # The current user's DAG file, DAGS_DIR/<user_id>_dag.json.
 DAG_FILE = ""
@@ -243,7 +256,7 @@ CHECKPOINT_FILE = ""
 REFERENCES_FILE = ""
 # Set in main(), beside REFERENCES_FILE: the optional, gitignored operator
 # notes the planner sees as "Human comments" — this user's own, never
-# committed or shared (see the module docstring; .comments, "Comments").
+# committed or shared (see the module docstring).
 COMMENTS_FILE = ""
 PROMPT_PATHS: Dict[str, str] = {name: name for name in workspace.PROMPT_FILES}
 
@@ -399,9 +412,10 @@ MAX_LOOP_RESTARTS = 3
 EXIT_NO_VERDICT = 3
 LOOP_RESTART_DELAY = 10
 
-# "auto" reproduces the original behaviour end to end. "human" stops at every
-# planning step. Set from --mode, then mutated by the hotkey and the menu, so
-# it is genuinely a run-time toggle rather than a launch-time one.
+# "auto" runs unattended: the selector agent picks from the shortlist.
+# "human" stops at every planning step. Set from --mode, then mutated by the
+# hotkey and the menu, so it is genuinely a run-time toggle rather than a
+# launch-time one.
 DEFAULT_MODE = "auto"
 MODE = DEFAULT_MODE
 HOTKEY_KEYS = "h"            # single keystroke; see interaction.HotKey
@@ -413,9 +427,8 @@ HOTKEY: interaction.HotKey = interaction.NullHotKey()
 # --num-ctx always wins — clamped only when the ceiling is a *probed*
 # llama-server -c (a fact), since on a non-llama.cpp endpoint the value on
 # record is a default, not a measurement, and clamping an explicit request
-# to a guess would defeat it. This constant stands in when the probe fails.
-# 65536 matches the Qwen3.8-27B reference launch line in llm_backend.py
-# (-c 65536).
+# to a guess would defeat it. This constant stands in when the probe fails,
+# and matches llm_backend.Profile's default context_limit.
 NUM_CTX = 65536
 # No static per-role generation budgets. reason() and extract() give every
 # call the full headroom — num_ctx minus the prompt, minus a safety margin —
@@ -428,7 +441,9 @@ NUM_CTX = 65536
 
 # Thinking level: True, or "low"/"medium"/"high"/"max" on models that support
 # levels. Set to None to omit the field entirely (the model's default).
-# Never set this to False — see the module docstring.
+# Never set this to False: reason() turns a False into None, because
+# turning thinking off is the backend's job, for schema calls only — see
+# the module docstring.
 #
 # These are requests, not guarantees. The backend checks them against the
 # probed capabilities and drops or downgrades: asking a non-thinking model to
@@ -526,6 +541,15 @@ MAX_COMPACTION_PASSES = 2
 # Set at runtime if schema-constrained extraction proves incompatible with the
 # model's default thinking (empty content, output stranded in .thinking).
 _SCHEMA_MODE_BROKEN = False
+
+
+def _recorded_model() -> str:
+    """The model name certificates and refutations record: the model that
+    did the work, as llm_backend's recorded_model() reads it — the file a
+    llama-server loaded, or the model a hosted API's reply names — rather
+    than the --model request, which a llama-server ignores. MODEL_NAME
+    before a backend exists."""
+    return BACKEND.recorded_model() if BACKEND is not None else MODEL_NAME
 
 
 def log(message: str, verbose: bool = True) -> None:
@@ -670,13 +694,13 @@ def lemma_id_set(
     suspended: Optional[Set[Tuple[str, str]]] = None,
 ) -> Set[str]:
     """Every lemma_id in the complete DAG, whoever proved it: the id space
-    a new lemma must not restate, the way the old single-file DAG's
-    'already in the DAG' test meant it.
+    a new lemma must not restate — the "already in the DAG" test, taken
+    across every user's file.
 
     Given the suspension (suspension.Suspension.suspended, recomputed from
-    the hashes, the certificates and the refutations — ".comments",
-    "Suspension"), a suspended lemma's id is not in this set: the id is up
-    for grabs again, for the users whose files do not hold it — a proof
+    the hashes, the certificates and the refutations — see suspension.py), a
+    suspended lemma's id is not in this set: the id is up for grabs again,
+    for the users whose files do not hold it — a proof
     under an id the DAG holds only under suspension is a fresh proof, not a
     build on the suspended lemma, and screening it out would make the id
     dead for everyone until the suspended node is repaired. The suspended
@@ -695,13 +719,12 @@ def _warn_suspended(
     warned: Optional[Set[Tuple[str, str]]] = None,
     dag: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """The run's warning for the suspended lemmas (".comments",
-    "Suspension"): a lemma with a refutation whose hash matches it, or
-    without a valid certificate, or citing a lemma that has either, is
-    hidden from the planner, the selector and the prover, and the operator
-    is told so. With a warned set, once per lemma per run, the way the
-    dangling-citation warning is told; without one, about every suspended
-    lemma now.
+    """The run's warning for the suspended lemmas (see suspension.py): a
+    lemma with a refutation whose hash matches it, or without a valid
+    certificate, or citing a lemma that has either, is hidden from the
+    planner, the selector and the prover, and the operator is told so. With
+    a warned set, once per lemma per run, the way the dangling-citation
+    warning is told; without one, about every suspended lemma now.
 
     One case gets its own message: a lemma committed but never certified —
     suspended only for having no certificate, with no refutation and no
@@ -878,7 +901,7 @@ def _check_prover_citations(
     suspended: Optional[Set[Tuple[str, str]]] = None,
 ) -> Tuple[List[Tuple[str, str]], List[str], List[Tuple[str, str]]]:
     """The prover's declared citations, normalized and checked against the
-    complete DAG (.comments, "Citations").
+    complete DAG (see load_dag()).
 
     cited_lemmas is an array of {"user_id", "lemma_id"} objects, every pair
     of which is checked against the complete DAG; cited_references is a
@@ -892,7 +915,7 @@ def _check_prover_citations(
     The caller sends the unmatched back to the prover as feedback; the
     "reference" ones are the maintainer's to supply, since references.md is
     the conjecture's committed collection and only the maintainer adds to
-    it (.comments, "References").
+    it (see parsing.py).
 
     Lenient on shape, strict on existence: a bare id in cited_lemmas that
     is a reference id (or exactly one lemma's id) is read as the citation
@@ -902,7 +925,7 @@ def _check_prover_citations(
 
     Given the suspension, a suspended lemma is unmatched too, as
     "suspended": the prover was not shown it and may not build on it
-    (".comments", "Suspension"). Let through, it would suspend the new
+    (see suspension.py). Let through, it would suspend the new
     lemma the moment it was committed — and in a repair, a citation of the
     lemma being re-proved, or of one of its dependents (all suspended by
     the rejection that started the repair), would close a citation cycle
@@ -985,7 +1008,7 @@ def load_dag() -> Dict[str, Any]:
     is unique only within one user's file, so the pair is the only key that
     cannot collide. Every node carries both fields, with the file's name
     authoritative for its owner. Citations are stored the same way
-    (.comments, "Citations"): cited_lemmas is an array of {"user_id",
+    (see load_dag()): cited_lemmas is an array of {"user_id",
     "lemma_id"} objects, read in memory as a list of (user_id, lemma_id)
     tuples, and cited_references a separate array of bare reference ids.
     Older files may still carry the mixed "dependencies" list (pair objects
@@ -1031,7 +1054,7 @@ def load_dag() -> Dict[str, Any]:
             if key not in dag["lemmas"]:
                 dag["lemmas"][key] = node
     # Second pass: split each node's citations into the two stored fields
-    # (.comments, "Citations"). A lemma citation is the (user_id, lemma_id)
+    # (see load_dag()). A lemma citation is the (user_id, lemma_id)
     # pair its file names it, a reference citation the reference's bare id.
     # Older files still carry the mixed "dependencies" list (pair objects
     # and bare reference ids in one field): a pair object becomes a lemma
@@ -1112,7 +1135,7 @@ def load_user_dag() -> Dict[str, Any]:
 def _user_header() -> Dict[str, str]:
     """The user identity stamped at the top of the per-user files this run
     writes as its own user: the config's user.id, user.name and user.email
-    (".comments", "User identity") — user.id is the run's USER, the file's
+    (see config.py) — user.id is the run's USER, the file's
     name, and name and email are whatever the config holds, the empty
     string where it holds none. The DAG file carries it as the first
     entries of its object, the certificate file as its first line: the
@@ -1131,7 +1154,7 @@ def _write_user_file(data: Dict[str, Any]) -> None:
     from several threads at once, and a plain open("w") lets a reader catch
     the file mid-write (an empty or half-formed file) and crash the loop on
     the parse. The file's first entries are the run's user identity, the
-    header the per-user files carry (".comments", "User identity"), kept
+    header the per-user files carry (see config.py), kept
     at the top and refreshed from the config on every write."""
     header = _user_header()
     data = {**header, **{k: v for k, v in data.items() if k not in header}}
@@ -1188,20 +1211,20 @@ def save_user_dag(dag: Dict[str, Any]) -> None:
 def commit_lemma_to_dag(
     lemma_id: str, node: Dict[str, Any]
 ) -> Tuple[str, bool]:
-    """Commit node to the current user's DAG file under lemma_id, or under
-    a fresh non-colliding id if lemma_id is already taken in that file. The
-    id check and the write are one step under the DAG lock, so the check
-    can never go stale: a writer that finds its id taken commits under
+    """Commit node to the current user's DAG file under lemma_id, or under a
+    fresh non-colliding id if lemma_id is already taken in that file. The id
+    check and the write are one step under the DAG lock, so the check can
+    never go stale: a writer that finds its id taken commits under
     lemma_id_2 (or _3, ...) rather than over the first proof, and the
-    renamed node carries "renamed_from" so the DAG stays self-explanatory.
-    A collision is with the current user's own lemmas: lemma_id is unique
-    only within one user's DAG, so a lemma another user proved under the
-    same id is no collision at all. The node is stored with its user_id and
-    lemma_id and its citations in the two stored fields (.comments,
-    "Citations"): cited_lemmas as {"user_id", "lemma_id"} objects,
-    cited_references as bare ids — no hashes, anywhere in the file — and
-    the moment of the commit as proved_at (the lemma window's recency).
-    Returns (committed_id, renamed)."""
+    renamed node carries "renamed_from" so the DAG stays self-explanatory. A
+    collision is with the current user's own lemmas: lemma_id is unique only
+    within one user's DAG, so a lemma another user proved under the same id
+    is no collision at all. The node is stored with its user_id and lemma_id
+    and its citations in the two stored fields (see load_dag()):
+    cited_lemmas as {"user_id", "lemma_id"} objects, cited_references as
+    bare ids — no hashes, anywhere in the file — and the moment of the
+    commit as proved_at (the lemma window's recency). Returns (committed_id,
+    renamed)."""
     with DAG_LOCK:
         data = load_user_dag()
         lemmas = data.get("lemmas")
@@ -1238,7 +1261,7 @@ def commit_lemma_to_dag(
 # ----------------------------------------------------------------------------
 # Certificates
 # ----------------------------------------------------------------------------
-# The record that a lemma was accepted (.comments, "Certificates"). The run
+# The record that a lemma was accepted (see certificates.py). The run
 # writes a certificate the moment an acceptance happens — the three verifier
 # checks accepting a proof, or the operator asserting one in human mode —
 # into this run's user's file, the verifier's, whoever owns the lemma. The storage, the upsert rule and the validity check
@@ -1259,9 +1282,9 @@ def record_certificate(
 
     owner is the lemma's owner, the certificate's user_id. It defaults to
     the current user: the run commits only its own lemmas, while proofs
-    repair commits a re-proof in place in the owner's file (".comments",
-    "Repair"). The verifier is either way the user whose run accepted the
-    proof, and the line goes into that user's certificates/ file — never
+    repair commits a re-proof in place in the owner's file (see
+    repair_entry()). The verifier is either way the user whose run accepted
+    the proof, and the line goes into that user's certificates/ file — never
     the owner's.
     """
     owner = owner or USER
@@ -1301,7 +1324,7 @@ def record_certificate(
 
 # ----------------------------------------------------------------------------
 # Verify and repair: the verification path proofs verify and proofs repair
-# share (".comments", "Verify", "Refutations", "Repair")
+# share (see verify_entry(), refutations.py, repair_entry())
 # ----------------------------------------------------------------------------
 # A lemma that is already in the DAG is verified the way the proof loop
 # verifies a proposed proof: the three verifier agents in order, each a
@@ -1309,12 +1332,11 @@ def record_certificate(
 # verifiers are not all for is not accepted, whatever the rest would say).
 # What differs from the loop is what the verdict does to the record, and
 # only proofs verify and proofs repair do this: a rejection writes a
-# refutation file (".comments", "Refutations"), an acceptance issues the
-# certificate the Certificates section requires of a verify or repair
-# acceptance, and the refutations whose justifications were on the table
-# are dismissed. proofs run never takes this path: a rejection inside the
-# loop is feedback to its own reviser, not a committed record, and
-# refutations are not made during the run.
+# refutation file (see refutations.py), an acceptance issues a certificate
+# (see certificates.py), and the refutations whose justifications were on
+# the table are dismissed. proofs run never takes this path: a rejection
+# inside the loop is feedback to its own reviser, not a committed record,
+# and refutations are not made during the run.
 
 
 def _citation_closure(
@@ -1360,8 +1382,7 @@ def _dependent_chain(
     """start's transitive dependents in dependency order: every lemma of
     the DAG that cites start directly or transitively, each before the
     lemmas that cite it — the reverse of _citation_closure's order, the
-    order proofs repair climbs the dependency chain (".comments",
-    "Repair").
+    order proofs repair climbs the dependency chain (see repair_entry()).
 
     The set is the reverse-citation closure of start; the order is a
     post-order depth-first pass over the set's own citations, so a lemma
@@ -1419,7 +1440,7 @@ def _dependency_order(
 ) -> List[Tuple[str, str]]:
     """The given lemmas in dependency order: every lemma after the lemmas
     it cites, dependencies first — the order proofs export writes them in
-    (".comments", "Export"), each result resting on the ones above it.
+    (see export.py), each result resting on the ones above it.
 
     A post-order depth-first pass over the set's own citations, the way
     _citation_closure and _dependent_chain order their sets: a citation
@@ -1456,12 +1477,12 @@ def _dependency_order(
 def _replace_lemma_in_owner_file(
     owner: str, lemma_id: str, node: Dict[str, Any]
 ) -> None:
-    """Replace the lemma in place in the owner's DAG file (".comments",
-    "Repair"): the (user_id, lemma_id) pair the refutation named is kept,
-    in the owner's file, and the node's statement, proof and citations are
-    what the re-proof established. Unlike the run's commit, which writes
-    only the current user's file, this may write another user's file —
-    the repair's one cross-user write, and the section allows it.
+    """Replace the lemma in place in the owner's DAG file (see
+    repair_entry()): the (user_id, lemma_id) pair the refutation named is
+    kept, in the owner's file, and the node's statement, proof and citations
+    are what the re-proof established. Unlike the run's commit, which writes
+    only the current user's file, this may write another user's file — the
+    only write to another user's DAG file anywhere in the system.
 
     The node is stored in the pipeline's commit shape — statement, proof,
     the cited_lemmas pair objects, cited_references, user_id, lemma_id,
@@ -1529,15 +1550,15 @@ def verify_stored_lemma(
     verbose: bool,
 ) -> Tuple[str, Optional[str]]:
     """The three verifier checks on a lemma that is already in the DAG,
-    with the Refutations section's bookkeeping around them.
+    with the refutation bookkeeping around them (see refutations.py).
 
     The lemma's current Merkle hash is recomputed from the DAG and
     references as they stand now, and every refutation file the lemma has
     is loaded. A refutation counts while its hash matches the current
     one (refutations.is_counting); the ones that do not are stale —
     objections to versions of the lemma that are no longer in the files —
-    and the stale justifications are the ones the section says must be
-    passed to the verifiers, so a known objection is not forgotten. The
+    and their justifications are passed to the verifiers all the same,
+    so a known objection is not forgotten. The
     counting ones go on the table as well, marked as such: an objection
     to the proof as it stands now is the one a re-verification is
     answering, and proofs repair runs on exactly that case. A lemma with
@@ -1549,7 +1570,7 @@ def verify_stored_lemma(
     happened. An acceptance issues the certificate — the owner's file,
     the verifier recorded the way a certificate records it — and
     dismisses the refutations whose justifications were on the table: the
-    stale ones the section names, and the counting ones, answered.
+    stale ones, and the counting ones, answered.
 
     A step that gives no verdict at all (_run_verifier's "": the server
     failed or replied with nothing, the reply could not be read, or the
@@ -1635,7 +1656,7 @@ def verify_stored_lemma(
         )
         if decision == "reject":
             path = refutations.record(
-                CONJECTURE_ROOT, user_id, lemma_id, h, USER, MODEL_NAME,
+                CONJECTURE_ROOT, user_id, lemma_id, h, USER, _recorded_model(),
                 "reject", justification,
             )
             log(f"🚫 Refutation for {lemma_id} written: {path}", verbose)
@@ -1650,13 +1671,13 @@ def verify_stored_lemma(
             return "no_verdict", justification
     try:
         certificates.record(
-            CONJECTURE_ROOT, user_id, lemma_id, h, USER, MODEL_NAME,
+            CONJECTURE_ROOT, user_id, lemma_id, h, USER, _recorded_model(),
             user=_user_header(),
         )
     except OSError as e:
         log(f"⚠️  Could not write the certificate for {lemma_id}: {e}", verbose)
     log(
-        f"📜 Certificate for {lemma_id}: accepted by {USER} (model {MODEL_NAME}).",
+        f"📜 Certificate for {lemma_id}: accepted by {USER} (model {_recorded_model()}).",
         verbose,
     )
     for path, _ref in on_file:
@@ -1693,13 +1714,8 @@ def _verify_session(
     unchanged. user_id is the user running the verification: the verifier
     of record in any certificate issued and any refutation written.
 
-    The model the verification is recorded under is the model the server
-    says it is serving (".comments", "Model name"): the file name a
-    llama-server loaded, or the id the endpoint lists, which is what the
-    certificate and refutation this session writes must say, since an
-    alias in --model is not the model that verified anything. The name
-    --model asked for stays in the banner; when the server reported no
-    name, the requested one is the best record there is.
+    The certificates and refutations this session writes name the model
+    _recorded_model() reports, not the --model request.
     """
     global MODEL_NAME, CONJECTURE_FILE, CONJECTURE_ROOT, DAGS_DIR, DAG_FILE
     global REFERENCES_FILE, COMMENTS_FILE, USER, BACKEND, PROFILE, NUM_CTX
@@ -1711,8 +1727,6 @@ def _verify_session(
     PROFILE = BACKEND.probe()
     if PROFILE.auth_error:
         parser.error(PROFILE.auth_error)
-    if PROFILE.model_name:
-        MODEL_NAME = PROFILE.model_name
     if num_ctx is None:
         NUM_CTX = PROFILE.context_limit
     elif PROFILE.probed_llama_cpp:
@@ -1758,12 +1772,11 @@ def verify_entry(
     verbose: bool,
     parser: argparse.ArgumentParser,
 ) -> int:
-    """proofs verify PATH lemma_id [--full] (".comments", "Verify"): the
-    three verifier checks on the stored proof of a lemma that is already
-    in the DAG, with the Refutations and Certificates bookkeeping that
-    verify carries — a rejection writes a refutation file, an acceptance
-    issues a certificate and dismisses the refutations whose
-    justifications were on the table.
+    """proofs verify PATH lemma_id [--full]: the three verifier checks on
+    the stored proof of a lemma that is already in the DAG, with the
+    refutation and certificate bookkeeping that verify carries — a
+    rejection writes a refutation file, an acceptance issues a certificate
+    and dismisses the refutations whose justifications were on the table.
 
     PATH is the lemma's user's DAG file, which supplies the lemma's
     user_id (owner, the file's name the way load_dag reads it), and the
@@ -1790,9 +1803,9 @@ def verify_entry(
         )
     order = _citation_closure(dag, owner, lemma_id) if full else [(owner, lemma_id)]
     # Suspension is computed, not stored, and it does not reach in here:
-    # verify loads the suspended lemmas too (".comments", "Suspension") —
-    # it is the path back to them. The warning is the section's: a lemma
-    # the run must not build on is named as one.
+    # verify loads the suspended lemmas too (see suspension.py) —
+    # it is the path back to them. The warning names a lemma the run must
+    # not build on as one.
     susp = suspension.compute(dag["lemmas"], references, CONJECTURE_ROOT)
     for u, lid in order:
         if susp.has(u, lid):
@@ -1846,8 +1859,8 @@ def repair_entry(
     tool_mode: str = TOOL_MODE,
     lemmas_common: int = LEMMAS_COMMON,
 ) -> int:
-    """proofs repair path_to_refutation (".comments", "Refutations",
-    "Repair"): the refutation file supplies the lemma's user_id and
+    """proofs repair path_to_refutation (see refutations.py,
+    repair_entry()): the refutation file supplies the lemma's user_id and
     lemma_id, so nothing else names the lemma.
 
     The first step is to re-verify the existing proof with the
@@ -1864,8 +1877,8 @@ def repair_entry(
     feedback. The repair re-proves the lemma, and the lemma keeps its
     id, so the engine runs with decomposition off: the reviser's options
     are keep and revise only. An accepted proof is committed in place —
-    the same user_id and lemma_id, in the owner's file, the section's
-    one cross-user write — certified, and the lemma's refutations
+    the same user_id and lemma_id, in the owner's file, the one write to
+    another user's DAG file — certified, and the lemma's refutations
     dismissed.
 
     Because the new proof changes the lemma's hash, and so the hash of
@@ -1928,8 +1941,8 @@ def repair_entry(
     log(f"Repairing {owner}:{lemma_id} from {p.name}", verbose)
     # The lemma a refutation names is usually suspended (the refutation may
     # be stale, but the files say so only once they are read), and the
-    # repair is precisely the case the suspension warns about (".comments",
-    # "Suspension").
+    # repair is precisely the case the suspension warns about (see
+    # suspension.py).
     susp = suspension.compute(dag["lemmas"], references, CONJECTURE_ROOT)
     if susp.has(owner, lemma_id):
         log(
@@ -1982,7 +1995,7 @@ def repair_entry(
             return 0
 
         # The re-verification rejected the stored proof and wrote a new
-        # refutation for the rejection. The Repair section's next step:
+        # refutation for the rejection. The repair's next step:
         # re-prove the lemma through the prover, verifier and reviser,
         # the rejection's justification as the prover's first feedback,
         # and on acceptance commit the new proof in place under the same
@@ -2007,7 +2020,7 @@ def repair_entry(
         ref_ids = {str(r["id"]) for r in references}
 
         def reprove(u: str, lid: str, justification: Optional[str]) -> bool:
-            """The Repair section's re-proof of the stored lemma (u, lid):
+            """The repair's re-proof of the stored lemma (u, lid):
             the engine's prover -> verifier -> reviser rounds on the
             lemma's statement as it stands in the file, the rejection's
             justification as the prover's first feedback, decomposition
@@ -2057,7 +2070,7 @@ def repair_entry(
             def on_proof(proof_lid: str, proof_node: Dict[str, Any]) -> str:
                 with _commit_section():
                     _replace_lemma_in_owner_file(u, proof_lid, proof_node)
-                    record_certificate(proof_lid, MODEL_NAME, verbose, owner=u)
+                    record_certificate(proof_lid, _recorded_model(), verbose, owner=u)
                 return proof_lid
 
             result = run_proof_loop(
@@ -2220,24 +2233,24 @@ def prune_entry(
     user_id: str,
     parser: argparse.ArgumentParser,
 ) -> int:
-    """proofs prune DIR (".comments", "Prune"): recompute the Merkle hash
-    of every lemma in the conjecture and drop the current user's
-    certificates that no longer match.
+    """proofs prune DIR: recompute the Merkle hash of every lemma in the
+    conjecture and drop the current user's certificates that no longer
+    match.
 
     No model is involved — the hash is a function of the DAG files and
     references.md alone, the way certificates are checked everywhere else
-    (".comments", "Certificates") — so this entry sets only the file
-    globals load_dag() and load_references() read: no backend, no
-    probe, no prompt. It writes exactly one file, the user's own
-    certificate file, and never another user's (".comments", "Prune"):
-    only the certificates the user issued as verifier are pruned, whoever
-    owns the lemmas they cover.
+    (see certificates.py) — so this entry sets only the file globals
+    load_dag() and load_references() read: no backend, no probe, no
+    prompt. It writes exactly one file, the user's own certificate file,
+    and never another user's: only the certificates the user issued as
+    verifier are pruned, whoever owns the lemmas they cover.
+
     A line goes when its lemma's hash has moved (the proof, the statement,
     or something below it changed), when the lemma is no longer in the
     DAG at all, or when the lemma has no hash any more (a citation cycle,
     the case suspension.compute reads as "no certificate is valid for
-    it") — a certificate that matches nothing is the stale record the
-    section exists to clear, and the log names which case each line was.
+    it") — a certificate that matches nothing is the stale record prune
+    exists to clear, and the log names which case each line was.
 
     Returns the exit code: 0 when the prune ran (including a no-op), 1
     when the user's certificate file could not be read or rewritten.
@@ -2302,31 +2315,32 @@ def status_entry(
     user_id: str,
     parser: argparse.ArgumentParser,
 ) -> int:
-    """proofs status PATH lemma_id (".comments", "Status"): for each lemma
-    in the named lemma's dependency closure, list every valid
-    certificate, each with its verifier, model, date and count.
+    """proofs status PATH lemma_id: for each lemma in the named lemma's
+    dependency closure, list every valid certificate, each with its
+    verifier, model, date and count — then whether the conjecture is
+    settled.
 
     No model is involved — a certificate is valid only while its hash
-    matches the lemma's current Merkle hash (".comments",
-    "Certificates"), and that hash is a function of the DAG files and
-    references.md alone, the way prune's recomputation is — so this entry
-    sets only the file globals load_dag() and load_references() read: no
-    backend, no probe, no prompt. It reads the DAG files, references.md
-    and the certificate files, and writes nothing.
+    matches the lemma's current Merkle hash (see certificates.py), and that
+    hash is a function of the DAG files and references.md alone, the way
+    prune's recomputation is — so this entry sets only the file globals
+    load_dag() and load_references() read: no backend, no probe, no prompt.
+    It reads the DAG files, references.md and the certificate files, and
+    writes nothing.
 
     The closure is the lemma's citation closure in dependency order
-    (_citation_closure): the dependencies first, the target last, the
-    order proofs verify --full verifies in. A certificate is valid for a
-    lemma only while its hash matches the lemma's current Merkle hash
+    (_citation_closure): the dependencies first, the target last, the order
+    proofs verify --full verifies in. A certificate is valid for a lemma
+    only while its hash matches the lemma's current Merkle hash
     (certificates.is_valid), and the pair's lines are spread over every
-    verifier's file, certificates/<verifier>.jsonl, the way record()
-    writes them, so all the files are read (certificates.load_all); each
-    valid line is listed with the four fields the section
-    names. A line for the pair whose hash no longer matches is stale —
-    the record of an acceptance of a version of the lemma that is no
-    longer in the files — and is counted, not listed. A lemma whose hash
-    cannot be computed (a citation cycle) has no valid certificate: no
-    hash exists for a line to match, the case prune logs the same way.
+    verifier's file, certificates/<verifier>.jsonl, the way record() writes
+    them, so all the files are read (certificates.load_all); each valid line
+    is listed with its verifier, model, date and count. A line for the pair
+    whose hash no longer matches is stale — the record of an acceptance of a
+    version of the lemma that is no longer in the files — and is counted,
+    not listed. A lemma whose hash cannot be computed (a citation cycle) has
+    no valid certificate: no hash exists for a line to match, the case prune
+    logs the same way.
 
     Returns the exit code: 0 when the status was reported.
     """
@@ -2409,7 +2423,7 @@ def status_entry(
 
 
 # ----------------------------------------------------------------------------
-# Export: the LaTeX document of a DAG (".comments", "Export")
+# Export: the LaTeX document of a DAG (see export.py)
 # ----------------------------------------------------------------------------
 def export_entry(
     *,
@@ -2421,7 +2435,7 @@ def export_entry(
     user_id: str,
     parser: argparse.ArgumentParser,
 ) -> int:
-    """proofs export PATH [lemma_id] (".comments", "Export"): write the
+    """proofs export PATH [lemma_id] (see export.py): write the
     LaTeX document of the DAG, in dependency order.
 
     No model is involved — the document is a function of the DAG files,
@@ -2441,14 +2455,14 @@ def export_entry(
     a section always stands on the sections above it when they are its
     dependencies.
 
-    What PATH names is what the document holds, the way the .comments
-    splits it: with owner None (PATH was the conjecture directory) it is
-    the complete DAG, every user's lemmas; with owner set (PATH was that
-    user's DAG file) it is that user's lemmas, or — with lemma_id — that
-    lemma and everything it cites, whichever user's file each dependency
-    is in, the _citation_closure order, the same order proofs verify
-    --full verifies in. A user's lemmas and the complete DAG are ordered
-    by _dependency_order over the set they are: an export of one user's
+    What PATH names is what the document holds (see export.py): with owner
+    None (PATH was the conjecture directory) it is the complete DAG, every
+    user's lemmas; with owner set (PATH was that user's DAG file) it is that
+    user's lemmas, or — with lemma_id — that lemma and everything it cites,
+    whichever user's file each dependency is in, the _citation_closure
+    order, the same order proofs verify --full verifies in. A user's
+    lemmas and the complete DAG are ordered by _dependency_order over the
+    set they are: an export of one user's
     lemmas writes that user's lemmas, and the dependencies in the other
     users' files are not pulled in — they are cross-referenced, and each
     user's export writes its own.
@@ -3198,9 +3212,9 @@ def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
     budget, after a long generation.
 
     The prompt size used to be estimated as chars // 4. That is optimistic for
-    LaTeX-dense text and, worse, it is tokenizer-specific — the whole point of
-    this project is now to run the same conjecture through four different
-    tokenizers. llm_backend.chars_per_token() reads the running estimate that
+    LaTeX-dense text and, worse, it is tokenizer-specific — and the users
+    sharing a conjecture may each run a different model, with a different
+    tokenizer. llm_backend.chars_per_token() reads the running estimate that
     note_usage() revises from each call's real prompt token count, so the
     estimate converges on the truth for whichever model is loaded.
 
@@ -3947,10 +3961,11 @@ def planner_dag_view(
 
     Given the suspension, the suspended lemmas are not in the view: a
     refuted or uncertified lemma is not a proved lemma, and the planner
-    must not be told it is one (".comments", "Suspension"). (The view is
-    the hiding the section names: the selector sees it through
-    planner_dag_view, and the screening's id test through
-    lemma_id_set — the three agents the section hides it from.)
+    must not be told it is one (see suspension.py). (This view is
+    part of how a suspended lemma is hidden from the planner, the selector
+    and the prover: the selector sees it through planner_dag_view, the
+    prover through prover_context, and the screening's id test through
+    lemma_id_set.)
 
     Only the lemma window is listed in full; the rest of the proved
     lemmas are in other_proved_lemmas by id (lemma_window).
@@ -4016,7 +4031,7 @@ def prover_context(
 
     Given the suspension, the suspended lemmas are not in the view: the
     prover may not build on a lemma that is not to be built on, and a proof
-    that cites one would inherit its suspension (".comments", "Suspension").
+    that cites one would inherit its suspension (see suspension.py).
 
     Only the lemma window is listed in full; the rest of the proved
     lemmas are in other_proved_lemmas by id (lemma_window).
@@ -4059,16 +4074,15 @@ def verifier_context(
     DAG lemmas and reference results are merged into one set and carry the
     statement only: a lemma citation (the (user_id, lemma_id) pair) is keyed
     by the "user:lemma" spelling of the pair, a reference by its bare id.
-    The two lists are the citation check's output (.comments,
-    "Citations"): every pair is a lemma of the complete DAG and every id a
-    reference of the collection, so a statement missing here names a
-    citation the check let through — the verifier sees the gap as an absent
-    result.
-    Deliberately not the whole DAG or the whole reference collection: the
-    verifier agents are asked to reject "use of results not present in the
-    provided set", which only bites if the set is the prover's declared
-    citations: a proof leaning on a result it never declared then reads as
-    an unjustified leap, which is what it is.
+    The two lists are the citation check's output (see load_dag()): every
+    pair is a lemma of the complete DAG and every id a reference of the
+    collection, so a statement missing here names a citation the check let
+    through — the verifier sees the gap as an absent result. Deliberately
+    not the whole DAG or the whole reference collection: the verifier agents
+    are asked to reject "use of results not present in the provided set",
+    which only bites if the set is the prover's declared citations: a proof
+    leaning on a result it never declared then reads as an unjustified leap,
+    which is what it is.
     """
     statements: Dict[str, Dict[str, str]] = {}
     for pair in cited_lemmas:
@@ -4130,17 +4144,17 @@ def scan_citations(
 
 
 def load_references() -> List[Dict[str, Any]]:
-    """Load references.md — parsing.py's output.
+    """Load references.md — proofs parse's output (parsing.py).
 
     A strict JSON array of { id, slogan, "formal statement", reference } objects.
     The file is the conjecture's committed reference
-    collection (.comments, "References"): the maintainer parses it and
+    collection (see parsing.py): the maintainer parses it and
     commits it, every other user pulls it, and this module only ever reads
     it — a missing or corrupt file is never repaired here.
-    A missing file returns [], which is exactly the pre-features run: every
-    call site degrades to the old prompts. A corrupt file warns and returns
-    [] too — the right fix is for the maintainer to re-run parsing.py, not
-    to hand the loop a subset. Ids (ref_N) are assigned by parsing.py,
+    A missing file returns [], and every call site degrades to prompts
+    with no references section. A corrupt file warns and returns [] too —
+    the right fix is for the maintainer to re-run proofs parse, not to
+    hand the loop a subset. Ids (ref_N) are assigned by parsing.py,
     never here, so a prover that cites one is citing a name the file vouches
     for.
     """
@@ -4154,7 +4168,7 @@ def load_references() -> List[Dict[str, Any]]:
         data = json.loads(text)
     except (OSError, json.JSONDecodeError) as e:
         log(f"⚠️  {REFERENCES_FILE} is not valid JSON ({e}); ignoring it. "
-            f"Re-run parsing.py if you expected references here.")
+            f"Re-run proofs parse if you expected references here.")
         return []
     if not isinstance(data, list):
         log(f"⚠️  {REFERENCES_FILE} is not a JSON array; ignoring it.")
@@ -4217,7 +4231,7 @@ def screen_candidates(
     problem list means the candidate is ready for the prover.
 
     Given the suspension, the test runs against the lemmas that are not
-    suspended (".comments", "Suspension"): a candidate that restates a
+    suspended (see suspension.py): a candidate that restates a
     suspended lemma's id is not screened out, because a proof under that id
     is a fresh proof, not a build on the suspended lemma — the id is up for
     grabs for the users whose files do not hold it, and screening it out
@@ -4470,7 +4484,7 @@ def run_proof_loop(
     one.
 
     `suspended` is the suspension as the caller computed it this round
-    (".comments", "Suspension"): the prover's context and the reviser's
+    (see suspension.py): the prover's context and the reviser's
     view of the DAG omit the suspended lemmas, so the proof cannot build on
     them. A target that restates a suspended lemma's id is a fresh proof,
     not a build on the suspended lemma: the commit lands in this run's
@@ -4569,7 +4583,7 @@ def run_proof_loop(
         # prover.md instructs the model to reply with {"lemma_id",
         # "cited_lemmas", "cited_references", "proof"} — the two citation
         # lists are separate: pair objects for lemmas, bare ids for
-        # references (.comments, "Citations"). We parse that JSON locally
+        # references (see load_dag()). We parse that JSON locally
         # rather than via a second model call, so the proof text can never
         # be abridged or paraphrased; if the model ignored the format, its
         # content is taken verbatim as the proof.
@@ -4778,7 +4792,7 @@ def run_proof_loop(
         last_proof = proof
 
         # The DAG's edges now come from here, in the two stored fields
-        # (.comments, "Citations"): cited_lemmas, an array of
+        # (see load_dag()): cited_lemmas, an array of
         # {"user_id", "lemma_id"} objects, and cited_references, an array
         # of bare reference ids. A response with neither list means the
         # prover ignored its format, and scanning the text beats recording
@@ -5155,13 +5169,15 @@ def _serial_on_proof(
     """The serial success boundary: commit the lemma through the same
     check-and-write as the parallel run, so the engine's on_proof
     contract — return the id the lemma was committed under — holds in both
-    modes. A serial run has a single writer, so the id is never already
-    taken and the rename branch stays cold."""
+    modes. A serial run has a single writer, so the id is rarely taken —
+    typically because the user's own file already holds a suspended lemma
+    under it, an id the screening lets through — and the commit is then
+    renamed beside it."""
     with _commit_section():
         committed, _renamed = commit_lemma_to_dag(lemma_id, node)
         # All three verifier checks accepted this proof: it is certified,
         # the serial way the parallel on_proof below is.
-        record_certificate(committed, MODEL_NAME, verbose)
+        record_certificate(committed, _recorded_model(), verbose)
     return committed
 
 
@@ -5347,7 +5363,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         dag = load_dag()
 
         # The suspension, recomputed from the hashes, the certificates and
-        # the refutations as they stand now (".comments", "Suspension"): the
+        # the refutations as they stand now (see suspension.py): the
         # lemmas this iteration's planner, selector and prover are hidden
         # from. It is never stored in the DAG — this recomputation is the
         # only record of it — so a lemma re-proved and certified since the
@@ -5537,7 +5553,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                         )
                         # The operator's acceptance is certified too, with an
                         # empty model: a person vouching, not a machine
-                        # (.comments, "Certificates").
+                        # (see certificates.py).
                         record_certificate(committed_id, "", verbose)
                     continue
                 elif choice.lemma is not None:
@@ -6152,8 +6168,8 @@ def _parallel_planner(
         # would then clear the stale flag mark_plan_stale had just set.
         dag_version_before = state.dag_version_snapshot()
         dag = load_dag()
-        # The suspension as this round stands to be planned (".comments",
-        # "Suspension"): the planner's view omits the suspended lemmas, and
+        # The suspension as this round stands to be planned (see
+        # suspension.py): the planner's view omits the suspended lemmas, and
         # the warning is told here, where every DAG change is seen.
         susp = suspension.compute(dag["lemmas"], load_references(), CONJECTURE_ROOT)
         _warn_suspended(susp, verbose, warned, dag)
@@ -6436,8 +6452,8 @@ def _parallel_human_step(
                         verbose,
                     )
                 # The operator's acceptance is certified too, under the id it
-                # was committed under, with an empty model (.comments,
-                # "Certificates").
+                # was committed under, with an empty model (see
+                # certificates.py).
                 record_certificate(committed, "", verbose)
             continue
         # 'prove': a buffer lemma, claimed atomically, or a written one.
@@ -6495,8 +6511,8 @@ def _parallel_proof_loop(
         verbose,
     )
     while state.running():
-        # The suspension as this claim stands to be run (".comments",
-        # "Suspension"): the prover's context and the reviser's view omit
+        # The suspension as this claim stands to be run (see
+        # suspension.py): the prover's context and the reviser's view omit
         # its lemmas, and the "already in the DAG" test below runs against
         # the lemmas that are not suspended — a suspended lemma a previous
         # run died re-proving is not "already in the DAG" for this test, it
@@ -6619,7 +6635,7 @@ def _parallel_proof_loop(
                 # the _serial_on_proof boundary is: it is certified, under the id
                 # it was committed under (a renamed id is the lemma that is in the
                 # DAG now).
-                record_certificate(committed, MODEL_NAME, verbose)
+                record_certificate(committed, _recorded_model(), verbose)
             return committed
         result = run_proof_loop(
             verbose=verbose,
@@ -6918,7 +6934,8 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     argv is the argument list (defaults to sys.argv[1:]); prog is the name
     usage lines show. The proofs command calls this as
     main(argv=["--conjecture", DIR, ...], prog="proofs run"); running the
-    file directly is unchanged.
+    file directly (python proofs/main.py --conjecture NAME) parses
+    sys.argv the same way.
     """
     global MODEL_NAME, CONJECTURE_FILE, CONJECTURE_ROOT, DAGS_DIR, DAG_FILE
     global REFERENCES_FILE, COMMENTS_FILE
@@ -6942,7 +6959,7 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
         help="OpenAI-compatible base URL: a local llama-server, or a hosted "
              "API's base (e.g. https://api.openai.com, without the /v1 "
              "suffix — it is added automatically). Defaults to "
-             "$LLAMA_HOST or localhost:8081 (8080 is taken by open-webui).",
+             "$LLAMA_HOST or http://localhost:8081.",
     )
     parser.add_argument(
         "--api-key", default=None,
@@ -7075,8 +7092,7 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
 
     # The run's user, before the paths: the DAG file is named after it,
     # and every lemma the run commits is stored under it. The model never
-    # emits a user_id; this is the one that goes in (see .comments,
-    # "User identity").
+    # emits a user_id; this is the one that goes in (see config.py).
     try:
         USER = config.ensure_user_id()
         paths = workspace.resolve(args.conjecture, USER)
