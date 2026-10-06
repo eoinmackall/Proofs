@@ -37,9 +37,6 @@ For every result produce:
   allows: "Chapter 4, Theorem 4.3" or "page 12, Proposition 2". If the file
   gives no section or number, describe the location ("second display after
   the statement of the main theorem").
-- "tags": a short list (0–5) of lowercase topic words: branch of mathematics
-  and main objects involved ("univalent functions", "conformal mapping").
-  Tags are for humans glancing at the collection, not for search.
 
 Do NOT:
 
@@ -55,6 +52,6 @@ Do NOT:
 
 Output strictly valid JSON, no markdown fences and no extra text, of the form
 {"references": [{"slogan": "...", "formal statement": "...", "reference":
-"...", "tags": ["...", "..."]}]} — one object per result, in the order the
-file presents them. If the file contains no extractable result (a table of
-contents, an index, a file of only definitions), output {"references": []}.
+"..."}]} — one object per result, in the order the file presents them. If
+the file contains no extractable result (a table of contents, an index, a
+file of only definitions), output {"references": []}.

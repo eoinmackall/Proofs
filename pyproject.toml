@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proofs"
+version = "0.1.0"
+description = "A distributed system for constructing proofs to conjectures, coordinated through git."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "GPL-3.0-or-later"
+dependencies = ["requests"]
+
+[project.scripts]
+proofs = "proofs.cli:main"
+
+[tool.setuptools]
+packages = ["proofs"]

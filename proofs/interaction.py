@@ -275,12 +275,17 @@ def render(
     return "\n".join(out)
 
 
-def _ask(prompt: str) -> str:
+def _ask(prompt: str) -> Optional[str]:
+    """One line from the operator, stripped — or None at end of input
+    (Ctrl-D, a closed stdin) or a KeyboardInterrupt. None is kept apart from
+    any typed answer so each prompt decides what giving up means there: a
+    "q" stood in for it once, and the statement prompt took it for a
+    statement."""
     try:
         return input(prompt).strip()
     except (EOFError, KeyboardInterrupt):
         print()
-        return "q"
+        return None
 
 
 def choose(
@@ -298,13 +303,17 @@ def choose(
 
     with hotkey.paused():
         while True:
-            reply = _ask("> ").lower()
+            answer = _ask("> ")
+            if answer is None:  # end of input at the menu: quit
+                return Choice("quit")
+            reply = answer.lower()
 
             if reply in ("q", "quit"):
                 return Choice("quit")
             if reply in ("a", "auto"):
                 return Choice("auto")
             if reply in ("r", "replan", ""):
+                # End of input here is no reason given, not a reason "q".
                 why = _ask("reason for the planner (optional): ")
                 note = why or "Rejected by the operator without a stated reason."
                 return Choice("replan", notes=[note])
@@ -349,6 +358,8 @@ def _write_own(proved: set) -> Optional[Dict[str, Any]]:
     Only an id and a statement are asked for, the same two fields the planner
     supplies. You are standing in for the planner here, not for the prover.
     """
+    # End of input, an empty line or a lone "q" at either prompt cancels the
+    # written lemma and returns to the menu.
     lemma_id = _ask("  id (e.g. lemma_7): ")
     if not lemma_id or lemma_id == "q":
         return None
@@ -357,8 +368,8 @@ def _write_own(proved: set) -> Optional[Dict[str, Any]]:
         return None
 
     statement = _ask("  statement: ")
-    if not statement:
-        print("  empty statement; nothing added.")
+    if not statement or statement == "q":
+        print("  no statement; nothing added.")
         return None
 
     return {"id": lemma_id, "statement": statement}

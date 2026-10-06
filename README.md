@@ -56,12 +56,49 @@ Each iteration:
    same job from the partial proof — see
    [When a call hits the context wall](#when-a-call-hits-the-context-wall).
 
+### When the conjecture is settled
+
+No agent can declare the conjecture proved. It is settled by a lemma, and
+two lemma ids are reserved for that lemma:
+
+- `conjecture`: the conjecture itself.
+- `conjecture_negation`: that the conjecture is false, by an explicit
+  counterexample.
+
+The planner (or, in parallel mode, the lemma generator) attempts the
+conjecture by proposing a candidate under one of these ids. Its statement
+is always written by the code, not by the model: the verbatim text of
+`conjecture.md`, or that text after the fixed prefix "The following
+conjecture is false. Exhibit an explicit counterexample…". From there it is
+an ordinary candidate. The selector weighs it against the others with no
+priority, the prover assembles its proof from the DAG, and the three
+verifiers check it. The reviser may not revise a pinned statement, and may
+not decompose a lemma onto a reserved id.
+
+Whether the conjecture is settled is computed, never stored
+(`proofs/resolution.py`). It is settled while some lemma in any user's DAG
+file meets both conditions:
+
+- Its statement is exactly the pinned text, up to whitespace.
+- It is not suspended, so it holds a valid certificate and everything it
+  cites, all the way down, is certified and unrefuted.
+
+The test is on the statement, so a proof committed under a renamed id
+(`conjecture_2`) counts too. The serial run checks at the top of every
+iteration and once after the last; the parallel planner checks on every DAG
+change. Either way, a run stops when another user's pulled DAG settles the
+conjecture. Editing `conjecture.md`, or a refutation or repair anywhere
+below the settling lemma, reopens the conjecture on its own. A conjecture
+asserted by the operator at the menu counts, and is reported as
+operator-asserted. A DAG that proves both the conjecture and its negation
+settles nothing: the run warns and carries on.
+
 ### Thinking vs. structured output
 
 The prompts instruct each model to emit strict JSON directly, so every
 response is first parsed as-is; a schema-constrained *extraction* call only
 runs as a fallback. The underlying tension there — on llama.cpp, reasoning
-silently voids the grammar — is handled inside `src/llm_backend.py`, which
+silently voids the grammar — is handled inside `proofs/llm_backend.py`, which
 disables reasoning for exactly the calls that carry a schema.
 
 ### When a call hits the context wall
@@ -111,7 +148,7 @@ from the last safe boundary.
 
 ### Backend
 
-One transport, probed at startup (`src/llm_backend.py`): the
+One transport, probed at startup (`proofs/llm_backend.py`): the
 OpenAI-compatible `/v1/chat/completions` endpoint. The same code serves two
 backends:
 
@@ -138,6 +175,14 @@ standard OpenAI against one that has it). The probe's *measurements* — the
 context ceiling and thinking support — are kept either way, because they
 describe the server that is actually there.
 
+The probe also records the **model name** the server actually serves
+(`.comments`, "Model name"): on a llama-server it is the file name of the
+loaded model, read off `/props`; otherwise — a hosted API or other server —
+it is the first id of the endpoint's `/v1/models` list, the same call that
+verifies a supplied key. It is kept on the profile and printed in the banner
+beside the name `--model` asked for, so a run records which model actually
+served it.
+
 Model capabilities (context size, thinking support) are *profiles*, probed
 rather than hard-coded, so adding a model needs no code change.
 
@@ -149,49 +194,146 @@ A Nix dev shell is provided:
 nix develop
 ```
 
-It gives you a Python 3 environment with `requests` installed. Otherwise any
-Python 3 install with `requests` works.
+It gives you a Python 3 environment with `requests` installed and puts the
+`proofs` command on your PATH. The command is also exposed as a flake app,
+so `nix run . -- --help` works without cloning. Outside Nix, `pip install .`
+installs the `proofs` command; otherwise any Python 3 install with
+`requests` works, running the modules directly (`python proofs/main.py ...`).
 
 ## Usage
 
+### The `proofs` command
+
+One command, nine subcommands:
+
+| Subcommand | Takes | Does |
+| --- | --- | --- |
+| `proofs config KEY [VALUE]` | a config key, an optional value | Gets or sets the user's config, git-style: `user.id`, `user.name`, `user.email`. |
+| `proofs new NAME` | a directory name | Lays out a blank conjecture, `conjectures/NAME/`: empty `references/`, `dags/` and `certificates/` directories, an empty `conjecture.md` and `comments.md`, and a `references.md` holding the empty collection `[]`. Refuses a `NAME` that already exists. |
+| `proofs run DIR` | `DIR`, then the loop's options | Runs the proof loop on the conjecture. |
+| `proofs parse DIR` | `DIR`, then the parser's options | The maintainer's tool: parses `DIR`'s `references/` into the committed `references.md`. |
+| `proofs verify PATH lemma_id [--full]` | a user's DAG file, a lemma | Verifies the lemma; with `--full`, what it cites too, cited lemmas first. |
+| `proofs repair path_to_refutation` | a refutation file | Repairs the lemma the refutation names. |
+| `proofs prune DIR` | a conjecture directory | Drops the current user's stale certificates. |
+| `proofs status PATH lemma_id` | a user's DAG file, a lemma | Lists the valid certificates in the lemma's citation closure, then whether the conjecture is settled. |
+| `proofs export PATH [lemma_id] -o OUT_DIR` | a DAG file or a conjecture directory, an optional lemma, the output directory | Writes a LaTeX document of the DAG, in dependency order, into OUT_DIR. |
+
+`DIR` is a conjecture directory. `PATH` is a user's DAG file,
+`conjectures/NAME/dags/<user_id>_dag.json`, whose name supplies the lemma's
+`user_id` — a lemma is addressed as `(user_id, lemma_id)`; for `export`,
+`PATH` may be the conjecture directory itself, in which case the complete DAG
+is written. `status` lists the valid certificates in the named lemma's
+citation closure; `export` writes the DAG's LaTeX document — the complete
+DAG, a user's lemmas, or a lemma and everything it cites — in dependency
+order (dependencies first), into the directory `-o`/`--out` names (created
+if it is not there yet — the document is the user's artifact, and never
+lands in the project on its own): `proof.tex` for the complete DAG,
+`<user_id>_proof.tex` for a user's lemmas, and
+`<user_id>--<lemma_id>_proof.tex` for a lemma and its dependencies.
+
+Every run acts as a **user**, named by a `user.id` that identifies its DAG
+file, its certificates and its refutations. The user's identity —
+`user.id`, `user.name` (a full name) and `user.email` — is stored in
+`~/.config/proofs/config` (or `$XDG_CONFIG_HOME/proofs/config`), outside the
+repository, so it is never committed. It is set and read git-style, through
+the `config` subcommand: `proofs config --global user.id ID` sets (likewise
+`user.name` and `user.email`), `proofs config user.id` prints, an empty
+value unsets, and `proofs config --list` lists the set keys. A run without
+a `user.id` fails and names the command to set it; proofs does not ask for
+one, as git does not.
+
+The identity is also stamped at the top of the user's generated files, so
+a file read out of context still says whose it is: the user's DAG file
+holds `user.id`, `user.name` and `user.email` as the first entries of its
+object, and the user's certificate file holds them as its first line,
+before the certificates. The stamp is the owner's to write — a run updates
+it from the owner's config when it writes the owner's own file, and keeps
+it as it stands when it writes another user's file (the repair's one
+cross-user write), since it does not hold that user's name and email. The
+certificate's readers skip the line; it names no lemma.
+
 ```sh
-python src/main.py --conjecture algebra_example
-python src/main.py --conjecture algebra_example --model Qwen3.5-122B-Q4_K_M
-python src/main.py --conjecture algebra_example --no-verbose --max-iterations 25
-python src/main.py --conjecture algebra_example --mode human
-python src/main.py --conjecture algebra_example --parallel 2
-python src/main.py --conjecture algebra_example --parallel 3 --mode human
+proofs run conjectures/algebra_example
+proofs run conjectures/algebra_example --model Qwen3.5-122B-Q4_K_M
+proofs run conjectures/algebra_example --no-verbose --max-iterations 25
+proofs run conjectures/algebra_example --mode human
+proofs run conjectures/algebra_example --parallel 2
+proofs run conjectures/algebra_example --parallel 3 --mode human
 
 # or against a hosted API instead of a local llama-server
-LLM_API_KEY=sk-... python src/main.py --conjecture algebra_example \
+LLM_API_KEY=sk-... proofs run conjectures/algebra_example \
     --host https://api.openai.com --model gpt-4o
 
 # once, before proving: parse the conjecture's reference collection
-python src/parsing.py --conjecture algebra_example
+proofs parse conjectures/algebra_example
+
+# the DAG as a LaTeX document, in dependency order: the complete DAG, or
+# one user's lemmas, or a single lemma with everything it cites, written
+# into the directory -o names (created if it is not there yet)
+proofs export conjectures/algebra_example -o ~/tex
+proofs export conjectures/algebra_example/dags/alice_dag.json -o ~/tex
+proofs export conjectures/algebra_example/dags/alice_dag.json lemma_42 -o ~/tex
+
+# start a new conjecture, then write its statement into conjecture.md
+proofs new standard_d
+
+# on a fresh machine, set the identity once, git-style
+proofs config --global user.id eoin
+proofs config --global user.name "Eoin Mackall"
+proofs config --global user.email eoin@example.com
 ```
 
-`parsing.py` shares main.py's server options (`--host`, `--api-key`,
-`--backend`, `--model`, `--num-ctx`) and its `--conjecture NAME` /
-`--verbose` pair; it has no proving options, because it has no loop.
+`run` and `parse` both take one argument, the conjecture directory: a name
+under `conjectures/` or a path to it — anything after it is passed through
+to the tool unchanged. `parse` shares `run`'s server options (`--host`,
+`--api-key`, `--backend`, `--model`, `--num-ctx`) and its DIR / `--verbose`
+pair; it has no proving options, because it has no loop.
 
 ### CLI options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--conjecture NAME` | `algebra_example` | A directory under `conjectures/` holding a `conjecture.md`. |
+| `DIR` | — | The conjecture directory: a name under `conjectures/` holding a `conjecture.md`, or a path to it. Taken by `run` and `parse`. |
 | `--model NAME` | `qwen3.8-27b` | Model name: the `--alias` llama-server was launched with, or a provider's model id (e.g. `gpt-4o`). |
 | `--host URL` | `http://localhost:8081` | OpenAI-compatible base URL — a local llama-server, or a hosted API's base (e.g. `https://api.openai.com`, without the `/v1` suffix — it is added automatically). `$LLAMA_HOST` overrides the default; 8080 is taken by open-webui. |
 | `--api-key KEY` | `$LLM_API_KEY` | Sent as `Authorization: Bearer <key>`. Needed for a hosted API; leave unset for a plain local llama-server. |
 | `--backend {auto,llamacpp,openai}` | `auto` | Which dialect of the OpenAI-compatible endpoint to speak: the full llama.cpp option set (with thinking suppressed for schema calls), or the standard OpenAI set. `auto` takes the probe's answer; the other two force it, for when the probe can't see the real server. |
-| `--dag PATH` | `conjectures/<name>/dag.json` | Use a separate DAG file (e.g. to isolate a model's run). |
 | `--max-iterations N` | 10 | Loop iterations before giving up. |
 | `--max-proof-attempts N` | 3 | Prover rounds per lemma before it is given up. |
+| `--lemmas-all N` | 25 | How many of the most recently proved lemmas (anyone's) the agents see in full; every other proved lemma is listed by `user_id` and `lemma_id` only. `-1` shows all. Also taken by `proofs repair`. |
+| `--my-lemmas N` | 25 | How many of your own most recently proved lemmas the agents also see in full, overlap with `--lemmas-all` shown once. `-1` shows all. Also taken by `proofs repair`. |
+| `--lemmas-common K` | 10 | How many *common lemmas* the agents also see, statement only: the lemmas outside the two recency windows that the shown lemmas cite most often (direct citations only). Ties are broken in a random order fixed for the run. A lemma nothing shown cites never ranks. `-1` shows every cited lemma. Also taken by `proofs repair`. |
+| `--tool-mode {auto,json}` | `auto` | How agents call tools such as `lookup_lemmas`. `auto` uses the server's native tool calling and falls back to a JSON protocol the first time the server refuses it (llama-server needs `--jinja` for native calls); `json` uses the protocol from the start. Also taken by `proofs repair`. |
 | `--fresh` | off | Ignore and delete the checkpoint (`<dag>.checkpoint.json`), restarting the iteration budget from 1. The DAG is kept. |
 | `--parallel [N]` | off | Run N proof loops in parallel around one shared DAG, steered by one planner and one lemma generator. Bare `--parallel` is N=1. `--mode human`, when set, takes the place of one of the loops (loop-0). See [Parallel mode](#parallel-mode). |
 | `--num-ctx N` | the server's own (probed) | Context window in tokens. On a local llama-server: defaults to the `-c` it was launched with, as probed — lower it if VRAM is tight — and an explicit value is clamped to that ceiling. On a hosted `--host` API nothing is probed, so the default is 65536 and an explicit value replaces it. Budgeting above the server's own window is caught at once from the server's 400, which names its real limit and the `--num-ctx` to re-run with. |
 | `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
 | `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
 | `--verbose / --no-verbose` | on | Console logging. |
+
+### The lemma window and tools
+
+Agents are not shown every proved lemma. They see in full the
+`--lemmas-all` most recently proved lemmas (anyone's) and the `--my-lemmas`
+most recently proved of your own, chosen after suspended lemmas are removed
+and with the overlap shown once; recency is the `proved_at` stamp a lemma
+gets when it is committed or re-proved. They also see, statement only, up
+to `--lemmas-common` older lemmas that the shown lemmas cite most often,
+counting direct citations, with ties broken in a random order that is fixed
+for the run (so prompts do not change from call to call for no reason). The
+prompt therefore holds a bounded number of statements however large the DAG
+grows; only the ID index grows with it. Every other proved lemma is listed
+by `user_id` and `lemma_id` only, and the agent can read any of them with
+the `lookup_lemmas` tool (statement and citations, never a suspended
+lemma). When the window holds every lemma, no index and no tool are sent
+and the prompts are as before.
+
+Tools live in `proofs/tools.py`: each is a name, a JSON Schema for its
+arguments and a handler. `reason()` runs the loop — at most
+`MAX_TOOL_ROUNDS` (3) rounds per call, `MAX_LOOKUP` (10) lemmas per
+lookup — using native tool calls where the server supports them and a JSON
+protocol otherwise (`--tool-mode`). If a call hits the context wall after
+using tools, the continuation carries the tool results in its task.
 
 ### Modes and the hotkey
 
@@ -207,8 +349,8 @@ direction, without restarting:
   checkpoint first; see [Cancelling a run](#cancelling-a-run-ctrl-c-and-resuming).
   At the menu, `q` does the same thing.
 
-`src/interaction.py` explains why the toggle is a keystroke in one place and
-a line of input in the other.
+`proofs/interaction.py` explains why the toggle is a keystroke in one place
+and a line of input in the other.
 
 ## Parallel mode
 
@@ -219,8 +361,8 @@ threads steer them: a **planner** that keeps a shared strategy current, and a
 **lemma generator** that keeps the loops supplied with work.
 
 ```sh
-python src/main.py --conjecture algebra_example --parallel 2
-python src/main.py --conjecture algebra_example --parallel 3 --mode human
+proofs run conjectures/algebra_example --parallel 2
+proofs run conjectures/algebra_example --parallel 3 --mode human
 ```
 
 A bare `--parallel` is N=1: the parallel machinery with a single loop. The
@@ -330,7 +472,9 @@ agents/
   parallel/                                    # parallel-mode prompts
     parallel_planner.md  parallel_lemma_generator.md
   parsing.md                               # references parser prompt
-src/
+proofs/
+  cli.py               # the `proofs` command: subcommands and argument validation
+  config.py            # the user's global config (~/.config/proofs/config): user.id, user.name, user.email
   main.py              # the proof loop (planner → selector → prover → verifier → reviser)
   parsing.py           # standalone references/ → references.md parser
   llm_backend.py       # OpenAI-compatible transport (llama.cpp or a hosted API) + model profiles
@@ -341,11 +485,12 @@ conjectures/
     conjecture.md          # required: the statement
     dag.json               # shared by every model
     dag.checkpoint.json    # optional: where a cancelled run stopped (--fresh)
-    references/            # optional: source files (.tex/.md/plain text) to parse
-    references.md          # parsed theorem-level results (strict JSON array)
-    comments.md            # optional: operator notes, passed to the planner as suggestions
+    references/            # maintainer-local source files (.tex/.md/plain text), gitignored
+    references.md          # committed: parsed theorem-level results (strict JSON array)
+    comments.md            # optional, gitignored: this user's private notes for the planner
     prover.md              # optional per-conjecture prompt override
-flake.nix                  # Nix dev shell
+pyproject.toml             # the package and the `proofs` console script
+flake.nix                  # Nix dev shell, package and app (`nix run .`)
 ```
 
 ### Conjectures and the shared DAG
@@ -391,20 +536,38 @@ reported and kept — raise the budget and re-run to continue from it.
 
 ### References
 
-A conjecture can ship a `references/` directory: chapters, surveys or
-papers, as `.tex`, `.md` or plain text, that the agents may lean on. The
-directory is parsed by a standalone tool, not by the proving loop:
+The conjecture's maintainer keeps a `references/` directory beside
+`conjecture.md`: chapters, surveys or papers, as `.tex`, `.md` or plain
+text, that the agents may lean on. In the distributed setup the two sides
+of that directory have different owners:
 
-```sh
-python src/parsing.py --conjecture algebra_example
-```
+- **`references/` (the input) is the conjecture maintainer's local
+  material.** It is gitignored and never committed: it may be large, and it
+  is the maintainer's working copy of the sources.
+- **`references.md` (the output) is a committed artefact, maintained by the
+  maintainer and committed with the conjecture.** Only the maintainer runs
+  the parser — a standalone tool, not part of the proving loop:
 
-reads every parsable file in `references/`, asks the model (via
-`agents/parsing.md`) for the theorem-level results, and writes them to
-`references.md` beside the DAG as a **strict JSON array** — one object per
-result with `id`, `slogan`, `formal statement`, `reference` (where it appears
-in the file) and `tags`. `main.py` then feeds that file to the loop at three
-granularities:
+  ```sh
+  proofs parse conjectures/algebra_example
+  ```
+
+  It reads every parsable file in `references/`, asks the model (via
+  `agents/parsing.md`) for the theorem-level results, and writes them to
+  `references.md` beside the DAG as a **strict JSON array** — one object per
+  result with `id`, `slogan`, `formal statement` and `reference` (where it
+  appears in the file). The maintainer then commits and pushes the file
+  (the tool reminds them to).
+- **Every other user pulls `references.md` and never regenerates it.**
+  Nothing in `run`, `verify` or `repair` writes the file; the loop only
+  reads it. A result they need that is missing is *requested from the
+  maintainer*, who parses it in and commits the new entry — and the loop
+  says so in the log when a proof cites a reference id that is not in the
+  collection, instead of burning rounds retrying the same citation.
+  (Running `proofs parse` in a clone without the maintainer's
+  `references/` is a clean no-op that leaves the pulled file untouched.)
+
+`main.py` feeds that file to the loop at three granularities:
 
 - **Planner and reviser** — an `id` + `slogan` shortlist, and only while the
   collection is small: below `PLANNER_REFERENCE_LIMIT` (100) entries each
@@ -414,8 +577,9 @@ granularities:
   away, not lost. A strategy for large collections is deliberately not
   built yet.
 - **Prover** — the whole collection unconditionally (id, slogan, formal
-  statement, tags). It may cite any entry by `id` in `cited_lemmas` and
-  rely on it without proving it, exactly like a proved lemma.
+  statement). It may cite any entry by `id` in `cited_references` and
+  rely on it without proving it, exactly like a proved lemma (a cited lemma
+  goes in `cited_lemmas` instead, as a `{"user_id", "lemma_id"}` pair).
 - **Verifier** — only the formal statements of the results the proof
   actually cites, merged with the cited DAG lemmas into one set. The rest
   of the collection is withheld on purpose: a proof that leans on a result
@@ -423,39 +587,47 @@ granularities:
   told that citing a reference is legitimate while proving it inline is
   not.
 
-Two properties of the parser matter for resuming:
+Two properties of the parser keep citations valid as the collection grows —
+which is what makes a shared, committed file safe to keep re-parsing:
 
-- **Ids are stable across re-parses.** `ref_N` numbers are assigned by the
-  tool, never by the model; a result whose formal statement matches an
-  existing entry keeps its id, so a DAG that cites `ref_3` still means the
-  same thing after you add a chapter to `references/` and re-run.
-- **Re-parses are a union.** Entries from a previous `references.md` whose
-  statements were not re-derived this run are kept, so a flaky parse of one
-  file cannot silently delete a result another proof cites. An empty
-  `references/` directory never touches an existing `references.md`. There is
-  no clear mode: to reset the collection, delete or rewrite `references.md`
-  (a DAG that cited its entries will warn about the dangling ids) — deleting
-  it and re-running `parsing.py` is the cleanest way to start over.
+- **Reference ids are stable across re-parses.** `ref_N` numbers are
+  assigned by the tool, never by the model; a result whose formal statement
+  matches an existing entry keeps its id, so a lemma that cites `ref_3` in
+  its `cited_references` still means the same thing after the maintainer
+  adds a chapter to `references/` and re-parses.
+- **Entries are never deleted.** A re-parse is a union: entries from a
+  previous `references.md` whose statements were not re-derived this run are
+  kept, so a flaky parse of one file cannot silently delete a result another
+  user's proof cites. An empty `references/` directory never touches an
+  existing `references.md`. There is no clear mode: to reset the collection,
+  delete or rewrite `references.md` (lemmas that cited its entries will warn
+  about the dangling ids) — deleting it and re-running `parsing.py` is the
+  cleanest way to start over.
 
 A run without `references/` or `references.md` is exactly the old run:
 every prompt degrades to its pre-references form, which is also the failure
 mode for a corrupt `references.md` (it warns once and is ignored).
 
-### Comments (operator hints to the planner)
+### Comments (private hints to the planner)
 
-A conjecture can ship a `comments.md` beside its `conjecture.md`: free-form
-notes on possible approaches to a proof or a counterexample — routes to try,
-objects or theorems worth using, or dead ends to avoid. No tooling touches
-it; you just edit it. On every planning step the loop hands the file's
-contents to the planner verbatim as a **Human comments** section, and
-`agents/planner.md` tells the planner how to read it: weigh the suggestions
-— when a comment points at a viable route the state of the proof allows,
-one of the five candidates should be a concrete version of it — but treat
-them as suggestions, not instructions, since a comment may be mistaken or
-stale.
+A conjecture directory may hold a `comments.md` beside its
+`conjecture.md`: free-form notes on possible approaches to a proof or a
+counterexample — routes to try, objects or theorems worth using, or dead
+ends to avoid. No tooling touches it; you just edit it. On every planning
+step the loop hands the file's contents to the planner verbatim as a
+**Human comments** section, and `agents/planner.md` tells the planner how
+to read it: weigh the suggestions — when a comment points at a viable route
+the state of the proof allows, one of the five candidates should be a
+concrete version of it — but treat them as suggestions, not instructions,
+since a comment may be mistaken or stale.
 
-The planner is the only agent that sees the file (the prover, verifiers and
-reviser are deliberately left to judge the mathematics on its own), and a
-conjecture directory without a `comments.md` runs exactly as before — the
-prompt degrades to its pre-comments form, the same way the reference blocks
-do. The run banner announces the file when it is present.
+The file is gitignored: each user keeps their own `comments.md`, and
+comments are never committed or shared. A clone you pull therefore carries
+no one else's notes, and yours never reach anyone else's run — the file is
+per user the way the DAG files are, but by absence of sharing rather than
+by a `<user_id>` in the name. The planner is the only agent that sees it
+(the prover, verifiers and reviser are deliberately left to judge the
+mathematics on its own), and a conjecture directory without a `comments.md`
+runs exactly as before — the prompt degrades to its pre-comments form, the
+same way the reference blocks do. The run banner announces the file when it
+is present.

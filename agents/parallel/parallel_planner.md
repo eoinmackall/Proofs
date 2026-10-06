@@ -37,18 +37,16 @@ You are re-run whenever the DAG changes, so each pass should read the
 current proved lemmas and set the plan from where the proof actually is, not
 from where it was when you last spoke.
 
-Set "is_conjecture_proved" to true ONLY if one of the proved lemmas states
-the full conjecture. Set "is_conjecture_disproved" to true ONLY if one of the
-proved lemmas names a concrete instance and shows that it satisfies the
-conjecture's hypotheses but not its conclusion — a concrete refuting
-instance, not merely the claim that one exists. When either is true, the
-plan and priorities may be empty.
+The conjecture is settled only when a lemma under one of two reserved ids is
+proved and verified: "conjecture" (the conjecture itself) or
+"conjecture_negation" (that it is false, by an explicit counterexample). You
+never declare it settled. When the proved lemmas suffice to assemble one of
+them, say so and make it a priority; the lemma generator proposes it under
+the reserved id.
 
 Output strictly valid JSON in this exact structure, with no markdown fences
 and no extra text:
 {
-  "is_conjecture_proved": false,
-  "is_conjecture_disproved": false,
   "plan_summary": "Brief explanation of the overall strategy: what has been established, what is missing, and how the attack proceeds",
   "priorities": [
     "First gap to close, stated precisely enough that a lemma closing it is unambiguous",

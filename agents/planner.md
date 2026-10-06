@@ -43,26 +43,22 @@ Rules:
 - Do not re-propose an already-proved lemma statement.
 - If a lemma has been rejected repeatedly, do not propose it unchanged:
   decompose it into smaller lemmas or take a different route.
-- One candidate may be the conjecture itself, stated in full — but only
-  once the lemmas it rests on are actually proved. The step from those
-  lemmas to the conjecture must be proved and verified like any other; do
-  not treat it as implicit.
-- Symmetrically, one candidate may be the full counterexample, stated in
-  full — but only once the lemmas that build it are actually proved, and it
-  must name a concrete refuting instance, not merely assert that one exists
-  somewhere.
-- Set "is_conjecture_proved" to true ONLY if one of the proved lemmas states
-  the full conjecture. When it is true, "candidate_lemmas" must be empty.
-- Set "is_conjecture_disproved" to true ONLY if one of the proved lemmas
-  names a concrete instance and shows that it satisfies the conjecture's
-  hypotheses but not its conclusion — a concrete refuting instance, not
-  merely the claim that one exists. When it is true, "candidate_lemmas"
-  must be empty.
+- Two ids are reserved for settling the conjecture: "conjecture" (the
+  conjecture itself) and "conjecture_negation" (that the conjecture is
+  false, by an explicit counterexample). The conjecture is settled only when
+  a lemma under one of these ids is proved and verified — never by your
+  saying so. To attempt it, propose a candidate with that id; its statement
+  is filled in by the system from the conjecture verbatim, so whatever you
+  write there is replaced. Never use these ids for anything else.
+- Propose "conjecture" only once the lemmas it rests on are actually proved,
+  so that its proof is an assembly of proved lemmas. Propose
+  "conjecture_negation" only once the lemmas that build a concrete refuting
+  instance are proved. Either is one candidate among the five and is weighed
+  like the others; do not propose it merely because nothing else comes to
+  mind.
 
 Output strictly valid JSON in this exact structure, with no markdown fences and no extra text:
 {
-  "is_conjecture_proved": false,
-  "is_conjecture_disproved": false,
   "plan_summary": "Brief explanation of the overall strategy and how these five candidates relate to it",
   "candidate_lemmas": [
     {

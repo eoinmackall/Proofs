@@ -28,15 +28,16 @@ taken verbatim, so the proof text can't be abridged or paraphrased.
 
 Cancelling and resuming
 -----------------------
-The run keeps a checkpoint, `dag.checkpoint.json`, beside the DAG it is
-building (so a `--dag` run checkpoints beside its own file). It holds what
-`dag.json` does not: the position of the iteration budget, the planner's
-reject list (`failed_attempts`), and — when the run is cancelled in the
-middle of a proof — the lemma that was in flight, with the target statement
-(the reviser may have revised it), the prover round it was on, the
-feedback that round was about to be given, and the last proof of it (the one
-the verifiers just rejected — the material the reviser judges its difficulty
-by when it next sees this lemma). Checkpoints are written at safe
+The run keeps a checkpoint, `dags/<user_id>_dag.checkpoint.json`, beside
+the user's DAG file it is building (it is per user, the way the DAG file
+is, and gitignored). It holds what the DAG files do not: the position of
+the iteration budget, the planner's reject list (`failed_attempts`), and —
+when the run is cancelled in the middle of a proof — the lemma that was in
+flight, with the target statement (the reviser may have revised it), the
+prover round it was on, the feedback that round was about to be given, and
+the last proof of it (the one the verifiers just rejected — the material
+the reviser judges its difficulty by when it next sees this lemma).
+Checkpoints are written at safe
 boundaries — the top of each iteration, the top of every prover round, and
 the end of each iteration — and by the SIGINT handler itself on Ctrl-C,
 which writes the last safe boundary's state and exits 130; a second Ctrl-C
@@ -48,7 +49,7 @@ is what makes a mid-proof Ctrl-C cost the interrupted call, not the whole
 iteration). An interrupted call is never restored — that one is re-run —
 everything completed before it is not. When the planner settles the
 conjecture the checkpoint is deleted; `--fresh` deletes it too, without
-touching `dag.json`.
+touching the DAG files.
 
 Planning is a shortlist, not a decision
 ---------------------------------------
@@ -127,49 +128,81 @@ for why one of these is a keystroke and the other is a line of input.
 
 Usage
 -----
-    python main.py --conjecture algebra_example
-    python main.py --conjecture algebra_example --model Qwen3.5-122B-Q4_K_M
-    python main.py --conjecture algebra_example --model qwen3.8-27b
-    python main.py --conjecture algebra_example --no-verbose --max-iterations 25
-    python main.py --conjecture algebra_example --mode human
-    python parsing.py --conjecture algebra_example
+    proofs run conjectures/algebra_example
+    proofs run conjectures/algebra_example --model Qwen3.5-122B-Q4_K_M
+    proofs run conjectures/algebra_example --model qwen3.8-27b
+    proofs run conjectures/algebra_example --no-verbose --max-iterations 25
+    proofs run conjectures/algebra_example --mode human
+    proofs parse conjectures/algebra_example
+    proofs verify conjectures/algebra_example/dags/alice_dag.json lemma_42 --full
+    proofs repair conjectures/algebra_example/refutations/alice--lemma_42--bob--20250102T030405Z.json
+    proofs status conjectures/algebra_example/dags/alice_dag.json lemma_42
+    proofs export conjectures/algebra_example -o ~/tex
+    proofs export conjectures/algebra_example/dags/alice_dag.json lemma_42 -o ~/tex
 
-parsing.py is standalone: it reads conjectures/<name>/references/ (any .tex
-or .md file in it), asks the model for the theorem-level results, and writes
-them as a strict-JSON array to conjectures/<name>/references.md. main.py then
-offers those references to the prover (citable by id), to the verifiers (the
-formal statements of the cited ones only) and to the planner and the reviser
-(an id + slogan shortlist, only while the collection is small enough to be
-one).
+(also: python proofs/main.py --conjecture algebra_example)
 
-A conjecture may also carry a comments.md beside its conjecture.md: free-form
-operator notes on possible approaches to a proof or a counterexample. The
-loop reads it once and hands it to the planner verbatim on every iteration as
-a "Human comments" section — the planner is told to treat it as suggestions
-to weigh (a viable suggested route should get one of the five candidates),
-not as instructions. No other agent sees the file, and a directory without
-one runs exactly as before.
+parsing.py is standalone: the conjecture's maintainer points it at
+conjectures/<name>/references/ (any .tex or .md file in it), it asks the
+model for the theorem-level results, and writes them as a strict-JSON array
+to conjectures/<name>/references.md, which the maintainer commits with the
+conjecture. The reference collection is a shared, committed artefact
+(.comments, "References"): every other user pulls references.md and never
+regenerates it, and a result they need that is missing is requested from the
+maintainer. main.py only ever reads that file, and offers those references
+to the prover (citable by id), to the verifiers (the formal statements of
+the cited ones only) and to the planner and the reviser (an id + slogan
+shortlist, only while the collection is small enough to be one).
+
+A conjecture directory may also carry a comments.md beside its
+conjecture.md: free-form operator notes on possible approaches to a proof or
+a counterexample. The loop reads it once and hands it to the planner verbatim
+on every iteration as a "Human comments" section — the planner is told to
+treat it as suggestions to weigh (a viable suggested route should get one of
+the five candidates), not as instructions. No other agent sees the file, and
+a directory without one runs exactly as before. The file is gitignored and
+never committed or shared: each user keeps their own (".comments",
+"Comments").
 
 --conjecture names a directory under conjectures/ holding a conjecture.md.
-The DAG is written beside it as dag.json and shared by every model: point a
-second model at a conjecture already under way and it continues from the
-lemmas the first one proved. Pass --dag to give a run its own file instead.
+DAG files are per user: conjectures/<name>/dags/<user_id>_dag.json holds
+the current user's lemmas (user_id from the config file, never emitted by
+a model), and the run reads every file in dags/ to see the complete DAG
+while writing new lemmas to its own file only. A lemma is identified by the
+pair (user_id, lemma_id); a lemma_id is unique only within one user's
+file, and no hashes are stored in the DAG files. Each acceptance of a
+lemma is also recorded as a certificate in
+conjectures/<name>/certificates/<verifier>.jsonl, the file of the user
+whose run accepted it, one JSON line per acceptance (.comments, "Certificates").
 """
 
 import argparse
+import contextlib
+import glob
+import hashlib
 import json
 import os
+import random
 import re
 import signal
 import sys
 import threading
+import traceback
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 
-import interaction
-import llm_backend
-import workspace
+try:  # inside the proofs package (installed, or `python -m proofs`)
+    from . import (
+        certificates, config, export, interaction, llm_backend, merkle,
+        refutations, resolution, suspension, workspace,
+    )
+    from . import tools as tools_mod
+except ImportError:  # top-level modules (`python proofs/main.py`)
+    import certificates, config, export, interaction, llm_backend, merkle
+    import refutations, resolution, suspension, workspace
+    import tools as tools_mod
 
 # ----------------------------------------------------------------------------
 # Configuration (all overridable from the command line; see main())
@@ -187,13 +220,30 @@ PROFILE: Any = None
 # Resolved by workspace.resolve(): a prompt may be overridden per conjecture,
 # so these are paths rather than the bare filenames they used to be.
 CONJECTURE_FILE = ""
+# Set in main(): the conjecture's root, the parent of DAGS_DIR. The
+# certificates/ directory with the certificate files lives here too
+# (.comments, "Certificates").
+CONJECTURE_ROOT = ""
+# Set in main(): the user this run writes as, resolved from the config file
+# before the paths are (see .comments, "User identity"). The model never
+# emits it; it is stored in every lemma the run commits.
+USER = ""
+# Set in main(): the per-user DAG files live here, one per user
+# (DAGS_DIR/<user_id>_dag.json). load_dag() merges every file in it into the
+# complete DAG; only DAG_FILE is ever written. See .comments,
+# "Per-user DAGs".
+DAGS_DIR = ""
+# The current user's DAG file, DAGS_DIR/<user_id>_dag.json.
 DAG_FILE = ""
-# Set in main(), beside DAG_FILE: dag.json -> dag.checkpoint.json. See the
-# "Cancelling and resuming" section of the module docstring.
+# Set in main(), beside DAG_FILE: DAGS_DIR/<user_id>_dag.json ->
+# DAGS_DIR/<user_id>_dag.checkpoint.json. The checkpoint is per user, the
+# way the DAG file is, and gitignored. See the "Cancelling and resuming"
+# section of the module docstring.
 CHECKPOINT_FILE = ""
 REFERENCES_FILE = ""
-# Set in main(), beside REFERENCES_FILE: the optional operator notes the
-# planner sees as "Human comments" (see the module docstring).
+# Set in main(), beside REFERENCES_FILE: the optional, gitignored operator
+# notes the planner sees as "Human comments" — this user's own, never
+# committed or shared (see the module docstring; .comments, "Comments").
 COMMENTS_FILE = ""
 PROMPT_PATHS: Dict[str, str] = {name: name for name in workspace.PROMPT_FILES}
 
@@ -216,6 +266,114 @@ PLANNER_CANDIDATES = 5
 # collections is deliberately not built yet.
 PLANNER_REFERENCE_LIMIT = 100
 
+# The lemma window: how many proved lemmas reach the agents in full. A
+# complete DAG of many users' files would otherwise put every statement
+# into every prompt. Shown in full are the LEMMAS_ALL most recently proved
+# lemmas, anyone's, together with the MY_LEMMAS most recently proved of the
+# current user's own (the two overlap, and are deduplicated); every other
+# proved lemma is listed by id only, as an index (lemma_window). -1 is no
+# limit. Recency is the lemma's proved_at stamp, written at commit.
+LEMMAS_ALL = 25
+MY_LEMMAS = 25
+# A third, fixed-size group: the LEMMAS_COMMON lemmas outside the two
+# recency windows that the shown lemmas cite most often (direct citations
+# only), shown statement-only. Ties are broken in an order random per run
+# but fixed within it (_TIEBREAK_SEED), so the prompt does not churn from
+# call to call. A lemma nothing shown cites does not rank.
+LEMMAS_COMMON = 10
+_TIEBREAK_SEED = random.getrandbits(64)
+
+
+def _window_size(text: str) -> int:
+    """A lemma-window size: a count, or -1 for no limit."""
+    n = int(text)
+    if n < -1:
+        raise argparse.ArgumentTypeError(f"{n} is neither a count nor -1")
+    return n
+
+
+# How agents call tools (tools.py): "auto" tries the server's native tool
+# calling and falls back to the JSON protocol the first time the server
+# refuses it (a llama-server without --jinja); "json" uses the protocol
+# from the start. _NATIVE_TOOLS_OK is what auto has learned: None until a
+# refusal, then False for the rest of the process.
+TOOL_MODE = "auto"
+_NATIVE_TOOLS_OK: Optional[bool] = None
+
+
+def _native_tools() -> bool:
+    return TOOL_MODE == "auto" and _NATIVE_TOOLS_OK is not False
+
+
+def _disable_native_tools(why: str, verbose: bool) -> None:
+    global _NATIVE_TOOLS_OK
+    if _NATIVE_TOOLS_OK is not False:
+        _NATIVE_TOOLS_OK = False
+        log(
+            f"⚠️  The server refused native tool calls ({why[:200]}); using "
+            f"the JSON tool protocol for the rest of the run. Launch "
+            f"llama-server with --jinja for native tool calls.",
+            verbose,
+        )
+
+
+def agent_tools(
+    dag: Dict[str, Any],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
+) -> Optional["tools_mod.ToolSet"]:
+    """The tools an agent shown the lemma window is offered: lookup_lemmas,
+    over the same lemmas the window chose from — or None when the window
+    shows every proved lemma, so a small DAG's prompts carry no tools."""
+    _shown, _common, index = lemma_window(dag, suspended)
+    if not index:
+        return None
+    return tools_mod.ToolSet([tools_mod.lemma_lookup(dag["lemmas"], suspended)])
+
+
+def add_tool_flags(parser: argparse.ArgumentParser) -> None:
+    """--tool-mode: taken by proofs run and proofs repair, beside the
+    lemma window's flags."""
+    parser.add_argument(
+        "--tool-mode", choices=("auto", "json"), default=TOOL_MODE,
+        help=(
+            "How agents call tools such as lookup_lemmas. auto (default): "
+            "the server's native tool calling, falling back to a JSON "
+            "protocol if the server refuses it (llama-server needs --jinja "
+            "for native calls). json: the JSON protocol from the start."
+        ),
+    )
+
+
+def add_lemma_window_flags(parser: argparse.ArgumentParser) -> None:
+    """--lemmas-all and --my-lemmas, the lemma window's two sizes: taken by
+    proofs run and by proofs repair, the two commands whose agents are
+    shown the proved lemmas."""
+    parser.add_argument(
+        "--lemmas-all", type=_window_size, default=LEMMAS_ALL, metavar="N",
+        help=(
+            "Show the agents the N most recently proved lemmas, anyone's, "
+            f"in full (default: {LEMMAS_ALL}; -1 for all). The rest are "
+            "listed by id."
+        ),
+    )
+    parser.add_argument(
+        "--lemmas-common", type=_window_size, default=LEMMAS_COMMON,
+        metavar="K",
+        help=(
+            "Also show the K lemmas the shown lemmas cite most often, "
+            f"statement only (default: {LEMMAS_COMMON}; -1 for every cited "
+            "lemma). Ties are broken randomly, fixed for the run."
+        ),
+    )
+    parser.add_argument(
+        "--my-lemmas", type=_window_size, default=MY_LEMMAS, metavar="N",
+        help=(
+            "Also show the N most recently proved of your own lemmas in "
+            f"full (default: {MY_LEMMAS}; -1 for all). Overlap with "
+            "--lemmas-all is shown once."
+        ),
+    )
+
 # The verification steps: a proof enters the DAG only after every one of
 # these verifier agents has accepted it. Each is a separate agent — its own
 # prompt file and role, run as a single atomic check — rather than one
@@ -228,6 +386,18 @@ VERIFIER_AGENTS = ("verifier_1.md", "verifier_2.md", "verifier_3.md")
 # How many prover rounds one iteration may spend on a lemma before giving it
 # up and re-planning.
 MAX_PROOF_ATTEMPTS = 3
+# Parallel mode: how many times a proof loop that crashed (an unexpected
+# exception, not a stop) is restarted in a row — the count resets whenever
+# the loop finishes a lemma — before it is given up for the run, and how
+# long it waits before each restart. The bound matters because a
+# restart resumes the round it crashed in: a crash that repeats on that
+# round would otherwise restart forever.
+MAX_LOOP_RESTARTS = 3
+# proofs verify / proofs repair: the exit code when a verifier gave no
+# verdict (the server failed, or the reply could not be read). Distinct from
+# 1, a real rejection, and from argparse's 2; nothing was written.
+EXIT_NO_VERDICT = 3
+LOOP_RESTART_DELAY = 10
 
 # "auto" reproduces the original behaviour end to end. "human" stops at every
 # planning step. Set from --mode, then mutated by the hotkey and the menu, so
@@ -383,17 +553,17 @@ _LEMMA_SCHEMA: Dict[str, Any] = {
 # not cover array cardinality, so writing them here would look like an
 # enforced guarantee while enforcing nothing. The count is requested in
 # planner.md and trimmed in planner_candidates().
+#
+# No flag says the conjecture is settled: that is computed from the DAG
+# (resolution.find), and the planner attempts the conjecture by proposing
+# a candidate under a reserved id (resolution.RESERVED_IDS).
 PLANNER_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "is_conjecture_proved": {"type": "boolean"},
-        "is_conjecture_disproved": {"type": "boolean"},
         "plan_summary": {"type": "string"},
         "candidate_lemmas": {"type": "array", "items": _LEMMA_SCHEMA},
     },
     "required": [
-        "is_conjecture_proved",
-        "is_conjecture_disproved",
         "plan_summary",
         "candidate_lemmas",
     ],
@@ -405,14 +575,10 @@ PLANNER_SCHEMA: Dict[str, Any] = {
 PARALLEL_PLANNER_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
-        "is_conjecture_proved": {"type": "boolean"},
-        "is_conjecture_disproved": {"type": "boolean"},
         "plan_summary": {"type": "string"},
         "priorities": {"type": "array", "items": {"type": "string"}},
     },
     "required": [
-        "is_conjecture_proved",
-        "is_conjecture_disproved",
         "plan_summary",
     ],
 }
@@ -482,50 +648,1867 @@ def load_file(filepath: Any) -> str:
         return f.read().strip()
 
 
+def _dep_to_json(dep: Any) -> Any:
+    """A dependency as it is stored in a DAG file: a lemma as the
+    {"user_id", "lemma_id"} object that identifies it, a parsed reference as
+    its bare id (reference ids are global, so bare is right)."""
+    if isinstance(dep, tuple):
+        return {"user_id": dep[0], "lemma_id": dep[1]}
+    return str(dep)
+
+
+def _citation_label(dep: Any) -> str:
+    """How a citation is spelled for a log line: user:lemma for a lemma,
+    the bare id for a reference."""
+    if isinstance(dep, tuple):
+        return f"{dep[0]}:{dep[1]}"
+    return str(dep)
+
+
+def lemma_id_set(
+    dag: Dict[str, Any],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
+) -> Set[str]:
+    """Every lemma_id in the complete DAG, whoever proved it: the id space
+    a new lemma must not restate, the way the old single-file DAG's
+    'already in the DAG' test meant it.
+
+    Given the suspension (suspension.Suspension.suspended, recomputed from
+    the hashes, the certificates and the refutations — ".comments",
+    "Suspension"), a suspended lemma's id is not in this set: the id is up
+    for grabs again, for the users whose files do not hold it — a proof
+    under an id the DAG holds only under suspension is a fresh proof, not a
+    build on the suspended lemma, and screening it out would make the id
+    dead for everyone until the suspended node is repaired. The suspended
+    node itself is lifted by proofs verify or proofs repair re-accepting
+    it, which re-issues the certificate for the proof in the file."""
+    return {
+        lid
+        for (u, lid) in dag["lemmas"]
+        if suspended is None or (u, lid) not in suspended
+    }
+
+
+def _warn_suspended(
+    susp: "suspension.Suspension",
+    verbose: bool,
+    warned: Optional[Set[Tuple[str, str]]] = None,
+    dag: Optional[Dict[str, Any]] = None,
+) -> None:
+    """The run's warning for the suspended lemmas (".comments",
+    "Suspension"): a lemma with a refutation whose hash matches it, or
+    without a valid certificate, or citing a lemma that has either, is
+    hidden from the planner, the selector and the prover, and the operator
+    is told so. With a warned set, once per lemma per run, the way the
+    dangling-citation warning is told; without one, about every suspended
+    lemma now.
+
+    One case gets its own message: a lemma committed but never certified —
+    suspended only for having no certificate, with no refutation and no
+    certificate line in any file, ever. That is a run stopped between the
+    commit of an accepted proof and its certificate (a kill, or a failed
+    certificate write); nothing is wrong with the proof that anyone has
+    recorded, and proofs verify is how it gets its certificate."""
+    pending = [
+        p for p in sorted(susp.suspended)
+        if warned is None or p not in warned
+    ]
+    if not pending:
+        return
+    ever_certified = {
+        (str(c.get("user_id") or ""), str(c.get("lemma_id") or ""))
+        for c in certificates.load_all(CONJECTURE_ROOT)
+    }
+    for u, lid in pending:
+        if warned is not None:
+            warned.add((u, lid))
+        if (
+            susp.reasons(u, lid) == ["no valid certificate"]
+            and (u, lid) not in ever_certified
+        ):
+            dag_path = os.path.join(DAGS_DIR, f"{u}_dag.json")
+            node = (dag or {}).get("lemmas", {}).get((u, lid)) or {}
+            if node.get("provenance") == "operator":
+                # No proof to verify: the verifiers would reject the
+                # placeholder text and write a refutation.
+                log(
+                    f"⚠️  {u}:{lid} was asserted by the operator but its "
+                    f"certificate was never written — a run stopped between "
+                    f"the commit and the certificate. It is suspended "
+                    f"until certified. Do not proofs verify it (there is no "
+                    f"proof to check): remove it from {dag_path} and assert "
+                    f"it again at the menu.",
+                    verbose,
+                )
+                continue
+            log(
+                f"⚠️  {u}:{lid} was committed but never certified — a run "
+                f"stopped between the commit and the certificate. It is "
+                f"suspended (hidden from the planner, the selector and the "
+                f"prover) until certified: run proofs verify {dag_path} "
+                f"{lid}.",
+                verbose,
+            )
+            continue
+        log(
+            f"⚠️  {u}:{lid} is suspended ({'; '.join(susp.reasons(u, lid))}); "
+            f"it is hidden from the planner, the selector and the prover, "
+            f"and proofs run will not build on it. proofs verify and "
+            f"proofs repair still load it: re-accepting it (and any "
+            f"suspended lemma it cites) re-issues the certificate and "
+            f"lifts the suspension.",
+            verbose,
+        )
+
+
+def _settled(
+    dag: Dict[str, Any],
+    suspended: Set[Tuple[str, str]],
+    conjecture: str,
+    verbose: bool,
+) -> Optional[str]:
+    """Whether the DAG settles the conjecture now (resolution.find): the
+    kind, "proved" or "disproved", or None while it is open. Logs the
+    lemma that settles it. A DAG that holds both a proof and a disproof
+    settles nothing — it is inconsistent, and the run is told so and goes
+    on, since a repair is the way out of it, not a stop."""
+    found = resolution.find(dag["lemmas"], suspended, conjecture)
+    kinds = {r.kind for r in found}
+    if len(kinds) > 1:
+        log(
+            "⚠️  The DAG both proves and disproves the conjecture ("
+            + "; ".join(_citation_label(r.pair) for r in found)
+            + "): at least one of these proofs is wrong. Treating the "
+            "conjecture as open; proofs verify --full on each will show "
+            "where.",
+            verbose,
+        )
+        return None
+    if not found:
+        return None
+    for r in found:
+        log(f"🎉 {resolution.describe(r)}.", verbose)
+    return found[0].kind
+
+
+def _committed_uncertified(
+    dag: Dict[str, Any],
+    susp: "suspension.Suspension",
+    in_flight: Dict[str, Any],
+) -> bool:
+    """Whether a checkpoint's in-flight lemma is already in the current
+    user's file, committed but never certified: the state a run leaves when
+    it stops between the commit of an accepted proof and its certificate
+    (a kill, or a certificate write that failed — Ctrl-C is held off for
+    that step, see _commit_section).
+
+    Suspended (no certificate), so the resume's "already in the DAG" test
+    does not see it, and without this the resume would re-prove it and
+    commit the new proof beside it as id_2. Only that state answers yes:
+    the user's own lemma under the in-flight id, stating the in-flight
+    target, suspended, not refuted, and with no certificate line at all in
+    any file — never certified, rather than certified once and gone stale.
+    A lemma the user's file holds under suspension for any other reason (a
+    refutation, a stale certificate) is a fresh proof's to replace, and the
+    resume goes ahead."""
+    pair = (USER, str(in_flight.get("lemma_id") or ""))
+    node = dag["lemmas"].get(pair)
+    if node is None or pair not in susp.suspended or pair in susp.refuted:
+        return False
+    target = in_flight.get("target") or {}
+    if merkle.normalize(node.get("statement")) != merkle.normalize(
+        target.get("statement")
+    ):
+        return False
+    return not any(
+        str(c.get("user_id") or "") == pair[0]
+        and str(c.get("lemma_id") or "") == pair[1]
+        for c in certificates.load_all(CONJECTURE_ROOT)
+    )
+
+
+def _uncertified_message(lemma_id: str) -> str:
+    return (
+        f"⚠️  In-flight {lemma_id} is already in {os.path.basename(DAG_FILE)}"
+        f", committed but never certified (the last run stopped between "
+        f"the two). It is suspended until certified: run proofs verify "
+        f"{DAG_FILE} {lemma_id}. Not re-proving it."
+    )
+
+
+def _lemma_pair_from(entry: Any) -> Optional[Tuple[str, str]]:
+    """The (user_id, lemma_id) pair an entry declares, or None.
+
+    A pair is a dict with usable "user_id"/"lemma_id" strings — the shape
+    it has in a DAG file and in the prover's JSON — or a two-item tuple /
+    list of the same (the shape a pair has in memory, or across a
+    checkpoint). A bare id is not a pair: a lemma_id is unique only within
+    one user's file, so on its own it names no particular lemma."""
+    if isinstance(entry, dict):
+        uid = entry.get("user_id")
+        lid = entry.get("lemma_id")
+        if isinstance(uid, str) and isinstance(lid, str) and uid and lid:
+            return (uid.strip(), lid.strip())
+    elif isinstance(entry, (tuple, list)) and len(entry) == 2:
+        uid, lid = entry
+        if isinstance(uid, str) and isinstance(lid, str) and uid and lid:
+            return (uid.strip(), lid.strip())
+    return None
+
+
+def _citation_display(entry: Any) -> str:
+    """How a citation entry reads in a log line: a pair as
+    "user_id:lemma_id", a bare id as itself, anything else as JSON."""
+    pair = _lemma_pair_from(entry)
+    if pair is not None:
+        return f"{pair[0]}:{pair[1]}"
+    if isinstance(entry, str):
+        return entry
+    try:
+        return json.dumps(entry, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return repr(entry)
+
+
+def _check_prover_citations(
+    raw_lemmas: Any,
+    raw_references: Any,
+    dag: Dict[str, Any],
+    ref_ids: Set[str],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
+) -> Tuple[List[Tuple[str, str]], List[str], List[Tuple[str, str]]]:
+    """The prover's declared citations, normalized and checked against the
+    complete DAG (.comments, "Citations").
+
+    cited_lemmas is an array of {"user_id", "lemma_id"} objects, every pair
+    of which is checked against the complete DAG; cited_references is a
+    separate list of reference ids. Returns (cited_lemmas,
+    cited_references, unmatched): the surviving pairs, the surviving
+    reference ids, and (label, kind) for every entry that matched nothing —
+    kind is "lemma" for a pair that names no lemma in any user's file,
+    "reference" for an id that is in neither the DAG nor the reference
+    collection, "suspended" for a pair that names a suspended lemma, and
+    "other" for an entry that is neither a pair nor an id.
+    The caller sends the unmatched back to the prover as feedback; the
+    "reference" ones are the maintainer's to supply, since references.md is
+    the conjecture's committed collection and only the maintainer adds to
+    it (.comments, "References").
+
+    Lenient on shape, strict on existence: a bare id in cited_lemmas that
+    is a reference id (or exactly one lemma's id) is read as the citation
+    it can mean, and a pair misplaced in cited_references is read as a
+    lemma citation — but whatever an entry names, it must exist, or it is
+    unmatched.
+
+    Given the suspension, a suspended lemma is unmatched too, as
+    "suspended": the prover was not shown it and may not build on it
+    (".comments", "Suspension"). Let through, it would suspend the new
+    lemma the moment it was committed — and in a repair, a citation of the
+    lemma being re-proved, or of one of its dependents (all suspended by
+    the rejection that started the repair), would close a citation cycle
+    once the new proof replaced the old one in place. A bare id resolves
+    only to an unsuspended lemma for the same reason."""
+    suspended = suspended or set()
+    owners: Dict[str, List[str]] = {}
+    suspended_ids: Set[str] = set()
+    for u, lid in dag["lemmas"]:
+        if (u, lid) in suspended:
+            suspended_ids.add(lid)
+        else:
+            owners.setdefault(lid, []).append(u)
+
+    cited_lemmas: List[Tuple[str, str]] = []
+    cited_references: List[str] = []
+    unmatched: List[Tuple[str, str]] = []
+    seen_pairs: Set[Tuple[str, str]] = set()
+    seen_refs: Set[str] = set()
+    seen_unmatched: Set[str] = set()
+
+    def report_unmatched(label: str, kind: str) -> None:
+        if label not in seen_unmatched:
+            seen_unmatched.add(label)
+            unmatched.append((label, kind))
+
+    def take_pair(pair: Tuple[str, str]) -> None:
+        if pair in suspended:
+            report_unmatched(f"{pair[0]}:{pair[1]}", "suspended")
+        elif pair in dag["lemmas"]:
+            if pair not in seen_pairs:
+                seen_pairs.add(pair)
+                cited_lemmas.append(pair)
+        else:
+            report_unmatched(f"{pair[0]}:{pair[1]}", "lemma")
+
+    def take_ref(rid: str) -> None:
+        if rid in ref_ids:
+            if rid not in seen_refs:
+                seen_refs.add(rid)
+                cited_references.append(rid)
+        else:
+            report_unmatched(rid, "reference")
+
+    def take_bare(rid: str) -> None:
+        if rid in ref_ids:
+            take_ref(rid)
+        elif len(owners.get(rid, [])) == 1:
+            take_pair((owners[rid][0], rid))
+        elif rid in suspended_ids and rid not in owners:
+            report_unmatched(rid, "suspended")
+        else:
+            report_unmatched(rid, "reference")
+
+    for entry in raw_lemmas if isinstance(raw_lemmas, list) else []:
+        pair = _lemma_pair_from(entry)
+        if pair is not None:
+            take_pair(pair)
+        elif isinstance(entry, str) and entry.strip():
+            take_bare(entry.strip())
+        else:
+            report_unmatched(_citation_display(entry), "other")
+    for entry in raw_references if isinstance(raw_references, list) else []:
+        if isinstance(entry, str) and entry.strip():
+            take_bare(entry.strip())
+        else:
+            pair = _lemma_pair_from(entry)
+            if pair is not None:
+                take_pair(pair)
+            else:
+                report_unmatched(_citation_display(entry), "other")
+    return cited_lemmas, cited_references, unmatched
+
+
 def load_dag() -> Dict[str, Any]:
-    """Load current DAG state from file. Absent file => empty DAG."""
+    """The complete DAG: the merge of every user's DAG file in dags/.
+
+    Each file in dags/ is one user's lemmas, named <user_id>_dag.json, and
+    the merge keys them by the pair (user_id, lemma_id) — a bare lemma_id
+    is unique only within one user's file, so the pair is the only key that
+    cannot collide. Every node carries both fields, with the file's name
+    authoritative for its owner. Citations are stored the same way
+    (.comments, "Citations"): cited_lemmas is an array of {"user_id",
+    "lemma_id"} objects, read in memory as a list of (user_id, lemma_id)
+    tuples, and cited_references a separate array of bare reference ids.
+    Older files may still carry the mixed "dependencies" list (pair objects
+    and bare reference ids in one field); the second pass below migrates
+    it.
+
+    This is a read-only view: the run writes new lemmas to the current
+    user's file alone (commit_lemma_to_dag) and never to another user's
+    file.
+    """
+    dag: Dict[str, Any] = {"lemmas": {}}
+    if not DAGS_DIR or not os.path.isdir(DAGS_DIR):
+        return dag
+    for path in sorted(glob.glob(os.path.join(DAGS_DIR, "*_dag.json"))):
+        file_user = os.path.basename(path)[: -len("_dag.json")]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            # Unreadable means corrupt or cut off; it is another user's
+            # file, so the run goes on without its lemmas rather than
+            # dying — but the operator must see it, so the warning is
+            # logged unconditionally (a load_dag() per iteration repeats
+            # it, which is the point: a corrupt file is a state the run
+            # should not be able to shrug off silently).
+            print(
+                f"⚠️  {os.path.basename(path)} is unreadable ({e}); its "
+                f"lemmas are skipped.",
+            )
+            continue
+        if not isinstance(data, dict):
+            continue
+        lemmas = data.get("lemmas")
+        if not isinstance(lemmas, dict):
+            continue
+        for lid, node in lemmas.items():
+            if not isinstance(node, dict):
+                continue
+            node = dict(node)
+            node["user_id"] = file_user
+            node["lemma_id"] = str(lid)
+            key = (file_user, str(lid))
+            if key not in dag["lemmas"]:
+                dag["lemmas"][key] = node
+    # Second pass: split each node's citations into the two stored fields
+    # (.comments, "Citations"). A lemma citation is the (user_id, lemma_id)
+    # pair its file names it, a reference citation the reference's bare id.
+    # Older files still carry the mixed "dependencies" list (pair objects
+    # and bare reference ids in one field): a pair object becomes a lemma
+    # pair, and a bare id a reference citation — except that a bare id
+    # exactly one lemma in the merge owns is read as that lemma's pair, the
+    # legacy spelling of a lemma citation. Whatever cannot be resolved is
+    # kept in the field its shape names, where the dangling-citation check
+    # in the run loop will see it.
+    owners: Dict[str, List[str]] = {}
+    for u, lid in dag["lemmas"]:
+        owners.setdefault(lid, []).append(u)
+    for node in dag["lemmas"].values():
+        cited_lemmas: List[Tuple[str, str]] = []
+        cited_references: List[str] = []
+        seen_pairs: Set[Tuple[str, str]] = set()
+        seen_refs: Set[str] = set()
+        for field in ("cited_lemmas", "dependencies"):
+            entries = node.get(field)
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                pair = _lemma_pair_from(entry)
+                if pair is not None:
+                    if pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        cited_lemmas.append(pair)
+                    continue
+                if isinstance(entry, str):
+                    rid = entry.strip()
+                    if not rid:
+                        continue
+                    if len(owners.get(rid, [])) == 1:
+                        pair = (owners[rid][0], rid)
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            cited_lemmas.append(pair)
+                    elif rid not in seen_refs:
+                        # A reference id, or a bare id nothing owns: kept
+                        # as a reference citation, where the dangling check
+                        # will flag it if the id is gone.
+                        seen_refs.add(rid)
+                        cited_references.append(rid)
+                # anything else (a number, null) names nothing: dropped
+        entries = node.get("cited_references")
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, str):
+                    rid = entry.strip()
+                    if rid and rid not in seen_refs:
+                        seen_refs.add(rid)
+                        cited_references.append(rid)
+        node["cited_lemmas"] = cited_lemmas
+        node["cited_references"] = cited_references
+        # The legacy field is migrated, not mirrored: drop it so a save of
+        # a loaded DAG writes only the two stored fields.
+        node.pop("dependencies", None)
+    return dag
+
+
+def load_user_dag() -> Dict[str, Any]:
+    """The current user's own DAG file, or an empty one.
+
+    The file the run writes to, read whole: commit_lemma_to_dag updates one
+    lemma in it and save_user_dag() updates its top-level fields, and both
+    keep whatever else the file holds. A file that exists but is not a JSON
+    object is an error, not an empty DAG: it is the operator's data, and
+    overwriting it would be worse than failing loudly.
+    """
     if os.path.exists(DAG_FILE):
         with open(DAG_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"{DAG_FILE} must hold a JSON object")
+        return data
     return {"lemmas": {}}
 
 
-def save_dag(dag: Dict[str, Any]) -> None:
-    """Save updated DAG state to file, creating it if needed.
+def _user_header() -> Dict[str, str]:
+    """The user identity stamped at the top of the per-user files this run
+    writes as its own user: the config's user.id, user.name and user.email
+    (".comments", "User identity") — user.id is the run's USER, the file's
+    name, and name and email are whatever the config holds, the empty
+    string where it holds none. The DAG file carries it as the first
+    entries of its object, the certificate file as its first line: the
+    header that says whose file this is, beside the name that already said
+    it, so the file stands alone when it is read out of context."""
+    return {
+        config.USER_ID_KEY: USER,
+        config.USER_NAME_KEY: config.get(config.USER_NAME_KEY) or "",
+        config.USER_EMAIL_KEY: config.get(config.USER_EMAIL_KEY) or "",
+    }
 
-    Whole-file write: temp file beside the DAG, then os.replace, the
-    checkpoint's way. The parallel loops read the DAG from several threads
-    at once, and a plain open("w") lets a reader catch the file mid-write
-    (an empty or half-formed file) and crash the loop on the parse."""
+
+def _write_user_file(data: Dict[str, Any]) -> None:
+    """Whole-file write of the current user's DAG file: temp file beside it,
+    then os.replace, the checkpoint's way. The parallel loops read the DAG
+    from several threads at once, and a plain open("w") lets a reader catch
+    the file mid-write (an empty or half-formed file) and crash the loop on
+    the parse. The file's first entries are the run's user identity, the
+    header the per-user files carry (".comments", "User identity"), kept
+    at the top and refreshed from the config on every write."""
+    header = _user_header()
+    data = {**header, **{k: v for k, v in data.items() if k not in header}}
+    os.makedirs(DAGS_DIR, exist_ok=True)
     tmp = DAG_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(dag, f, indent=2)
+        json.dump(data, f, indent=2)
     os.replace(tmp, DAG_FILE)
+
+
+def _ensure_user_dag_file() -> None:
+    """The current user's DAG file, created empty if absent.
+
+    Both loops discard a checkpoint that has no DAG file beside it: the
+    operator deleting the user's DAG file is how a run resets, and a
+    checkpoint outliving its DAG would resurrect the old budget and
+    in-flight lemma. An interrupted run must resume, not reset, so the
+    file is in place before the first checkpoint can be written.
+    """
+    if not os.path.exists(DAG_FILE):
+        save_user_dag({"lemmas": {}})
+
+
+def save_user_dag(dag: Dict[str, Any]) -> None:
+    """Write the current user's file back from the complete DAG: the user's
+    own lemmas (the only lemmas the file may hold), with the node fields
+    this run owns (user_id, lemma_id, cited_lemmas as {"user_id",
+    "lemma_id"} objects, cited_references as bare ids). Whether the
+    conjecture is settled is never written: it is recomputed from the
+    lemmas (resolution.py). Other users' lemmas stay in their own files,
+    which the run never writes."""
+    with DAG_LOCK:
+        data = load_user_dag()
+        # Files from before resolution was computed may still carry these.
+        for top in ("conjecture", "status"):
+            data.pop(top, None)
+        data["lemmas"] = {
+            lid: {
+                **{k: v for k, v in node.items()
+                   if k not in ("cited_lemmas", "cited_references")},
+                "cited_lemmas": [
+                    _dep_to_json(d) for d in node.get("cited_lemmas", [])
+                ],
+                "cited_references": list(
+                    node.get("cited_references", [])
+                ),
+            }
+            for (u, lid), node in dag["lemmas"].items()
+            if u == USER
+        }
+        _write_user_file(data)
 
 
 def commit_lemma_to_dag(
     lemma_id: str, node: Dict[str, Any]
 ) -> Tuple[str, bool]:
-    """Commit node to the DAG under lemma_id, or under a fresh
-    non-colliding id if lemma_id is already taken. The id check and the
-    write are one step under the DAG lock, so the check can never go
-    stale: a writer that finds its id taken commits under lemma_id_2 (or
-    _3, ...) rather than over the first proof, and the renamed node
-    carries "renamed_from" so the DAG stays self-explanatory. Returns
-    (committed_id, renamed)."""
+    """Commit node to the current user's DAG file under lemma_id, or under
+    a fresh non-colliding id if lemma_id is already taken in that file. The
+    id check and the write are one step under the DAG lock, so the check
+    can never go stale: a writer that finds its id taken commits under
+    lemma_id_2 (or _3, ...) rather than over the first proof, and the
+    renamed node carries "renamed_from" so the DAG stays self-explanatory.
+    A collision is with the current user's own lemmas: lemma_id is unique
+    only within one user's DAG, so a lemma another user proved under the
+    same id is no collision at all. The node is stored with its user_id and
+    lemma_id and its citations in the two stored fields (.comments,
+    "Citations"): cited_lemmas as {"user_id", "lemma_id"} objects,
+    cited_references as bare ids — no hashes, anywhere in the file — and
+    the moment of the commit as proved_at (the lemma window's recency).
+    Returns (committed_id, renamed)."""
     with DAG_LOCK:
+        data = load_user_dag()
+        lemmas = data.get("lemmas")
+        if not isinstance(lemmas, dict):
+            lemmas = {}
+        if lemma_id not in lemmas:
+            committed_id = lemma_id
+        else:
+            suffix = 2
+            while f"{lemma_id}_{suffix}" in lemmas:
+                suffix += 1
+            committed_id = f"{lemma_id}_{suffix}"
+        new_node = dict(node)
+        new_node["user_id"] = USER
+        new_node["lemma_id"] = committed_id
+        # When the lemma was proved: the lemma window's recency order.
+        # Not part of the Merkle hash, which covers only the statement,
+        # the proof and the citations.
+        new_node["proved_at"] = certificates.now_iso()
+        new_node["cited_lemmas"] = [
+            _dep_to_json(d) for d in node.get("cited_lemmas", [])
+        ]
+        new_node["cited_references"] = list(
+            node.get("cited_references", [])
+        )
+        if committed_id != lemma_id:
+            new_node["renamed_from"] = lemma_id
+        lemmas[committed_id] = new_node
+        data["lemmas"] = lemmas
+        _write_user_file(data)
+        return committed_id, committed_id != lemma_id
+
+
+# ----------------------------------------------------------------------------
+# Certificates
+# ----------------------------------------------------------------------------
+# The record that a lemma was accepted (.comments, "Certificates"). The run
+# writes a certificate the moment an acceptance happens — the three verifier
+# checks accepting a proof, or the operator asserting one in human mode —
+# into this run's user's file, the verifier's, whoever owns the lemma. The storage, the upsert rule and the validity check
+# live in certificates.py; this is the run's one entry point to them.
+
+def record_certificate(
+    lemma_id: str, model: str, verbose: bool = True, owner: Optional[str] = None,
+) -> None:
+    """Record a certificate for a lemma this run just accepted.
+
+    The hash is the lemma's current Merkle hash, recomputed after the
+    commit from the DAG reloaded from the files and references.md, so the
+    line covers the proof that is in the file now and stays valid until
+    the lemma's statement, its proof, or anything it cites changes. model
+    is the verifier's model name; a human acceptance records "". A
+    certificate is the record of an acceptance; a failure to write it must
+    not undo the acceptance, so every failure here degrades to a warning.
+
+    owner is the lemma's owner, the certificate's user_id. It defaults to
+    the current user: the run commits only its own lemmas, while proofs
+    repair commits a re-proof in place in the owner's file (".comments",
+    "Repair"). The verifier is either way the user whose run accepted the
+    proof, and the line goes into that user's certificates/ file — never
+    the owner's.
+    """
+    owner = owner or USER
+    try:
         dag = load_dag()
-        if lemma_id not in dag["lemmas"]:
-            dag["lemmas"][lemma_id] = node
-            save_dag(dag)
-            return lemma_id, False
-        suffix = 2
-        while f"{lemma_id}_{suffix}" in dag["lemmas"]:
-            suffix += 1
-        committed_id = f"{lemma_id}_{suffix}"
-        dag["lemmas"][committed_id] = {**node, "renamed_from": lemma_id}
-        save_dag(dag)
-        return committed_id, True
+        m = merkle.Merkle(dag["lemmas"], load_references())
+        h = m.hash(owner, lemma_id)
+    except KeyError:
+        log(
+            f"⚠️  No certificate for {lemma_id}: it is not in the DAG "
+            f"just loaded; the acceptance stands, the certificate is "
+            f"skipped.",
+            verbose,
+        )
+        return
+    except merkle.MerkleCycleError as e:
+        log(f"⚠️  No certificate for {lemma_id}: {e}", verbose)
+        return
+    try:
+        cert = certificates.record(
+            CONJECTURE_ROOT, owner, lemma_id, h, USER, model,
+            user=_user_header(),
+        )
+    except OSError as e:
+        log(
+            f"⚠️  Could not write the certificate for {lemma_id}: {e}",
+            verbose,
+        )
+        return
+    how = f"model {model}" if model else "human acceptance"
+    log(
+        f"📜 Certificate for {lemma_id}: accepted by {USER} ({how}), "
+        f"count {cert['count']}.",
+        verbose,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Verify and repair: the verification path proofs verify and proofs repair
+# share (".comments", "Verify", "Refutations", "Repair")
+# ----------------------------------------------------------------------------
+# A lemma that is already in the DAG is verified the way the proof loop
+# verifies a proposed proof: the three verifier agents in order, each a
+# single atomic check, and the first rejection ends the count (a proof the
+# verifiers are not all for is not accepted, whatever the rest would say).
+# What differs from the loop is what the verdict does to the record, and
+# only proofs verify and proofs repair do this: a rejection writes a
+# refutation file (".comments", "Refutations"), an acceptance issues the
+# certificate the Certificates section requires of a verify or repair
+# acceptance, and the refutations whose justifications were on the table
+# are dismissed. proofs run never takes this path: a rejection inside the
+# loop is feedback to its own reviser, not a committed record, and
+# refutations are not made during the run.
+
+
+def _citation_closure(
+    dag: Dict[str, Any], user_id: str, lemma_id: str,
+) -> List[Tuple[str, str]]:
+    """The lemma's cited-lemma closure in dependency order: every lemma it
+    cites, dependencies first, the target last — the order proofs verify
+    --full verifies in, cited lemmas before the lemma that cites them.
+
+    A cited pair the DAG does not hold is skipped (a dangling citation is
+    the verifier's to see as an absent result, not the closure's to
+    chase), and a citation cycle is cut at the first repeat rather than
+    followed: the Merkle hash of a cycle would raise MerkleCycleError
+    anyway, so the closure cannot loop where the hash would refuse to.
+    """
+    lemmas = dag["lemmas"]
+    out: List[Tuple[str, str]] = []
+    done: Set[Tuple[str, str]] = set()
+    on_stack: Set[Tuple[str, str]] = set()
+
+    def visit(u: str, lid: str) -> None:
+        pair = (u, lid)
+        if pair in done or pair in on_stack:
+            return
+        node = lemmas.get(pair)
+        if node is None:
+            return
+        on_stack.add(pair)
+        for cited in node.get("cited_lemmas", []):
+            if isinstance(cited, tuple) and len(cited) == 2:
+                visit(cited[0], cited[1])
+        on_stack.discard(pair)
+        done.add(pair)
+        out.append(pair)
+
+    visit(user_id, lemma_id)
+    return out
+
+
+def _dependent_chain(
+    dag: Dict[str, Any], start: Tuple[str, str],
+) -> List[Tuple[str, str]]:
+    """start's transitive dependents in dependency order: every lemma of
+    the DAG that cites start directly or transitively, each before the
+    lemmas that cite it — the reverse of _citation_closure's order, the
+    order proofs repair climbs the dependency chain (".comments",
+    "Repair").
+
+    The set is the reverse-citation closure of start; the order is a
+    post-order depth-first pass over the set's own citations, so a lemma
+    comes after every lemma it cites that is in the set. start itself is
+    not a dependent of itself and is never in the result, and a citation
+    cycle is cut at the first repeat, the way _citation_closure cuts one:
+    a lemma in a cycle has no Merkle hash to re-verify, and the climb
+    will not loop where the hash would refuse to.
+    """
+    lemmas = dag["lemmas"]
+    # The reverse edges: for each lemma, the lemmas that cite it.
+    cited_by: Dict[Tuple[str, str], List[Tuple[str, str]]] = {
+        key: [] for key in lemmas
+    }
+    for key, node in lemmas.items():
+        for cited in node.get("cited_lemmas", []):
+            if isinstance(cited, tuple) and len(cited) == 2 and cited in lemmas:
+                cited_by[cited].append(key)
+    # The dependent set: everything that reaches start by following the
+    # reverse edges — nothing else, so a dependent's unrelated citations
+    # are not pulled into the climb.
+    in_set: Set[Tuple[str, str]] = set()
+    queue: List[Tuple[str, str]] = [start]
+    while queue:
+        for dep in cited_by.get(queue.pop(), []):
+            if dep not in in_set:
+                in_set.add(dep)
+                queue.append(dep)
+    # Dependency order: emit a lemma after the lemmas it cites that are in
+    # the set; sorted start points keep the result deterministic.
+    out: List[Tuple[str, str]] = []
+    done: Set[Tuple[str, str]] = set()
+    on_stack: Set[Tuple[str, str]] = set()
+
+    def visit(u: str, lid: str) -> None:
+        pair = (u, lid)
+        if pair in done or pair in on_stack:
+            return
+        on_stack.add(pair)
+        for cited in lemmas[pair].get("cited_lemmas", []):
+            if isinstance(cited, tuple) and len(cited) == 2 and cited in in_set:
+                visit(cited[0], cited[1])
+        on_stack.discard(pair)
+        done.add(pair)
+        if pair != start:
+            out.append(pair)
+
+    for pair in sorted(in_set):
+        visit(pair[0], pair[1])
+    return out
+
+
+def _dependency_order(
+    dag: Dict[str, Any], pairs: Set[Tuple[str, str]],
+) -> List[Tuple[str, str]]:
+    """The given lemmas in dependency order: every lemma after the lemmas
+    it cites, dependencies first — the order proofs export writes them in
+    (".comments", "Export"), each result resting on the ones above it.
+
+    A post-order depth-first pass over the set's own citations, the way
+    _citation_closure and _dependent_chain order their sets: a citation
+    the set does not hold is not pulled in (an export of one user's
+    lemmas writes that user's lemmas; their dependencies live in the
+    other users' files, written by their own exports), and a citation
+    cycle is cut at the first repeat, the way those cut one — a cycle's
+    lemmas still get an order, one after the other, rather than an
+    export that never ends. Sorted start points keep the result
+    deterministic, the way _dependent_chain's do.
+    """
+    lemmas = dag["lemmas"]
+    out: List[Tuple[str, str]] = []
+    done: Set[Tuple[str, str]] = set()
+    on_stack: Set[Tuple[str, str]] = set()
+
+    def visit(u: str, lid: str) -> None:
+        pair = (u, lid)
+        if pair in done or pair in on_stack:
+            return
+        on_stack.add(pair)
+        for cited in lemmas[pair].get("cited_lemmas", []):
+            if isinstance(cited, tuple) and len(cited) == 2 and cited in pairs:
+                visit(cited[0], cited[1])
+        on_stack.discard(pair)
+        done.add(pair)
+        out.append(pair)
+
+    for pair in sorted(pairs):
+        visit(pair[0], pair[1])
+    return out
+
+
+def _replace_lemma_in_owner_file(
+    owner: str, lemma_id: str, node: Dict[str, Any]
+) -> None:
+    """Replace the lemma in place in the owner's DAG file (".comments",
+    "Repair"): the (user_id, lemma_id) pair the refutation named is kept,
+    in the owner's file, and the node's statement, proof and citations are
+    what the re-proof established. Unlike the run's commit, which writes
+    only the current user's file, this may write another user's file —
+    the repair's one cross-user write, and the section allows it.
+
+    The node is stored in the pipeline's commit shape — statement, proof,
+    the cited_lemmas pair objects, cited_references, user_id, lemma_id,
+    proved_at — the same shape a run's commit writes, so a repaired lemma reads the
+    same as a run-committed one; a stale field of the node it replaces
+    (the old proof's provenance among them) is dropped with it. The write
+    is under the DAG lock and atomic, the way the run's file writes are.
+    """
+    path = os.path.join(DAGS_DIR, f"{owner}_dag.json")
+    with DAG_LOCK:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} must hold a JSON object")
+        lemmas = data.get("lemmas")
+        if not isinstance(lemmas, dict) or lemma_id not in lemmas:
+            raise KeyError(f"{owner}:{lemma_id} is not in {path}")
+        lemmas[lemma_id] = {
+            "statement": node["statement"],
+            "proof": node["proof"],
+            "cited_lemmas": [
+                _dep_to_json(dep) for dep in node.get("cited_lemmas", [])
+            ],
+            "cited_references": list(node.get("cited_references", [])),
+            "user_id": owner,
+            "lemma_id": lemma_id,
+            # A re-proof is a fresh proof: it moves to the front of the
+            # lemma window, as a new commit does.
+            "proved_at": certificates.now_iso(),
+        }
+        if owner == USER:
+            # The run's own file: refresh the identity header at the top,
+            # the way _write_user_file does it. Another user's file keeps
+            # the header the owner stamped — the run does not hold the
+            # owner's name or email, and a header is the owner's to write.
+            header = _user_header()
+            data = {**header, **{k: v for k, v in data.items()
+                                 if k not in header}}
+        data["lemmas"] = lemmas
+        os.makedirs(DAGS_DIR, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+
+
+def _verifier_prompts(parser: argparse.ArgumentParser) -> Dict[str, str]:
+    """The three verifier prompts as the prompt paths give them, each
+    checked non-empty: a verifier with an empty system prompt is not a
+    verifier, and a missing prompt file is a setup error, not a verdict."""
+    verifier_sys = {name: load_file(PROMPT_PATHS[name]) for name in VERIFIER_AGENTS}
+    missing = [name for name in verifier_sys if not verifier_sys[name]]
+    if missing:
+        parser.error(f"no prompt text for: {', '.join(missing)}")
+    return verifier_sys
+
+
+def verify_stored_lemma(
+    dag: Dict[str, Any],
+    references: List[Dict[str, Any]],
+    user_id: str,
+    lemma_id: str,
+    conjecture_text: str,
+    verifier_sys: Dict[str, str],
+    verbose: bool,
+) -> Tuple[str, Optional[str]]:
+    """The three verifier checks on a lemma that is already in the DAG,
+    with the Refutations section's bookkeeping around them.
+
+    The lemma's current Merkle hash is recomputed from the DAG and
+    references as they stand now, and every refutation file the lemma has
+    is loaded. A refutation counts while its hash matches the current
+    one (refutations.is_counting); the ones that do not are stale —
+    objections to versions of the lemma that are no longer in the files —
+    and the stale justifications are the ones the section says must be
+    passed to the verifiers, so a known objection is not forgotten. The
+    counting ones go on the table as well, marked as such: an objection
+    to the proof as it stands now is the one a re-verification is
+    answering, and proofs repair runs on exactly that case. A lemma with
+    a counting refutation is warned about before the checks start.
+
+    A rejection ends the count, the run loop's rule, and the rejecting
+    verifier's justification is what the new refutation file records,
+    under the user who ran the verification and the model under which it
+    happened. An acceptance issues the certificate — the owner's file,
+    the verifier recorded the way a certificate records it — and
+    dismisses the refutations whose justifications were on the table: the
+    stale ones the section names, and the counting ones, answered.
+
+    A step that gives no verdict at all (_run_verifier's "": the server
+    failed or replied with nothing, the reply could not be read, or the
+    pass hit the context wall) ends the count too, but writes nothing: a
+    refutation is the record of a verifier's rejection, and a missing
+    verdict is not one — written, it would suspend the lemma and everything
+    above it for a server outage. Nothing is issued or dismissed either;
+    the lemma stands exactly as it did, and the verification can be re-run.
+
+    Returns (outcome, justification): ("accepted", None), ("rejected", the
+    rejecting justification), or ("no_verdict", why there was none).
+    """
+    node = dag["lemmas"].get((str(user_id), str(lemma_id)))
+    if node is None:
+        raise KeyError(f"({user_id!r}, {lemma_id!r}) is not a lemma of the DAG")
+    m = merkle.Merkle(dag["lemmas"], references)
+    h = m.hash(user_id, lemma_id)
+
+    on_file = refutations.for_lemma(CONJECTURE_ROOT, user_id, lemma_id)
+    stale = 0
+    for path, ref in on_file:
+        if refutations.is_counting(ref, h):
+            log(
+                f"⚠️  {lemma_id} has a refutation that counts ({path.name}): "
+                f"the proof it rejects is the proof in the file now.",
+                verbose,
+            )
+        else:
+            stale += 1
+    if stale:
+        log(
+            f"ℹ️  {lemma_id} has {stale} stale refutation(s); their "
+            f"justifications go to the verifiers.",
+            verbose,
+        )
+
+    cited_lemmas = [c for c in node.get("cited_lemmas", []) if isinstance(c, tuple)]
+    cited_references = [str(r) for r in node.get("cited_references", [])]
+    statement = str(node.get("statement") or "")
+    proof = str(node.get("proof") or "")
+
+    notes = [
+        {
+            "verifier": str(ref.get("verifier") or ""),
+            "model": str(ref.get("model") or ""),
+            "date": str(ref.get("date") or ""),
+            "verdict": str(ref.get("verdict") or ""),
+            "hash": str(ref.get("hash") or ""),
+            "hash_matches_current": refutations.is_counting(ref, h),
+            "justification": str(ref.get("justification") or ""),
+        }
+        for _path, ref in on_file
+    ]
+    refutation_block = ""
+    if notes:
+        refutation_block = (
+            "Known refutations (rejections of this lemma on record, oldest "
+            "first; each carries the verifier's justification. A hash that "
+            "no longer matches the lemma's is an objection to an earlier "
+            "version of it, kept so the objection is not lost when the "
+            "lemma changes; one that still matches is an objection to the "
+            "proof as it stands):\n"
+            f"{json.dumps(notes, indent=2)}\n\n"
+        )
+
+    verifier_user = (
+        f"Conjecture:\n{conjecture_text}\n\n"
+        "Cited results (statements of exactly the lemmas and references "
+        "the proof declares it used; nothing else is available to it):\n"
+        f"{json.dumps(verifier_context(dag, cited_lemmas, cited_references, references), indent=2)}\n\n"
+        f"{refutation_block}"
+        "Target lemma:\n"
+        f"{json.dumps({'user_id': user_id, 'lemma_id': lemma_id, 'statement': statement}, indent=2)}\n\n"
+        f"Proposed proof:\n{proof}"
+    )
+    for step, agent in enumerate(VERIFIER_AGENTS, 1):
+        role = agent[:-3]
+        decision, justification = _run_verifier(role, verifier_sys[agent], verifier_user, verbose)
+        log(
+            f"🔍 Verifier {step}/{len(VERIFIER_AGENTS)} ({role}): "
+            f"{decision.upper() or '???'} — {justification}",
+            verbose,
+        )
+        if decision == "reject":
+            path = refutations.record(
+                CONJECTURE_ROOT, user_id, lemma_id, h, USER, MODEL_NAME,
+                "reject", justification,
+            )
+            log(f"🚫 Refutation for {lemma_id} written: {path}", verbose)
+            return "rejected", justification
+        if decision != "accept":
+            log(
+                f"⚠️  No verdict on {lemma_id} from {role}; no refutation is "
+                f"written and nothing is certified. Re-run once the server "
+                f"is answering.",
+                verbose,
+            )
+            return "no_verdict", justification
+    try:
+        certificates.record(
+            CONJECTURE_ROOT, user_id, lemma_id, h, USER, MODEL_NAME,
+            user=_user_header(),
+        )
+    except OSError as e:
+        log(f"⚠️  Could not write the certificate for {lemma_id}: {e}", verbose)
+    log(
+        f"📜 Certificate for {lemma_id}: accepted by {USER} (model {MODEL_NAME}).",
+        verbose,
+    )
+    for path, _ref in on_file:
+        try:
+            refutations.delete(path)
+            log(f"🧹 Refutation dismissed: {path}", verbose)
+        except OSError as e:
+            log(f"⚠️  Could not delete the refutation {path}: {e}", verbose)
+    log(
+        f"✅ Lemma {lemma_id} passed all {len(VERIFIER_AGENTS)} verifier checks.",
+        verbose,
+    )
+    return "accepted", None
+
+
+def _verify_session(
+    *,
+    conjecture_dir: str,
+    user_id: str,
+    model: str,
+    host: Optional[str],
+    api_key: Optional[str],
+    backend_choice: str,
+    num_ctx: Optional[int],
+    verbose: bool,
+    parser: argparse.ArgumentParser,
+) -> None:
+    """The shared setup of proofs verify and proofs repair: the backend
+    and the conjecture's paths, the run's, minus the run's — no
+    checkpoint, no hotkey, no SIGINT handler, and the DAG files are
+    read, never written (a verify or repair writes only refutations and
+    the running user's own certificate file). Sets the same globals main() sets, so
+    load_dag, load_references and the verifier plumbing below run
+    unchanged. user_id is the user running the verification: the verifier
+    of record in any certificate issued and any refutation written.
+
+    The model the verification is recorded under is the model the server
+    says it is serving (".comments", "Model name"): the file name a
+    llama-server loaded, or the id the endpoint lists, which is what the
+    certificate and refutation this session writes must say, since an
+    alias in --model is not the model that verified anything. The name
+    --model asked for stays in the banner; when the server reported no
+    name, the requested one is the best record there is.
+    """
+    global MODEL_NAME, CONJECTURE_FILE, CONJECTURE_ROOT, DAGS_DIR, DAG_FILE
+    global REFERENCES_FILE, COMMENTS_FILE, USER, BACKEND, PROFILE, NUM_CTX
+    global PROMPT_PATHS
+    MODEL_NAME = model
+    BACKEND = llm_backend.make_backend(
+        model, host, REQUEST_TIMEOUT, api_key=api_key, backend=backend_choice,
+    )
+    PROFILE = BACKEND.probe()
+    if PROFILE.auth_error:
+        parser.error(PROFILE.auth_error)
+    if PROFILE.model_name:
+        MODEL_NAME = PROFILE.model_name
+    if num_ctx is None:
+        NUM_CTX = PROFILE.context_limit
+    elif PROFILE.probed_llama_cpp:
+        NUM_CTX = min(num_ctx, PROFILE.context_limit)
+    else:
+        NUM_CTX = num_ctx
+    REASONING_OPTIONS["num_ctx"] = NUM_CTX
+    EXTRACT_OPTIONS["num_ctx"] = NUM_CTX
+    log(
+        llm_backend.describe(
+            PROFILE, num_ctx if num_ctx is not None else NUM_CTX
+        ),
+        verbose,
+    )
+    USER = user_id
+    try:
+        paths = workspace.resolve(conjecture_dir, user_id)
+    except workspace.ConjectureNotFound as e:
+        parser.error(str(e))
+    CONJECTURE_FILE = str(paths.conjecture)
+    CONJECTURE_ROOT = str(paths.root)
+    DAGS_DIR = str(paths.dags_dir)
+    DAG_FILE = str(paths.dag)
+    REFERENCES_FILE = str(paths.references)
+    COMMENTS_FILE = str(paths.comments)
+    PROMPT_PATHS = {name: str(p) for name, p in paths.prompts.items()}
+    log(workspace.describe(paths), verbose)
+
+
+def verify_entry(
+    *,
+    path: str,
+    lemma_id: str,
+    owner: str,
+    root: str,
+    full: bool,
+    user_id: str,
+    model: str,
+    host: Optional[str],
+    api_key: Optional[str],
+    backend: str,
+    num_ctx: Optional[int],
+    verbose: bool,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """proofs verify PATH lemma_id [--full] (".comments", "Verify"): the
+    three verifier checks on the stored proof of a lemma that is already
+    in the DAG, with the Refutations and Certificates bookkeeping that
+    verify carries — a rejection writes a refutation file, an acceptance
+    issues a certificate and dismisses the refutations whose
+    justifications were on the table.
+
+    PATH is the lemma's user's DAG file, which supplies the lemma's
+    user_id (owner, the file's name the way load_dag reads it), and the
+    conjecture's root (root) is the file's grandparent, so the
+    verification runs against the conjecture the lemma's DAG belongs to.
+    With --full the lemma's cited lemmas are verified first, in
+    dependency order, the target last, and a rejection anywhere in that
+    order stops the verification. Returns the exit code: 0 when every
+    lemma verified was accepted, 1 when one was rejected (its refutation
+    written), EXIT_NO_VERDICT when a verifier gave no verdict (nothing
+    written; re-run once the server answers).
+    """
+    _verify_session(
+        conjecture_dir=root, user_id=user_id, model=model, host=host,
+        api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
+        verbose=verbose, parser=parser,
+    )
+    dag = load_dag()
+    references = load_references()
+    m = merkle.Merkle(dag["lemmas"], references)
+    if not m.has(owner, lemma_id):
+        parser.error(
+            f"{owner}:{lemma_id} (from {path}) is not a lemma of the DAG {root}"
+        )
+    order = _citation_closure(dag, owner, lemma_id) if full else [(owner, lemma_id)]
+    # Suspension is computed, not stored, and it does not reach in here:
+    # verify loads the suspended lemmas too (".comments", "Suspension") —
+    # it is the path back to them. The warning is the section's: a lemma
+    # the run must not build on is named as one.
+    susp = suspension.compute(dag["lemmas"], references, CONJECTURE_ROOT)
+    for u, lid in order:
+        if susp.has(u, lid):
+            log(
+                f"⚠️  {u}:{lid} is suspended ({'; '.join(susp.reasons(u, lid))}); "
+                f"it is loaded and verified anyway — the verification is how "
+                f"the suspension is lifted.",
+                verbose,
+            )
+    conjecture_text = load_file(CONJECTURE_FILE)
+    verifier_sys = _verifier_prompts(parser)
+    log(
+        f"Verifying {len(order)} lemma(s) for {owner}: "
+        + ", ".join(lid for _u, lid in order),
+        verbose,
+    )
+    try:
+        for u, lid in order:
+            outcome, _just = verify_stored_lemma(
+                dag, references, u, lid, conjecture_text, verifier_sys, verbose
+            )
+            if outcome == "rejected":
+                log(f"❌ {lid} rejected; verification stops here.", verbose)
+                return 1
+            if outcome == "no_verdict":
+                log(
+                    f"⏸ {lid} got no verdict; verification stops here, "
+                    f"with nothing written.",
+                    verbose,
+                )
+                return EXIT_NO_VERDICT
+    except merkle.MerkleCycleError as e:
+        log(f"⚠️  {e}", verbose)
+        return 1
+    return 0
+
+
+def repair_entry(
+    *,
+    path: str,
+    user_id: str,
+    model: str,
+    host: Optional[str],
+    api_key: Optional[str],
+    backend: str,
+    num_ctx: Optional[int],
+    verbose: bool,
+    parser: argparse.ArgumentParser,
+    lemmas_all: int = LEMMAS_ALL,
+    my_lemmas: int = MY_LEMMAS,
+    tool_mode: str = TOOL_MODE,
+    lemmas_common: int = LEMMAS_COMMON,
+) -> int:
+    """proofs repair path_to_refutation (".comments", "Refutations",
+    "Repair"): the refutation file supplies the lemma's user_id and
+    lemma_id, so nothing else names the lemma.
+
+    The first step is to re-verify the existing proof with the
+    refutation's justifications as input — the verification a stored
+    lemma gets from proofs verify, in which the lemma's refutations are
+    on the table and the file addressed carries its justification. If the
+    proof is accepted, the refutation is dismissed and its file deleted
+    (the acceptance dismisses the lemma's refutations and re-issues its
+    certificate), and the repair stops.
+
+    If it is rejected, a new refutation file is written for the new
+    rejection, and the lemma is re-proven through the prover, verifier
+    and reviser, the rejection's justification as the prover's first
+    feedback. The repair re-proves the lemma, and the lemma keeps its
+    id, so the engine runs with decomposition off: the reviser's options
+    are keep and revise only. An accepted proof is committed in place —
+    the same user_id and lemma_id, in the owner's file, the section's
+    one cross-user write — certified, and the lemma's refutations
+    dismissed.
+
+    Because the new proof changes the lemma's hash, and so the hash of
+    every lemma that depends on it, those dependents lose their valid
+    certificates the moment the in-place commit happens and are
+    suspended until verified again. The repair therefore climbs the
+    dependency chain, re-verifying each dependent in dependency order and
+    re-proving a rejected one the same way, its own rejection as the
+    justification. A lemma that cannot be re-proved keeps the proof it
+    had and the refutation that counts against it, and the climb goes on:
+    the hash change has already happened, whether or not its proof
+    sticks, so it and its dependents stay suspended.
+
+    Returns the exit code: 0 when the lemma was re-verified or re-proved
+    and every dependent re-verified or re-proved; 1 when a re-proof
+    failed (its lemma and its dependents stay suspended) or a
+    re-verification could not hash the lemma; EXIT_NO_VERDICT when a
+    verifier gave no verdict (the server failed, or its reply could not be
+    read). A missing verdict is not a rejection: no refutation is written,
+    nothing is re-proved, and the repair stops where it is — the lemmas
+    already repaired stand and the rest are left as they were. On the
+    named lemma, the refutation file is still there, so the same command
+    can be re-run; on a dependent, the named lemma's refutation is already
+    dismissed, so the log lists the dependents still to verify with proofs
+    verify.
+    """
+    # Resolved first, as cli.py resolves PATH: the conjecture root is the
+    # refutation file's grandparent, which a bare relative name (run inside
+    # refutations/) does not have until it is made absolute.
+    p = Path(path).resolve()
+    try:
+        ref = refutations.load(p)
+    except (OSError, ValueError) as e:
+        parser.error(f"{path} is not a readable refutation file: {e}")
+    owner = str(ref.get("user_id") or "")
+    lemma_id = str(ref.get("lemma_id") or "")
+    if not owner or not lemma_id:
+        parser.error(
+            f"{path} names no lemma (its user_id and lemma_id are required)"
+        )
+    if p.parent.name != refutations.DIR_NAME:
+        parser.error(f"{path} is not in a {refutations.DIR_NAME}/ directory")
+    root = p.parent.parent
+    global LEMMAS_ALL, MY_LEMMAS, TOOL_MODE, LEMMAS_COMMON
+    LEMMAS_ALL, MY_LEMMAS, TOOL_MODE = lemmas_all, my_lemmas, tool_mode
+    LEMMAS_COMMON = lemmas_common
+    _verify_session(
+        conjecture_dir=str(root), user_id=user_id, model=model, host=host,
+        api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
+        verbose=verbose, parser=parser,
+    )
+    dag = load_dag()
+    references = load_references()
+    m = merkle.Merkle(dag["lemmas"], references)
+    if not m.has(owner, lemma_id):
+        parser.error(
+            f"{owner}:{lemma_id} (named by {p.name}) is not a lemma of the "
+            f"DAG {root}; there is nothing to repair"
+        )
+    log(f"Repairing {owner}:{lemma_id} from {p.name}", verbose)
+    # The lemma a refutation names is usually suspended (the refutation may
+    # be stale, but the files say so only once they are read), and the
+    # repair is precisely the case the suspension warns about (".comments",
+    # "Suspension").
+    susp = suspension.compute(dag["lemmas"], references, CONJECTURE_ROOT)
+    if susp.has(owner, lemma_id):
+        log(
+            f"⚠️  {owner}:{lemma_id} is suspended ({'; '.join(susp.reasons(owner, lemma_id))}); "
+            f"the repair re-verifies it anyway — an acceptance re-issues the "
+            f"certificate and lifts the suspension.",
+            verbose,
+        )
+    conjecture_text = load_file(CONJECTURE_FILE)
+    if not conjecture_text:
+        log(
+            f"⚠️  {CONJECTURE_FILE} is empty; the re-verification and the "
+            f"re-proof go on without the conjecture, the lemma's "
+            f"statement and the DAG being the substance.",
+            verbose,
+        )
+    verifier_sys = _verifier_prompts(parser)
+    # Ctrl-C stays a KeyboardInterrupt (caught below), but one landing
+    # while a re-proof is rewritten in place and certified waits for both.
+    global _DEFERRED_INTERRUPT
+    previous_handler = signal.signal(signal.SIGINT, _on_sigint_repair)
+    _DEFERRED_INTERRUPT = _raise_interrupt
+    try:
+        try:
+            outcome, just = verify_stored_lemma(
+                dag, references, owner, lemma_id, conjecture_text,
+                verifier_sys, verbose,
+            )
+        except merkle.MerkleCycleError as e:
+            log(f"⚠️  {e}", verbose)
+            return 1
+        if outcome == "no_verdict":
+            # Not a rejection: re-proving would replace a proof nobody
+            # rejected.
+            log(
+                f"⏸ {owner}:{lemma_id} got no verdict; the repair stops "
+                f"with nothing written. Re-run it once the server answers.",
+                verbose,
+            )
+            return EXIT_NO_VERDICT
+        if outcome == "accepted":
+            # The acceptance already dismissed the lemma's refutations
+            # (the addressed file among them) and re-issued its
+            # certificate.
+            if p.is_file():
+                refutations.delete(p)
+                log(f"🧹 Refutation dismissed: {p}", verbose)
+            log(f"✅ {owner}:{lemma_id} accepted; the repair is done.",
+                verbose)
+            return 0
+
+        # The re-verification rejected the stored proof and wrote a new
+        # refutation for the rejection. The Repair section's next step:
+        # re-prove the lemma through the prover, verifier and reviser,
+        # the rejection's justification as the prover's first feedback,
+        # and on acceptance commit the new proof in place under the same
+        # pair.
+        log(
+            f"↻ {owner}:{lemma_id} rejected on re-verification; "
+            f"re-proving it through the prover, verifier and reviser.",
+            verbose,
+        )
+        prover_sys = load_file(PROMPT_PATHS["prover.md"])
+        reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
+        empty = [
+            name for name, text in (
+                ("prover.md", prover_sys), ("reviser.md", reviser_sys),
+            ) if not text
+        ]
+        if empty:
+            parser.error(f"no prompt text for: {', '.join(empty)}")
+        references, reference_block, _planner_ref_block, reviser_ref_block = (
+            _build_reference_blocks(verbose)
+        )
+        ref_ids = {str(r["id"]) for r in references}
+
+        def reprove(u: str, lid: str, justification: Optional[str]) -> bool:
+            """The Repair section's re-proof of the stored lemma (u, lid):
+            the engine's prover -> verifier -> reviser rounds on the
+            lemma's statement as it stands in the file, the rejection's
+            justification as the prover's first feedback, decomposition
+            off — the repair re-proves the lemma and the lemma keeps its
+            id, so the reviser's choices are keep and revise only. An
+            accepted proof is committed in place in the owner's file
+            under the same pair, certified the way an acceptance
+            certifies, and the lemma's refutations dismissed. Returns
+            whether the proof was accepted; a failure leaves the stored
+            proof and its counting refutation in the file, the lemma
+            suspended.
+            """
+            dag0 = load_dag()
+            node = dag0["lemmas"].get((u, lid))
+            if node is None:
+                log(
+                    f"⚠️  {u}:{lid} is not in the DAG any more; nothing "
+                    f"to re-prove.",
+                    verbose,
+                )
+                return False
+            # The suspension as it stands now: the lemma is suspended
+            # (that is why it is being re-proved), and so are its
+            # dependents; the prover and the reviser see the lemmas that
+            # are not.
+            susp0 = suspension.compute(
+                dag0["lemmas"], references, CONJECTURE_ROOT
+            )
+            initial = {
+                "lemma_id": lid,
+                "claimed_id": lid,
+                "target": {
+                    "id": lid,
+                    "statement": str(node.get("statement") or ""),
+                },
+                "attempt": 1,
+                # The rejection's justification is the prover's first
+                # feedback, the engine's most-recent-failure-only as it
+                # was when the lemma's proof was last rejected.
+                "feedback": (
+                    [f"Verifier: {justification}"] if justification else []
+                ),
+                "attempt_notes": [],
+                "last_proof": "",
+            }
+
+            def on_proof(proof_lid: str, proof_node: Dict[str, Any]) -> str:
+                with _commit_section():
+                    _replace_lemma_in_owner_file(u, proof_lid, proof_node)
+                    record_certificate(proof_lid, MODEL_NAME, verbose, owner=u)
+                return proof_lid
+
+            result = run_proof_loop(
+                verbose=verbose,
+                conjecture=conjecture_text,
+                prover_sys=prover_sys,
+                reviser_sys=reviser_sys,
+                reference_block=reference_block,
+                reviser_ref_block=reviser_ref_block,
+                references=references,
+                verifier_sys=verifier_sys,
+                ref_ids=ref_ids,
+                initial=initial,
+                fresh_target=None,
+                suspended=susp0.suspended,
+                on_round=lambda state: None,
+                on_proof=on_proof,
+                failed_attempts={},
+                failed_lock=threading.Lock(),
+                get_dag=load_dag,
+                toggle_hotkey=lambda: None,
+                allow_decomposition=False,
+            )
+            if not result["proved"]:
+                log(
+                    f"❌ {u}:{lid} could not be re-proved after "
+                    f"{MAX_PROOF_ATTEMPTS} prover round(s); the stored "
+                    f"proof stays, with its refutation counting against "
+                    f"it.",
+                    verbose,
+                )
+                for note in result["attempt_notes"]:
+                    log(f"   · {note}", verbose)
+                return False
+            # The acceptance put every objection on the table: the
+            # lemma's refutations are dismissed, the addressed file among
+            # them, the way the re-verification's acceptance would have
+            # dismissed them.
+            for ref_path, _ref in refutations.for_lemma(CONJECTURE_ROOT, u, lid):
+                try:
+                    refutations.delete(ref_path)
+                    log(f"🧹 Refutation dismissed: {ref_path}", verbose)
+                except OSError as e:
+                    log(
+                        f"⚠️  Could not delete the refutation "
+                        f"{ref_path}: {e}",
+                        verbose,
+                    )
+            log(
+                f"✅ {u}:{lid} re-proved in place; the new proof stands "
+                f"under its own id.",
+                verbose,
+            )
+            return True
+
+        if not reprove(owner, lemma_id, just):
+            log(
+                f"⏹ The repair of {owner}:{lemma_id} failed; it and the "
+                f"lemmas that depend on it stay suspended.",
+                verbose,
+            )
+            return 1
+
+        # The new proof changed the lemma's hash, and so the hash of
+        # every lemma that depends on it: their certificates no longer
+        # match and they are suspended until verified again. Climb the
+        # dependency chain, re-verifying each dependent in dependency
+        # order, and re-proving a rejected one the same way, its own
+        # rejection as the justification. A dependent that cannot be
+        # re-proved stays suspended and the climb goes on: the hash
+        # change has already happened, whether or not its proof sticks.
+        chain = _dependent_chain(load_dag(), (owner, lemma_id))
+        if not chain:
+            log(
+                f"✅ The repair is done: {owner}:{lemma_id} re-proved, "
+                f"and nothing depends on it.",
+                verbose,
+            )
+            return 0
+        log(
+            f"↻ {len(chain)} dependent(s) of {owner}:{lemma_id} lost "
+            f"their certificates with the new hash; re-verifying them in "
+            f"dependency order: "
+            + ", ".join(f"{u}:{lid}" for u, lid in chain)
+            + ".",
+            verbose,
+        )
+        failed: List[Tuple[str, str]] = []
+        for u, lid in chain:
+            dag = load_dag()
+            try:
+                dep_outcome, dep_just = verify_stored_lemma(
+                    dag, references, u, lid, conjecture_text, verifier_sys,
+                    verbose,
+                )
+            except merkle.MerkleCycleError as e:
+                log(f"⚠️  {e}", verbose)
+                failed.append((u, lid))
+                continue
+            if dep_outcome == "no_verdict":
+                # Most likely the server is down, and every later check
+                # would fail the same way: stop the climb rather than
+                # spend it. The repaired lemma stands (its refutation is
+                # already dismissed, so this repair cannot be re-run); the
+                # dependents not yet verified stay suspended until proofs
+                # verify accepts each.
+                rest = chain[chain.index((u, lid)):]
+                log(
+                    f"⏸ {u}:{lid} got no verdict; the climb stops with "
+                    f"nothing written for it. Still to verify, with proofs "
+                    f"verify once the server answers: "
+                    + ", ".join(f"{a}:{b}" for a, b in rest)
+                    + (f". Already unproved: "
+                       + ", ".join(f"{a}:{b}" for a, b in failed)
+                       if failed else "")
+                    + ".",
+                    verbose,
+                )
+                return EXIT_NO_VERDICT
+            if dep_outcome == "accepted":
+                continue
+            log(
+                f"↻ {u}:{lid} rejected on re-verification; re-proving it "
+                f"the same way.",
+                verbose,
+            )
+            if not reprove(u, lid, dep_just):
+                failed.append((u, lid))
+        if failed:
+            log(
+                f"⏹ The repair finished with {len(failed)} lemma(s) "
+                f"unproved: "
+                + ", ".join(f"{u}:{lid}" for u, lid in failed)
+                + "; they and their dependents stay suspended.",
+                verbose,
+            )
+            return 1
+        log(
+            f"✅ The repair is done: {owner}:{lemma_id} and its "
+            f"{len(chain)} dependent(s) are verified, the rejected ones "
+            f"re-proved.",
+            verbose,
+        )
+        return 0
+    except KeyboardInterrupt:
+        log(
+            "\n⏹ Interrupted; the lemmas already repaired stand, and the "
+            "rest keep the proofs they had, suspended.",
+            verbose,
+        )
+        return 130
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+        _DEFERRED_INTERRUPT = None
+
+
+def prune_entry(
+    *,
+    dir: str,
+    user_id: str,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """proofs prune DIR (".comments", "Prune"): recompute the Merkle hash
+    of every lemma in the conjecture and drop the current user's
+    certificates that no longer match.
+
+    No model is involved — the hash is a function of the DAG files and
+    references.md alone, the way certificates are checked everywhere else
+    (".comments", "Certificates") — so this entry sets only the file
+    globals load_dag() and load_references() read: no backend, no
+    probe, no prompt. It writes exactly one file, the user's own
+    certificate file, and never another user's (".comments", "Prune"):
+    only the certificates the user issued as verifier are pruned, whoever
+    owns the lemmas they cover.
+    A line goes when its lemma's hash has moved (the proof, the statement,
+    or something below it changed), when the lemma is no longer in the
+    DAG at all, or when the lemma has no hash any more (a citation cycle,
+    the case suspension.compute reads as "no certificate is valid for
+    it") — a certificate that matches nothing is the stale record the
+    section exists to clear, and the log names which case each line was.
+
+    Returns the exit code: 0 when the prune ran (including a no-op), 1
+    when the user's certificate file could not be read or rewritten.
+    """
+    global CONJECTURE_ROOT, DAGS_DIR, DAG_FILE, REFERENCES_FILE, USER
+    try:
+        paths = workspace.resolve(dir, user_id)
+    except workspace.ConjectureNotFound as e:
+        parser.error(str(e))
+    CONJECTURE_ROOT = str(paths.root)
+    DAGS_DIR = str(paths.dags_dir)
+    DAG_FILE = str(paths.dag)
+    REFERENCES_FILE = str(paths.references)
+    USER = user_id
+    log(workspace.describe(paths))
+    dag = load_dag()
+    references = load_references()
+    m = merkle.Merkle(dag["lemmas"], references)
+    # Every lemma's current hash, a pair the DAG holds but cannot hash
+    # (a citation cycle) kept as None: its certificates match nothing
+    # either, and the map still says the lemma was there, so the log can
+    # name the reason. Per pair, the way suspension.compute does it:
+    # Merkle.all() would raise on the first cycle and hash nothing after.
+    hashes: Dict[Tuple[str, str], Optional[str]] = {}
+    for pair in dag["lemmas"]:
+        try:
+            hashes[pair] = m.hash(*pair)
+        except merkle.MerkleCycleError:
+            hashes[pair] = None
+    try:
+        kept, dropped = certificates.prune(
+            CONJECTURE_ROOT, USER, hashes, user=_user_header()
+        )
+    except OSError as e:
+        log(f"⚠️  Could not read or rewrite {USER}'s certificate file: {e}")
+        return 1
+    if dropped:
+        for line in dropped:
+            pair = (
+                str(line.get("user_id") or ""),
+                str(line.get("lemma_id") or ""),
+            )
+            if pair not in dag["lemmas"]:
+                reason = "the lemma is no longer in the DAG"
+            elif hashes.get(pair) is None:
+                reason = "the lemma has no current hash (a citation cycle)"
+            else:
+                reason = "its hash no longer matches the lemma's"
+            log(f"🧹 Dropped certificate for {pair[0]}:{pair[1]} — {reason}.")
+        log(f"Pruned {len(dropped)} certificate(s) for {USER}; {len(kept)} kept.")
+    else:
+        log(f"Nothing to prune: all {len(kept)} certificate(s) for {USER} still match.")
+    return 0
+
+
+def status_entry(
+    *,
+    path: str,
+    lemma_id: str,
+    owner: str,
+    root: str,
+    user_id: str,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """proofs status PATH lemma_id (".comments", "Status"): for each lemma
+    in the named lemma's dependency closure, list every valid
+    certificate, each with its verifier, model, date and count.
+
+    No model is involved — a certificate is valid only while its hash
+    matches the lemma's current Merkle hash (".comments",
+    "Certificates"), and that hash is a function of the DAG files and
+    references.md alone, the way prune's recomputation is — so this entry
+    sets only the file globals load_dag() and load_references() read: no
+    backend, no probe, no prompt. It reads the DAG files, references.md
+    and the certificate files, and writes nothing.
+
+    The closure is the lemma's citation closure in dependency order
+    (_citation_closure): the dependencies first, the target last, the
+    order proofs verify --full verifies in. A certificate is valid for a
+    lemma only while its hash matches the lemma's current Merkle hash
+    (certificates.is_valid), and the pair's lines are spread over every
+    verifier's file, certificates/<verifier>.jsonl, the way record()
+    writes them, so all the files are read (certificates.load_all); each
+    valid line is listed with the four fields the section
+    names. A line for the pair whose hash no longer matches is stale —
+    the record of an acceptance of a version of the lemma that is no
+    longer in the files — and is counted, not listed. A lemma whose hash
+    cannot be computed (a citation cycle) has no valid certificate: no
+    hash exists for a line to match, the case prune logs the same way.
+
+    Returns the exit code: 0 when the status was reported.
+    """
+    global CONJECTURE_ROOT, DAGS_DIR, DAG_FILE, REFERENCES_FILE, USER
+    try:
+        paths = workspace.resolve(root, user_id)
+    except workspace.ConjectureNotFound as e:
+        parser.error(str(e))
+    CONJECTURE_ROOT = str(paths.root)
+    DAGS_DIR = str(paths.dags_dir)
+    DAG_FILE = str(paths.dag)
+    REFERENCES_FILE = str(paths.references)
+    USER = user_id
+    log(workspace.describe(paths))
+    dag = load_dag()
+    references = load_references()
+    m = merkle.Merkle(dag["lemmas"], references)
+    if not m.has(owner, lemma_id):
+        parser.error(
+            f"{owner}:{lemma_id} (from {path}) is not a lemma of the DAG {root}"
+        )
+    order = _citation_closure(dag, owner, lemma_id)
+    try:
+        all_lines = certificates.load_all(CONJECTURE_ROOT)
+    except OSError as e:
+        log(f"⚠️  Could not read the certificate files: {e}")
+        all_lines = []
+    # Per lemma, the way prune_entry computes it: a pair the DAG holds
+    # but cannot hash (a citation cycle) is kept as None, and its status
+    # is "no certificate is valid for it", not a crash.
+    hashes: Dict[Tuple[str, str], Optional[str]] = {}
+    for u, lid in order:
+        try:
+            hashes[(u, lid)] = m.hash(u, lid)
+        except merkle.MerkleCycleError:
+            hashes[(u, lid)] = None
+    log(
+        f"Status for {owner}:{lemma_id}: {len(order)} lemma(s) in its "
+        f"dependency closure, dependencies first:"
+    )
+    for i, (u, lid) in enumerate(order, 1):
+        h = hashes[(u, lid)]
+        if h is None:
+            log(f"  {i}/{len(order)} {u}:{lid}")
+            log(
+                "     ⚠️ no Merkle hash (a citation cycle) — no "
+                "certificate is valid for it"
+            )
+            continue
+        of_lemma = [
+            c for c in all_lines
+            if str(c.get("user_id") or "") == u
+            and str(c.get("lemma_id") or "") == lid
+        ]
+        valid = [c for c in of_lemma if certificates.is_valid(c, h)]
+        stale = [c for c in of_lemma if not certificates.is_valid(c, h)]
+        log(f"  {i}/{len(order)} {u}:{lid}  hash {h}")
+        if valid:
+            for c in valid:
+                log(
+                    f"     📜 verifier={c.get('verifier') or ''} "
+                    f"model={c.get('model') or ''} "
+                    f"date={c.get('date') or ''} "
+                    f"count={c.get('count')}"
+                )
+        else:
+            log("     (no valid certificates)")
+        if stale:
+            log(
+                f"     ⚠️ {len(stale)} stale certificate(s) for an earlier "
+                f"version of this lemma are not listed"
+            )
+    # Whether the conjecture is settled, recomputed the way the run
+    # computes it (resolution.py): an unsuspended lemma, anyone's, stating
+    # conjecture.md (or its negation) verbatim.
+    susp = suspension.compute(dag["lemmas"], references, CONJECTURE_ROOT)
+    if _settled(dag, susp.suspended, load_file(paths.conjecture), True) is None:
+        log("Conjecture: open (no certified lemma states it or its negation).")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# Export: the LaTeX document of a DAG (".comments", "Export")
+# ----------------------------------------------------------------------------
+def export_entry(
+    *,
+    path: str,
+    lemma_id: Optional[str],
+    owner: Optional[str],
+    out_dir: str,
+    root: str,
+    user_id: str,
+    parser: argparse.ArgumentParser,
+) -> int:
+    """proofs export PATH [lemma_id] (".comments", "Export"): write the
+    LaTeX document of the DAG, in dependency order.
+
+    No model is involved — the document is a function of the DAG files,
+    references.md and conjecture.md alone, the way a Merkle hash is a
+    function of the files' contents — so this entry sets only the file
+    globals load_dag() and load_references() read: no backend, no probe,
+    no prompt. It reads those files and writes exactly one: the LaTeX
+    document in the out_dir directory, named by export.name_for for what
+    PATH names — proof.tex for the complete DAG,
+    <user_id>_proof.tex for a user's lemmas,
+    <user_id>--<lemma_id>_proof.tex for a lemma and its dependencies.
+    out_dir is the directory the user asked the document to be written to
+    (-o/--out), created if it is not there yet: the export is the user's
+    artifact, not the project's data, so it never lands in the project
+    unless told to. The document's lemmas come in
+    dependency order, dependencies first, the order the document reads in:
+    a section always stands on the sections above it when they are its
+    dependencies.
+
+    What PATH names is what the document holds, the way the .comments
+    splits it: with owner None (PATH was the conjecture directory) it is
+    the complete DAG, every user's lemmas; with owner set (PATH was that
+    user's DAG file) it is that user's lemmas, or — with lemma_id — that
+    lemma and everything it cites, whichever user's file each dependency
+    is in, the _citation_closure order, the same order proofs verify
+    --full verifies in. A user's lemmas and the complete DAG are ordered
+    by _dependency_order over the set they are: an export of one user's
+    lemmas writes that user's lemmas, and the dependencies in the other
+    users' files are not pulled in — they are cross-referenced, and each
+    user's export writes its own.
+
+    Returns the exit code: 0 when the document was written.
+    """
+    global CONJECTURE_ROOT, DAGS_DIR, DAG_FILE, REFERENCES_FILE, USER
+    try:
+        paths = workspace.resolve(root, user_id)
+    except workspace.ConjectureNotFound as e:
+        parser.error(str(e))
+    CONJECTURE_ROOT = str(paths.root)
+    DAGS_DIR = str(paths.dags_dir)
+    DAG_FILE = str(paths.dag)
+    REFERENCES_FILE = str(paths.references)
+    USER = user_id
+    log(workspace.describe(paths))
+    dag = load_dag()
+    references = load_references()
+    lemmas = dag["lemmas"]
+    if owner is None:
+        order = _dependency_order(dag, set(lemmas))
+        users = {u for u, _ in order}
+        name = export.name_for()
+        scope = (
+            f"the complete DAG — {len(order)} lemma(s) from "
+            f"{len(users)} user(s)"
+        )
+    elif lemma_id is None:
+        order = _dependency_order(
+            dag, {p for p in lemmas if p[0] == owner}
+        )
+        name = export.name_for(owner=owner)
+        scope = f"{owner}'s lemmas — {len(order)} lemma(s)"
+    else:
+        if (owner, lemma_id) not in lemmas:
+            parser.error(
+                f"{owner}:{lemma_id} (from {path}) is not a lemma of the "
+                f"DAG {root}"
+            )
+        order = _citation_closure(dag, owner, lemma_id)
+        name = export.name_for(owner=owner, lemma_id=lemma_id)
+        scope = (
+            f"{owner}'s lemma {lemma_id} and everything it cites — "
+            f"{len(order)} lemma(s)"
+        )
+    document = export.render(
+        conjecture_name=paths.root.name,
+        conjecture=load_file(paths.conjecture),
+        scope=scope,
+        order=order,
+        lemmas=lemmas,
+        references=references,
+    )
+    out = export.write(Path(out_dir) / name, document)
+    log(
+        f"Exported {len(order)} lemma(s) to {out} — dependency order, "
+        f"dependencies first."
+    )
+    return 0
 
 
 # ----------------------------------------------------------------------------
@@ -544,6 +2527,21 @@ _LIVE_STATE: Dict[str, Any] = {
     "in_flight": None,
 }
 _sigint_count = 0
+# Commit sections: the commit of an accepted lemma and its certificate are
+# one step that Ctrl-C must not split — a lemma committed without its
+# certificate is suspended, and a resume would re-prove it into id_2.
+# _commit_section() counts the sections in progress, in any thread; the
+# SIGINT handler defers the interrupt until the count is back to zero (the
+# serial run replays it at the section's end; the parallel run waits for
+# the worker threads' sections to finish, at most COMMIT_WAIT_SECONDS).
+_COMMIT_COND = threading.Condition()
+_COMMITS_IN_PROGRESS = 0
+_SIGINT_PENDING = False
+COMMIT_WAIT_SECONDS = 30
+# What a deferred interrupt does when its commit section ends: None is the
+# run's (_interrupt_serial: checkpoint, exit 130); proofs repair, which has
+# no checkpoint, sets its own.
+_DEFERRED_INTERRUPT = None
 # The live ParallelState, or None outside a parallel run. The SIGINT handler
 # checks it first so a Ctrl-C in parallel mode snapshots the shared state
 # (version-2 checkpoint) instead of the serial _LIVE_STATE, which a parallel
@@ -571,10 +2569,12 @@ CHECKPOINT_LOCK = threading.Lock()
 
 
 def checkpoint_path_for(dag_path: str) -> str:
-    """The checkpoint file for a DAG file: dag.json -> dag.checkpoint.json.
+    """The checkpoint file for a DAG file:
+    dags/<user_id>_dag.json -> dags/<user_id>_dag.checkpoint.json.
 
-    Beside the DAG, not beside the conjecture directory's name, so a run
-    pointed at its own --dag file checkpoints beside exactly that file.
+    Beside the user's DAG file, so the checkpoint is per user the way the
+    DAG file is, and gitignored by the *.checkpoint.json rule like the
+    temporary files beside it.
     """
     root, ext = os.path.splitext(dag_path)
     return f"{root}.checkpoint{ext or '.json'}"
@@ -831,6 +2831,57 @@ def discard_checkpoint() -> None:
             pass
 
 
+@contextlib.contextmanager
+def _commit_section():
+    """Hold off Ctrl-C while an accepted lemma is committed and certified
+    (see _COMMIT_COND). In the serial run an interrupt that arrived inside
+    is replayed when the section ends."""
+    global _COMMITS_IN_PROGRESS, _SIGINT_PENDING
+    with _COMMIT_COND:
+        _COMMITS_IN_PROGRESS += 1
+    try:
+        yield
+    finally:
+        with _COMMIT_COND:
+            _COMMITS_IN_PROGRESS -= 1
+            _COMMIT_COND.notify_all()
+            replay = (
+                _SIGINT_PENDING
+                and _COMMITS_IN_PROGRESS == 0
+                and threading.current_thread() is threading.main_thread()
+            )
+            if replay:
+                _SIGINT_PENDING = False
+        if replay:
+            (_DEFERRED_INTERRUPT or _interrupt_serial)()
+
+
+def _raise_interrupt() -> None:
+    raise KeyboardInterrupt
+
+
+def _on_sigint_repair(signum, frame) -> None:
+    """Ctrl-C during proofs repair: a KeyboardInterrupt, as with no
+    handler at all, except that one landing while a re-proved lemma is
+    being rewritten in place and certified is held off until both are
+    done (_commit_section) — split, the lemma would be left rewritten and
+    uncertified. A second Ctrl-C force-exits."""
+    global _sigint_count, _SIGINT_PENDING
+    _sigint_count += 1
+    if _sigint_count > 1:
+        print("\nForced exit.", file=sys.stderr)
+        os._exit(130)
+    if _COMMITS_IN_PROGRESS:
+        _SIGINT_PENDING = True
+        print(
+            "\n⏸ Interrupted — finishing the in-place commit of the "
+            "re-proved lemma first (Ctrl-C again to force)...",
+            file=sys.stderr,
+        )
+        return
+    raise KeyboardInterrupt
+
+
 def _on_sigint(signum, frame) -> None:
     """Ctrl-C: write the checkpoint, then exit 130 like the shell expects.
 
@@ -839,18 +2890,29 @@ def _on_sigint(signum, frame) -> None:
     so an interrupt mid-LLM-call loses only that call: the next run re-runs
     the interrupted prover round, not the whole iteration.
     """
-    global _sigint_count
+    global _sigint_count, _SIGINT_PENDING
     _sigint_count += 1
     if _sigint_count > 1:
         print("\nForced exit.", file=sys.stderr)
         os._exit(130)
     if _PARALLEL is not None:
         # Parallel mode: the shared state is the checkpoint. Ask every thread
-        # to stop at its next boundary, snapshot the whole run under the
-        # state lock, and exit; the daemon threads die with the process and
-        # the next run resumes from the snapshot.
+        # to stop at its next boundary, let any commit in progress finish
+        # (its lemma and its certificate land together), snapshot the whole
+        # run under the state lock, and exit; the daemon threads die with
+        # the process and the next run resumes from the snapshot.
         _PARALLEL.request_stop()
         print("\n⏹ Interrupted — writing checkpoint...", file=sys.stderr)
+        with _COMMIT_COND:
+            if _COMMITS_IN_PROGRESS:
+                print(
+                    f"   waiting for {_COMMITS_IN_PROGRESS} lemma commit(s) "
+                    f"to finish (Ctrl-C again to force)...",
+                    file=sys.stderr,
+                )
+            _COMMIT_COND.wait_for(
+                lambda: _COMMITS_IN_PROGRESS == 0, timeout=COMMIT_WAIT_SECONDS
+            )
         _PARALLEL.write_checkpoint()
         print(
             f"   {os.path.basename(CHECKPOINT_FILE)} written. Re-run the same "
@@ -858,6 +2920,23 @@ def _on_sigint(signum, frame) -> None:
             file=sys.stderr,
         )
         sys.exit(130)
+    if _COMMITS_IN_PROGRESS:
+        # Serial mode: the handler runs on the main thread, which is inside
+        # the commit section itself, so it cannot wait for it — it defers,
+        # and the section replays the interrupt as it ends.
+        _SIGINT_PENDING = True
+        print(
+            "\n⏸ Interrupted — finishing the commit of the accepted lemma "
+            "first (Ctrl-C again to force)...",
+            file=sys.stderr,
+        )
+        return
+    _interrupt_serial()
+
+
+def _interrupt_serial() -> None:
+    """The serial interrupt: write the checkpoint from _LIVE_STATE and exit
+    130."""
     print("\n⏹ Interrupted — writing checkpoint...", file=sys.stderr)
     state = _LIVE_STATE
     if (
@@ -1129,7 +3208,11 @@ def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
     COMPACT_THRESHOLD * num_ctx: the model may think and write until the window
     is COMPACT_THRESHOLD full, and only then is it cut off for compaction.
     """
-    chars = sum(len(m["content"]) for m in messages)
+    # A tool-call turn carries its calls beside an often-empty content.
+    chars = sum(
+        len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or ""))
+        for m in messages
+    )
     ratio = llm_backend.chars_per_token()
     used = int(chars / max(ratio, 1.0)) + 1
     return max(int(num_ctx * COMPACT_THRESHOLD) - used, 0)
@@ -1456,6 +3539,7 @@ def reason(
     role: str,
     think: Any = True,
     verbose: bool = True,
+    tools: Optional["tools_mod.ToolSet"] = None,
 ) -> Tuple[str, str, Optional[Dict[str, str]]]:
     """Stage 1: free-form reasoning. No `format`, so thinking is preserved.
 
@@ -1477,66 +3561,167 @@ def reason(
     leaves nothing to build on, or no headroom is left) the partial work is
     returned for the caller to decide what to do — for the prover, handing it
     to the reviser to pick a smaller lemma or revise the statement.
+
+    tools, when given, is what the agent may call before it answers
+    (tools.py): natively, through the request's `tools` field, or — on a
+    server that refuses that, or under --tool-mode json — through the JSON
+    protocol the system prompt then describes. Each round's results stay in
+    the conversation, up to tools.MAX_TOOL_ROUNDS rounds; then the agent is
+    told to answer. A compaction rescue re-sends the task with the results
+    folded into it as text, so what the agent looked up survives the cut.
     """
-    messages = [
+    base_system = system_prompt
+    native = bool(tools) and _native_tools()
+    if tools and not native:
+        system_prompt = base_system + "\n\n" + tools.json_protocol()
+    messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     options: Dict[str, Any] = {
         **REASONING_OPTIONS,
         "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
-        # As much room as the window has left, recomputed for this prompt:
-        # the prompt differs every iteration and every role, and there is no
-        # point asking for more than the window holds or less than it does.
-        "num_predict": _headroom(messages, REASONING_OPTIONS["num_ctx"]),
     }
     # `think` is passed through as a request. The backend reconciles it with
     # the probed capabilities and never sends False, whatever we ask for.
     want_think = think if (think is not None and think is not False) else None
+    # The tool calls made and their results, as text: what a compaction
+    # rescue folds into the task it re-sends.
+    tool_notes: List[str] = []
+    rounds = 0
 
-    for attempt in range(1, LLM_MAX_RETRIES + 1):
+    def _record(name: str, arguments: Any, result: str) -> None:
+        shown = arguments if isinstance(arguments, str) else json.dumps(arguments)
+        log(f"  🔧 {role} called {name}({shown[:200]})", verbose)
+        tool_notes.append(f"{name}({shown}) returned:\n{result}")
+
+    attempt = 0
+    while attempt < LLM_MAX_RETRIES:
+        offer = bool(tools) and rounds < tools_mod.MAX_TOOL_ROUNDS
+        # As much room as the window has left, recomputed for this prompt:
+        # the prompt differs every iteration and every role — and grows
+        # with each tool round — and there is no point asking for more than
+        # the window holds or less than it does.
+        options["num_predict"] = _headroom(messages, REASONING_OPTIONS["num_ctx"])
         try:
-            reply = BACKEND.chat(messages, think=want_think, schema=None,
-                                 options=options)
-            content = reply.content or ""
-            thinking = reply.thinking or ""
-            content, thinking = _split_inline_thinking(content, thinking)
-
-            hit_ceiling = reply.truncated
-
-            if content.strip() and not hit_ceiling:
-                return content.strip(), "", None
-
-            if hit_ceiling:
-                spent = (reply.usage.get("completion_tokens")
-                         or (len(thinking) + len(content)) // 4)
-                log(
-                    f"  ⛔ {role} hit the context wall "
-                    f"(num_ctx={options['num_ctx']}, generated {spent} tokens, "
-                    f"~{len(thinking) // 4} of them thinking).",
-                    verbose,
+            if native:
+                reply = BACKEND.chat(
+                    messages, think=want_think, schema=None, options=options,
+                    tools=tools.specs(),
+                    tool_choice=None if offer else "none",
                 )
-                # A pi-style compaction rescue, when there is something to
-                # resume from: the trace gets summarised, the answer-so-far
-                # is kept verbatim, and the model is asked to finish from the
-                # cut. The rescue is bounded by MAX_COMPACTION_PASSES passes;
-                # if the work is still unfinished then, its partial state is
-                # returned so the proof loop can hand it to the reviser.
-                partial: Optional[Dict[str, str]] = None
-                if COMPACT_ENABLED and (thinking.strip() or content.strip()):
-                    resumed, partial = _resume_compacted(
-                        role, system_prompt, user_prompt, thinking, content,
-                        want_think, verbose,
-                    )
-                    if resumed:
-                        log(f"  ✅ {role} completed after compaction + "
-                            f"continuation.", verbose)
-                        return resumed, "", None
-                return "", "ceiling", partial
-
-            log(f"  ⚠️  {role} returned empty content (attempt {attempt}).", verbose)
+            else:
+                reply = BACKEND.chat(messages, think=want_think, schema=None,
+                                     options=options)
+        except llm_backend.ToolsUnsupported as e:
+            # The server takes no native tools: the JSON protocol from here
+            # on, for this call and every later one. Not an attempt spent.
+            _disable_native_tools(str(e), verbose)
+            native = False
+            system_prompt = base_system + "\n\n" + tools.json_protocol()
+            messages[0] = {"role": "system", "content": system_prompt}
+            continue
         except (requests.RequestException, ValueError, KeyError) as e:
+            attempt += 1
             log(f"  ⚠️  {role} transport error (attempt {attempt}): {e}", verbose)
+            continue
+
+        content = reply.content or ""
+        thinking = reply.thinking or ""
+        content, thinking = _split_inline_thinking(content, thinking)
+        hit_ceiling = reply.truncated
+
+        if native and reply.tool_calls and not hit_ceiling:
+            if offer:
+                rounds += 1
+                messages.append({
+                    "role": "assistant",
+                    "content": reply.content or "",
+                    "tool_calls": [
+                        {"id": c.id, "type": "function",
+                         "function": {"name": c.name, "arguments": c.arguments}}
+                        for c in reply.tool_calls
+                    ],
+                })
+                for c in reply.tool_calls:
+                    result = tools.run(c.name, c.arguments)
+                    _record(c.name, c.arguments, result)
+                    messages.append({"role": "tool", "tool_call_id": c.id,
+                                     "content": result})
+                continue
+            if not content.strip():
+                # Still calling with the tools closed and nothing written.
+                attempt += 1
+                log(f"  ⚠️  {role} kept calling tools after its last round "
+                    f"(attempt {attempt}).", verbose)
+                continue
+
+        if not native and tools and not hit_ceiling:
+            call = tools.parse_json_call(content)
+            if call is not None:
+                messages.append({"role": "assistant", "content": content})
+                if offer:
+                    rounds += 1
+                    name, arguments = call
+                    result = tools.run(name, arguments)
+                    _record(name, arguments, result)
+                    last = rounds >= tools_mod.MAX_TOOL_ROUNDS
+                    messages.append({"role": "user", "content": (
+                        f"Result of {name}:\n{result}\n\n"
+                        + ("That was your last tool call: give your answer "
+                           "now, in the format asked for."
+                           if last else
+                           "Call another tool, or give your answer in the "
+                           "format asked for.")
+                    )})
+                else:
+                    attempt += 1
+                    messages.append({"role": "user", "content": (
+                        "No more tool calls: give your answer now, in the "
+                        "format asked for."
+                    )})
+                continue
+
+        if content.strip() and not hit_ceiling:
+            return content.strip(), "", None
+
+        if hit_ceiling:
+            spent = (reply.usage.get("completion_tokens")
+                     or (len(thinking) + len(content)) // 4)
+            log(
+                f"  ⛔ {role} hit the context wall "
+                f"(num_ctx={options['num_ctx']}, generated {spent} tokens, "
+                f"~{len(thinking) // 4} of them thinking).",
+                verbose,
+            )
+            # A pi-style compaction rescue, when there is something to
+            # resume from: the trace gets summarised, the answer-so-far
+            # is kept verbatim, and the model is asked to finish from the
+            # cut. The rescue is bounded by MAX_COMPACTION_PASSES passes;
+            # if the work is still unfinished then, its partial state is
+            # returned so the proof loop can hand it to the reviser. The
+            # continuation offers no tools; what was looked up rides along
+            # in the task.
+            partial: Optional[Dict[str, str]] = None
+            if COMPACT_ENABLED and (thinking.strip() or content.strip()):
+                task = user_prompt
+                if tool_notes:
+                    task += (
+                        "\n\n---\nResults of the tool calls you made:\n\n"
+                        + "\n\n".join(tool_notes)
+                    )
+                resumed, partial = _resume_compacted(
+                    role, base_system, task, thinking, content,
+                    want_think, verbose,
+                )
+                if resumed:
+                    log(f"  ✅ {role} completed after compaction + "
+                        f"continuation.", verbose)
+                    return resumed, "", None
+            return "", "ceiling", partial
+
+        attempt += 1
+        log(f"  ⚠️  {role} returned empty content (attempt {attempt}).", verbose)
 
     # Retries exhausted on empty replies or transport errors; nothing to salvage.
     return "", "", None
@@ -1628,7 +3813,19 @@ def extract(
                 _SCHEMA_MODE_BROKEN = True
                 continue
 
-            return json.loads(clean_json_text(content))
+            parsed = json.loads(clean_json_text(content))
+            if not isinstance(parsed, dict):
+                # A bare value (a string, a list of strings) is no answer
+                # to an object schema; every caller reads the result with
+                # .get. Same as a failed extraction: nothing usable.
+                log(
+                    f"  ⚠️  {role} extraction returned a JSON "
+                    f"{type(parsed).__name__}, not an object; treating it "
+                    f"as no answer.",
+                    verbose,
+                )
+                return {}
+            return parsed
         except (requests.RequestException, KeyError, TypeError) as e:
             log(f"  ⚠️  {role} extraction transport error (attempt {attempt}): {e}", verbose)
         except json.JSONDecodeError as e:
@@ -1654,20 +3851,148 @@ def extract(
 # ----------------------------------------------------------------------------
 # Context filtering
 # ----------------------------------------------------------------------------
-def planner_dag_view(dag: Dict[str, Any]) -> Dict[str, Any]:
-    """Planner sees lemma statements + dependency structure, never proofs."""
-    return {
-        "proved_lemmas": {
-            lid: {
-                "statement": node["statement"],
-                "dependencies": node.get("dependencies", []),
+def lemma_window(
+    dag: Dict[str, Any],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]], Dict[str, List[str]]]:
+    """Which proved lemmas the agents see in full, and the index of the rest.
+
+    The window is chosen from the lemmas that are not suspended — choosing
+    first and filtering after would fill it with lemmas no agent may use.
+    Newest first by proved_at, a lemma without one (committed before the
+    stamp existed) counting as older than any stamped lemma, file order
+    breaking ties: the LEMMAS_ALL newest lemmas, anyone's, and the
+    MY_LEMMAS newest of the current user's own, deduplicated, so the two
+    can show fewer than their sum. -1 for either is no limit.
+
+    Then the common lemmas: of the eligible lemmas not already shown,
+    the LEMMAS_COMMON cited most often by the shown ones, counting direct
+    citations only, ties broken by _tiebreak. A lemma no shown lemma
+    cites does not rank, so the group can be smaller than LEMMAS_COMMON.
+
+    Returns (the shown pairs, oldest first — the order the proof grew in;
+    the common pairs, most cited first; the index of every other eligible
+    lemma, as {user_id: [lemma_id, ...]}, each list sorted). The index is
+    empty when everything is shown.
+    """
+    position = {pair: i for i, pair in enumerate(dag["lemmas"])}
+    eligible = [
+        pair for pair in dag["lemmas"]
+        if suspended is None or pair not in suspended
+    ]
+    newest = sorted(
+        eligible,
+        key=lambda pair: (
+            str(dag["lemmas"][pair].get("proved_at") or ""),
+            position[pair],
+        ),
+        reverse=True,
+    )
+
+    def take(pairs: List[Tuple[str, str]], n: int) -> List[Tuple[str, str]]:
+        return pairs if n < 0 else pairs[:n]
+
+    chosen = set(take(newest, LEMMAS_ALL))
+    chosen.update(take([p for p in newest if p[0] == USER], MY_LEMMAS))
+    shown = [pair for pair in reversed(newest) if pair in chosen]
+
+    eligible_set = set(eligible)
+    counts: Dict[Tuple[str, str], int] = {}
+    for pair in shown:
+        for dep in dag["lemmas"][pair].get("cited_lemmas", []):
+            if isinstance(dep, tuple) and dep in eligible_set and dep not in chosen:
+                counts[dep] = counts.get(dep, 0) + 1
+    common = take(
+        sorted(counts, key=lambda p: (-counts[p], _tiebreak(p))),
+        LEMMAS_COMMON,
+    )
+    chosen.update(common)
+
+    index: Dict[str, List[str]] = {}
+    for u, lid in sorted(p for p in eligible if p not in chosen):
+        index.setdefault(u, []).append(lid)
+    return shown, common, index
+
+
+def _tiebreak(pair: Tuple[str, str]) -> bytes:
+    """A lemma's place among equally cited lemmas: random, from the run's
+    seed, but the same for the whole run — so a tie does not reshuffle the
+    prompt from one call to the next."""
+    return hashlib.sha256(
+        f"{_TIEBREAK_SEED}:{pair[0]}:{pair[1]}".encode("utf-8")
+    ).digest()
+
+
+# What an agent is told about the index, beside it in the view.
+_INDEX_NOTE = (
+    "proved_lemmas lists the most recently proved lemmas in full. "
+    "common_lemmas lists, statement only, older lemmas those cite often. "
+    "other_proved_lemmas lists every other proved lemma by user_id "
+    "(the key) and lemma_id, statement omitted; they are proved lemmas "
+    "all the same. Call lookup_lemmas to read the statement of any of them "
+    "before relying on it."
+)
+
+
+def planner_dag_view(
+    dag: Dict[str, Any],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
+) -> Dict[str, Any]:
+    """Planner sees lemma statements + dependency structure, never proofs.
+
+    A flat list, not a dict keyed by id: a bare lemma_id is unique only
+    within one user's file, so in the complete DAG a lemma is the pair
+    (user_id, lemma_id), and each entry carries both fields plus the node's
+    citations: the cited lemma pairs and the cited reference ids (bare).
+
+    Given the suspension, the suspended lemmas are not in the view: a
+    refuted or uncertified lemma is not a proved lemma, and the planner
+    must not be told it is one (".comments", "Suspension"). (The view is
+    the hiding the section names: the selector sees it through
+    planner_dag_view, and the screening's id test through
+    lemma_id_set — the three agents the section hides it from.)
+
+    Only the lemma window is listed in full; the rest of the proved
+    lemmas are in other_proved_lemmas by id (lemma_window).
+"""
+    shown, common, index = lemma_window(dag, suspended)
+    view: Dict[str, Any] = {
+        "proved_lemmas": [
+            {
+                "user_id": u,
+                "lemma_id": lid,
+                "statement": str(dag["lemmas"][(u, lid)].get("statement", "")),
+                "cited_lemmas": [
+                    _dep_to_json(dep)
+                    for dep in dag["lemmas"][(u, lid)].get("cited_lemmas", [])
+                ],
+                "cited_references": list(
+                    dag["lemmas"][(u, lid)].get("cited_references", [])
+                ),
             }
-            for lid, node in dag["lemmas"].items()
-        }
+            for u, lid in shown
+        ]
     }
+    if common:
+        view["common_lemmas"] = [
+            {
+                "user_id": u,
+                "lemma_id": lid,
+                "statement": str(dag["lemmas"][(u, lid)].get("statement", "")),
+            }
+            for u, lid in common
+        ]
+    if index:
+        view["other_proved_lemmas"] = index
+    if common or index:
+        view["note"] = _INDEX_NOTE
+    return view
 
 
-def prover_context(dag: Dict[str, Any]) -> Dict[str, Any]:
+def prover_context(
+    dag: Dict[str, Any],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
+) -> Dict[str, Any]:
     """Everything the prover is allowed to cite: every proved statement.
 
     This used to be the direct dependencies' full proofs plus a statement
@@ -1682,72 +4007,142 @@ def prover_context(dag: Dict[str, Any]) -> Dict[str, Any]:
     established. If a conjecture turns out to need the latter, the fix is a
     second prover call — one to ask which lemmas it wants, one to prove with
     those proofs attached — not to widen this.
+
+    Each lemma is listed with the user_id and lemma_id it is cited by: a
+    bare lemma_id is unique only within one user's file, so a citation of a
+    lemma is the pair, and the prover's cited_lemmas carries the pair
+    objects — one {"user_id", "lemma_id"} object per cited lemma, with the
+    cited reference ids in its separate cited_references list.
+
+    Given the suspension, the suspended lemmas are not in the view: the
+    prover may not build on a lemma that is not to be built on, and a proof
+    that cites one would inherit its suspension (".comments", "Suspension").
+
+    Only the lemma window is listed in full; the rest of the proved
+    lemmas are in other_proved_lemmas by id (lemma_window).
     """
-    return {
-        "proved_lemmas": {
-            lid: {"statement": node["statement"]}
-            for lid, node in dag["lemmas"].items()
-        }
+    shown, common, index = lemma_window(dag, suspended)
+    view: Dict[str, Any] = {
+        "proved_lemmas": [
+            {
+                "user_id": u,
+                "lemma_id": lid,
+                "statement": str(dag["lemmas"][(u, lid)].get("statement", "")),
+            }
+            for u, lid in shown
+        ]
     }
+    if common:
+        view["common_lemmas"] = [
+            {
+                "user_id": u,
+                "lemma_id": lid,
+                "statement": str(dag["lemmas"][(u, lid)].get("statement", "")),
+            }
+            for u, lid in common
+        ]
+    if index:
+        view["other_proved_lemmas"] = index
+    if common or index:
+        view["note"] = _INDEX_NOTE
+    return view
 
 
 def verifier_context(
     dag: Dict[str, Any],
-    cited: List[str],
+    cited_lemmas: List[Tuple[str, str]],
+    cited_references: List[str],
     references: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     """Statements of exactly the results the prover claims to have used.
 
-    DAG lemmas and reference results are merged into one set, keyed by id and
-    carrying the statement only. Deliberately not the whole DAG or the whole
-    reference collection: the verifier agents are asked to reject "use of
-    results not
-    present in the provided set", which only bites if the set is the prover's
-    declared citations: a proof leaning on a result it never declared then
-    reads as an unjustified leap, which is what it is.
+    DAG lemmas and reference results are merged into one set and carry the
+    statement only: a lemma citation (the (user_id, lemma_id) pair) is keyed
+    by the "user:lemma" spelling of the pair, a reference by its bare id.
+    The two lists are the citation check's output (.comments,
+    "Citations"): every pair is a lemma of the complete DAG and every id a
+    reference of the collection, so a statement missing here names a
+    citation the check let through — the verifier sees the gap as an absent
+    result.
+    Deliberately not the whole DAG or the whole reference collection: the
+    verifier agents are asked to reject "use of results not present in the
+    provided set", which only bites if the set is the prover's declared
+    citations: a proof leaning on a result it never declared then reads as
+    an unjustified leap, which is what it is.
     """
-    statements = {
-        lid: {"statement": dag["lemmas"][lid]["statement"]}
-        for lid in cited
-        if lid in dag["lemmas"]
-    }
-    for ref in references:
-        lid = str(ref.get("id") or "")
-        if lid in cited and lid not in statements:
-            statements[lid] = {
+    statements: Dict[str, Dict[str, str]] = {}
+    for pair in cited_lemmas:
+        if pair in dag["lemmas"]:
+            statements[_citation_label(pair)] = {
+                "statement": str(dag["lemmas"][pair].get("statement", ""))
+            }
+    ref_by_id = {str(r.get("id") or ""): r for r in references}
+    for rid in cited_references:
+        ref = ref_by_id.get(rid)
+        if ref is not None:
+            statements[rid] = {
                 "statement": str(ref.get("formal statement", ""))
             }
     return {"cited_results": statements}
 
 
 def scan_citations(
-    proof: str, dag: Dict[str, Any], references: List[Dict[str, Any]]
-) -> List[str]:
-    """Fallback edge recovery: which known ids appear in the proof text.
+    proof: str, dag: Dict[str, Any], references: List[Dict[str, Any]],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
+) -> Tuple[List[Tuple[str, str]], List[str]]:
+    """Fallback edge recovery: which known results appear in the proof text.
 
     Only used when the prover ignored its output format entirely, in which
-    case the alternative is a node with no edges at all — a lemma that
+    case the alternative is a node with no citations at all — a lemma that
     silently claims to stand on its own. Scans lemma ids and reference ids;
-    word-boundary matching, so lemma_1 does not match inside lemma_10.
+    word-boundary matching, so lemma_1 does not match inside lemma_10. A
+    lemma id several users' files share cannot be resolved from the text
+    alone, so it is left to the prover's declaration rather than guessed.
+
+    Returns (cited_lemmas, cited_references) in the two stored fields'
+    shapes. Everything it names exists by construction, so the citation
+    check has nothing to reject.
+
+    Given the suspension, a suspended lemma is never recovered: the text
+    naming one is a proof leaning on a lemma it may not build on, and the
+    verifiers, shown no statement for it, see the gap. Ownership is still
+    counted over every lemma, so an id a suspended lemma shares with an
+    unsuspended one stays ambiguous rather than resolving to the other.
     """
-    ids = set(dag["lemmas"])
-    ids.update(str(r.get("id")) for r in references if r.get("id"))
-    return [
-        lid for lid in ids
-        if re.search(rf"\b{re.escape(lid)}\b", proof)
-    ]
+    suspended = suspended or set()
+    owners: Dict[str, List[str]] = {}
+    for u, lid in dag["lemmas"]:
+        owners.setdefault(lid, []).append(u)
+    cited_lemmas: List[Tuple[str, str]] = []
+    for lid, users in sorted(owners.items()):
+        if (
+            len(users) == 1
+            and (users[0], lid) not in suspended
+            and re.search(rf"\b{re.escape(lid)}\b", proof)
+        ):
+            cited_lemmas.append((users[0], lid))
+    cited_references: List[str] = []
+    for ref in references:
+        rid = str(ref.get("id") or "")
+        if rid and re.search(rf"\b{re.escape(rid)}\b", proof):
+            cited_references.append(rid)
+    return cited_lemmas, cited_references
 
 
 def load_references() -> List[Dict[str, Any]]:
     """Load references.md — parsing.py's output.
 
-    A strict JSON array of { id, slogan, "formal statement", reference,
-    tags } objects, written once by parsing.py; this module only reads it.
+    A strict JSON array of { id, slogan, "formal statement", reference } objects.
+    The file is the conjecture's committed reference
+    collection (.comments, "References"): the maintainer parses it and
+    commits it, every other user pulls it, and this module only ever reads
+    it — a missing or corrupt file is never repaired here.
     A missing file returns [], which is exactly the pre-features run: every
     call site degrades to the old prompts. A corrupt file warns and returns
-    [] too — the right fix is to re-run parsing.py, not to hand the loop a
-    subset. Ids (ref_N) are assigned by parsing.py, never here, so a prover
-    that cites one is citing a name the file vouches for.
+    [] too — the right fix is for the maintainer to re-run parsing.py, not
+    to hand the loop a subset. Ids (ref_N) are assigned by parsing.py,
+    never here, so a prover that cites one is citing a name the file vouches
+    for.
     """
     if not REFERENCES_FILE or not os.path.exists(REFERENCES_FILE):
         return []
@@ -1810,19 +4205,30 @@ def planner_candidates(planner_res: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def screen_candidates(
-    dag: Dict[str, Any], candidates: List[Dict[str, Any]]
+    dag: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[Tuple[Dict[str, Any], List[str]]]:
     """Pair each candidate with the reasons it cannot be used as it stands.
 
     Only one check survives now that candidates carry no dependencies: an id
-    already in the DAG. Proving it again gains nothing, and writing it again
-    would overwrite a node that other lemmas may already cite. An empty
+    already in the DAG — under any user: proving it again gains nothing, and
+    writing it again would only fork the id across users' files. An empty
     problem list means the candidate is ready for the prover.
+
+    Given the suspension, the test runs against the lemmas that are not
+    suspended (".comments", "Suspension"): a candidate that restates a
+    suspended lemma's id is not screened out, because a proof under that id
+    is a fresh proof, not a build on the suspended lemma — the id is up for
+    grabs for the users whose files do not hold it, and screening it out
+    would make the id dead for everyone until the suspended node is
+    repaired. The suspended node itself is lifted by proofs verify or
+    proofs repair re-accepting it, not by this screen.
     """
     screened: List[Tuple[Dict[str, Any], List[str]]] = []
     for cand in candidates:
         problems: List[str] = []
-        if cand["id"] in dag["lemmas"]:
+        if cand["id"] in lemma_id_set(dag, suspended):
             problems.append(f"{cand['id']} is already in the DAG")
         screened.append((cand, problems))
     return screened
@@ -1850,6 +4256,7 @@ def select_lemma(
     failed_attempts: Dict[str, List[str]],
     verbose: bool,
     proposer: str = "the planner",
+    suspended: Optional[Set[Tuple[str, str]]] = None,
 ) -> Dict[str, Any]:
     """Ask the selector agent to pick, from the candidates that survived
     screening, the one it judges most likely to come through the prover and
@@ -1865,7 +4272,7 @@ def select_lemma(
     selector_user = (
         f"Conjecture:\n{conjecture}\n\n"
         f"Planner's strategy summary:\n{plan_summary or '(none)'}\n\n"
-        f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}\n\n"
+        f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}\n\n"
         f"Previously rejected attempts (routes the prover and the verifiers "
         f"have already found wanting):\n"
         f"{json.dumps(failed_attempts, indent=2)}\n\n"
@@ -1874,7 +4281,8 @@ def select_lemma(
         f"{json.dumps(usable, indent=2)}"
     )
     text, _status, _partial = reason(selector_sys, selector_user, "selector",
-                           THINK["selector"], verbose)
+                           THINK["selector"], verbose,
+                           tools=agent_tools(dag, suspended))
     check_mode_toggle(verbose)
 
     res: Optional[Dict[str, Any]] = None
@@ -1950,11 +4358,16 @@ def _run_verifier(
 ) -> Tuple[str, str]:
     """One atomic verification step: a single call to one verifier agent.
 
-    Returns (decision, justification). A pass that hits the context wall
-    without a verdict, or returns nothing parseable, is a reject — a check
-    that cannot be completed can never count as an acceptance, so the proof
-    goes to the reviser rather than into the DAG on the strength of the
-    other two verifiers.
+    Returns (decision, justification). decision is "accept" or "reject"
+    only when the verifier itself gave that verdict; it is "" when there is
+    no verdict at all — the server failed or returned nothing, the reply
+    could not be parsed, or the pass hit the context wall — and the
+    justification then says which. The proof loop treats "" like a reject
+    (a check that cannot be completed can never count as an acceptance, so
+    the proof goes to the reviser rather than into the DAG on the strength
+    of the other two verifiers); verify and repair do not, because a
+    refutation file is the record of a verifier's rejection, and a missing
+    verdict is not one.
     """
     review, review_status, _partial = reason(
         system_prompt, user_prompt, role, THINK[role], verbose,
@@ -1962,7 +4375,7 @@ def _run_verifier(
     check_mode_toggle(verbose)
     if review_status == "ceiling" and not review:
         return (
-            "reject",
+            "",
             f"{role} exhausted its token budget without reaching a verdict; "
             "the proof is likely too long to review in one pass.",
         )
@@ -1977,8 +4390,20 @@ def _run_verifier(
             role,
             verbose,
         )
+    if not review:
+        return (
+            "",
+            f"{role} returned no review (the server failed or replied "
+            f"with nothing, after retries).",
+        )
     res = res or {}
     decision = str(res.get("decision", "")).strip().lower()
+    if decision not in ("accept", "reject"):
+        return (
+            "",
+            f"{role}'s review could not be read as a verdict "
+            f"(decision {res.get('decision')!r}).",
+        )
     justification = str(res.get("justification") or "(no justification)").strip()
     return decision, justification
 
@@ -1996,6 +4421,7 @@ def run_proof_loop(
     ref_ids: Set[str],
     initial: Optional[Dict[str, Any]],
     fresh_target: Optional[Dict[str, Any]],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
     on_round,
     on_proof,
     failed_attempts: Dict[str, List[str]],
@@ -2003,9 +4429,21 @@ def run_proof_loop(
     get_dag,
     toggle_hotkey,
     should_stop=None,
+    allow_decomposition: bool = True,
 ) -> Dict[str, Any]:
     """Steps 2-5 of the proof loop: prover -> verifiers -> reviser, shared
     by the serial run and by every parallel loop.
+
+    `allow_decomposition` keeps the reviser's new_lemma option open: the
+    run leaves it on, where a lemma that is too hard as stated is the
+    reviser's to decompose. proofs repair turns it off — the repair
+    re-proves the named lemma and the lemma keeps its id, so a
+    decomposition would commit a different lemma and leave the refutation
+    sitting on the one it named. With it off, a new_lemma decision falls
+    back to keeping the statement, the way a new_lemma with a missing or
+    taken id already does; on the overflow path it falls back to giving up
+    on the lemma for this pass, since retrying the statement that just
+    overflowed would only overflow it again.
 
     `should_stop`, when given, is polled before every prover round: the
     parallel loops pass the run's stop test so a resolution or a Ctrl-C
@@ -2030,6 +4468,16 @@ def run_proof_loop(
     `failed_lock` — a formality in the serial run, where the lock is never
     contended, and what keeps the shared reject list coherent in a parallel
     one.
+
+    `suspended` is the suspension as the caller computed it this round
+    (".comments", "Suspension"): the prover's context and the reviser's
+    view of the DAG omit the suspended lemmas, so the proof cannot build on
+    them. A target that restates a suspended lemma's id is a fresh proof,
+    not a build on the suspended lemma: the commit lands in this run's
+    user's own file, under the id if it is free there and under a fresh id
+    beside it otherwise (commit_lemma_to_dag renames on collision), and a
+    node suspended in some file is lifted by proofs verify or proofs
+    repair re-accepting it.
 
     Returns {"proved", "lemma_id", "committed_id", "claimed_id", "target",
     "proof", "attempt_notes"}. committed_id is the id the proof was
@@ -2076,7 +4524,8 @@ def run_proof_loop(
         last_proof = str(in_flight.get("last_proof") or "")
     else:
         feedback: List[str] = []
-        attempt_notes: List[str] = list(failed_attempts.get(lemma_id, []))
+        with failed_lock:
+            attempt_notes: List[str] = list(failed_attempts.get(lemma_id, []))
         first_attempt = 1
         last_proof = ""
     proved = False
@@ -2118,14 +4567,16 @@ def run_proof_loop(
 
         # ---------------- Step 2: Prover ----------------
         # prover.md instructs the model to reply with {"lemma_id",
-        # "cited_lemmas", "proof"}. We parse that JSON locally rather than
-        # via a second model call, so the proof text can never be abridged
-        # or paraphrased; if the model ignored the format, its content is
-        # taken verbatim as the proof.
+        # "cited_lemmas", "cited_references", "proof"} — the two citation
+        # lists are separate: pair objects for lemmas, bare ids for
+        # references (.comments, "Citations"). We parse that JSON locally
+        # rather than via a second model call, so the proof text can never
+        # be abridged or paraphrased; if the model ignored the format, its
+        # content is taken verbatim as the proof.
         prover_user = (
             f"Conjecture:\n{conjecture}\n\n"
             f"Available proved lemmas:\n"
-            f"{json.dumps(prover_context(dag), indent=2)}"
+            f"{json.dumps(prover_context(dag, suspended), indent=2)}"
             f"{reference_block}\n\n"
             f"Lemma to prove:\n{json.dumps(target, indent=2)}\n"
             + (
@@ -2137,7 +4588,8 @@ def run_proof_loop(
             )
         )
         proof_text, prover_status, prover_partial = reason(
-            prover_sys, prover_user, "prover", THINK["prover"], verbose
+            prover_sys, prover_user, "prover", THINK["prover"], verbose,
+            tools=agent_tools(dag, suspended),
         )
         toggle_hotkey()
 
@@ -2175,7 +4627,7 @@ def run_proof_loop(
             )
             overflow_user = (
                 f"Conjecture:\n{conjecture}\n\n"
-                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
                 f"{reviser_ref_block}\n\n"
                 f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
                 f"{report}"
@@ -2183,6 +4635,7 @@ def run_proof_loop(
             revision_text, _revision_status, _revision_partial = reason(
                 reviser_sys, overflow_user, "reviser",
                 THINK["reviser"], verbose,
+                tools=agent_tools(dag, suspended),
             )
             toggle_hotkey()
             revision_res = _parse_reviser_decision(revision_text, verbose)
@@ -2201,27 +4654,34 @@ def run_proof_loop(
             # The id test reads the DAG fresh: the round's snapshot is
             # stale in a parallel run, and a decomposition onto an
             # already-proved id would burn rounds that add_lemma's
-            # commit-time guard would drop anyway.
+            # commit-time guard would drop anyway. The id is matched
+            # against every user's lemmas: a lemma_id is unique only
+            # within one user's file.
             if (
-                action == "new_lemma"
+                allow_decomposition
+                and action == "new_lemma"
                 and new_id
                 and new_stmt
-                and new_id not in get_dag()["lemmas"]
+                # a smaller lemma never takes a reserved id: that id's
+                # statement is pinned to the whole conjecture
+                and not resolution.is_reserved(new_id)
+                and new_id not in lemma_id_set(get_dag())
             ):
                 # The reviser found a smaller lemma worth trying. Set the
                 # overflowing lemma aside (its history is recorded under its
                 # own id) and start the prover on the smaller lemma with a
                 # fresh budget and no inherited verdict.
                 old_id = lemma_id
-                failed_attempts[old_id] = (
-                    list(attempt_notes)
-                    + list(overflow_feedback)
-                    + [
-                        f"Overflowed: {old_id} ran out of the prover's "
-                        f"context window; the reviser is instead trying "
-                        f"{new_id}."
-                    ]
-                )
+                with failed_lock:
+                    failed_attempts[old_id] = (
+                        list(attempt_notes)
+                        + list(overflow_feedback)
+                        + [
+                            f"Overflowed: {old_id} ran out of the prover's "
+                            f"context window; the reviser is instead trying "
+                            f"{new_id}."
+                        ]
+                    )
                 lemma_id = new_id
                 target = {"id": lemma_id, "statement": new_stmt}
                 attempt_notes = [
@@ -2242,6 +4702,8 @@ def run_proof_loop(
                 action == "revise_statement"
                 and new_stmt
                 and new_stmt != target["statement"]
+                # the conjecture's statement is pinned, not revisable
+                and not resolution.is_reserved(lemma_id)
             ):
                 # The partial work shows the statement is false or badly
                 # posed, and the reviser has corrected it. The lemma keeps
@@ -2263,31 +4725,47 @@ def run_proof_loop(
                     verbose,
                 )
                 continue
-            log(
-                "⛔ Reviser could not pick a usable smaller lemma or "
-                "revised statement from the partial proof; the planner "
-                "will decompose.",
-                verbose,
-            )
-            attempt_notes.extend(overflow_feedback)
-            attempt_notes.append(
-                "Lemma too large: the prover exhausted its context window "
-                "and the reviser could neither split it further nor "
-                "revise its statement. Decompose into smaller, "
-                "independently provable lemmas."
-            )
+            if allow_decomposition:
+                log(
+                    "⛔ Reviser could not pick a usable smaller lemma or "
+                    "revised statement from the partial proof; the planner "
+                    "will decompose.",
+                    verbose,
+                )
+                attempt_notes.extend(overflow_feedback)
+                attempt_notes.append(
+                    "Lemma too large: the prover exhausted its context "
+                    "window and the reviser could neither split it further "
+                    "nor revise its statement. Decompose into smaller, "
+                    "independently provable lemmas."
+                )
+            else:
+                log(
+                    "⛔ Reviser could not pick a usable revised statement "
+                    "from the partial proof, and decomposition is not "
+                    "allowed here.",
+                    verbose,
+                )
+                attempt_notes.extend(overflow_feedback)
+                attempt_notes.append(
+                    "Lemma too large: the prover exhausted its context "
+                    "window and the reviser could not revise its statement "
+                    "(decomposition is not allowed here)."
+                )
             break
 
         proof = proof_text
-        declared: Optional[List[str]] = None
+        cited_lemmas: List[Tuple[str, str]] = []
+        cited_refs: List[str] = []
         prover_res = parse_json_or_none(proof_text)
+        raw_cited_lemmas: Any = None
+        raw_cited_refs: Any = None
         if prover_res is not None:
             candidate = prover_res.get("proof")
             if isinstance(candidate, str) and candidate.strip():
                 proof = candidate.strip()
-            raw_cited = prover_res.get("cited_lemmas")
-            if isinstance(raw_cited, list):
-                declared = [str(c).strip() for c in raw_cited if str(c).strip()]
+            raw_cited_lemmas = prover_res.get("cited_lemmas")
+            raw_cited_refs = prover_res.get("cited_references")
 
         if not proof:
             log(f"❌ Prover produced no proof for {lemma_id}.", verbose)
@@ -2299,42 +4777,123 @@ def run_proof_loop(
         # the checkpoint records beside the in-flight state.
         last_proof = proof
 
-        # The DAG's edges now come from here. An empty declared list is
-        # taken at face value — a proof from first principles has no
-        # dependencies — but a missing one means the prover ignored its
-        # format, and scanning the text beats recording a lemma as
-        # standing on nothing.
-        if declared is None:
-            dep_ids = scan_citations(proof, dag, references)
-            if dep_ids:
+        # The DAG's edges now come from here, in the two stored fields
+        # (.comments, "Citations"): cited_lemmas, an array of
+        # {"user_id", "lemma_id"} objects, and cited_references, an array
+        # of bare reference ids. A response with neither list means the
+        # prover ignored its format, and scanning the text beats recording
+        # a lemma as standing on nothing; the scan only ever names
+        # something that exists, so what it recovers cannot be a phantom.
+        if not (
+            isinstance(raw_cited_lemmas, list)
+            or isinstance(raw_cited_refs, list)
+        ):
+            cited_lemmas, cited_refs = scan_citations(
+                proof, dag, references, suspended
+            )
+            if cited_lemmas or cited_refs:
                 log(
                     f"  ℹ️  Prover declared no citations; recovered "
-                    f"{', '.join(dep_ids)} from the proof text.",
+                    f"{', '.join(_citation_label(d) for d in [*cited_lemmas, *cited_refs])} "
+                    f"from the proof text.",
                     verbose,
                 )
         else:
-            # Citations may name DAG lemmas or parsed references; the
-            # verifier's context is the union of the two, so both are
-            # kept. A name in neither set is dropped, and the verifier is
-            # about to see a proof that leans on a result absent from its
-            # context, which is exactly the unjustified step it is meant
-            # to catch.
-            dep_ids = [c for c in declared if c in dag["lemmas"] or c in ref_ids]
-            phantom = [
-                c for c in declared if c not in dag["lemmas"] and c not in ref_ids
-            ]
-            if phantom:
-                log(
-                    f"  ⚠️  Prover cited ids that are neither lemmas nor "
-                    f"references: {', '.join(phantom)}.",
-                    verbose,
+            # Every cited pair is checked against the complete DAG and
+            # every id against the reference collection; whatever matches
+            # nothing is sent back to the prover as feedback and the round
+            # is spent, so a proof that claims a result nobody has proved
+            # never reaches the verifiers to be rejected there instead.
+            cited_lemmas, cited_refs, unmatched = _check_prover_citations(
+                raw_cited_lemmas, raw_cited_refs, dag, ref_ids, suspended
+            )
+            if unmatched:
+                unmatched_labels = [label for label, _ in unmatched]
+                suspended_labels = [
+                    label for label, kind in unmatched if kind == "suspended"
+                ]
+                unknown_labels = [
+                    label for label, kind in unmatched if kind != "suspended"
+                ]
+                if unknown_labels:
+                    log(
+                        f"  👻 Prover cited {len(unknown_labels)} result(s) "
+                        f"that match no lemma and no reference: "
+                        f"{', '.join(unknown_labels)} — sent back as "
+                        f"feedback.",
+                        verbose,
+                    )
+                if suspended_labels:
+                    log(
+                        f"  ⛔ Prover cited {len(suspended_labels)} "
+                        f"suspended lemma(s): {', '.join(suspended_labels)} "
+                        f"— not to be built on; sent back as feedback.",
+                        verbose,
+                    )
+                missing_refs = [
+                    label for label, kind in unmatched
+                    if kind == "reference"
+                ]
+                if missing_refs:
+                    log(
+                        f"  ↩ none of these is in "
+                        f"{os.path.basename(REFERENCES_FILE)}: "
+                        f"{', '.join(missing_refs)} — this run cannot add "
+                        f"references. Request the missing one(s) from the "
+                        f"conjecture's maintainer, who keeps the file with "
+                        f"proofs parse and commits it.",
+                        verbose,
+                    )
+                problems = []
+                if unknown_labels:
+                    problems.append(
+                        "cited result(s) that do not exist in the DAG or "
+                        "the reference collection: "
+                        + ", ".join(unknown_labels)
+                    )
+                if suspended_labels:
+                    problems.append(
+                        "cited lemma(s) that are suspended — refuted, "
+                        "uncertified, or standing on one that is — and may "
+                        "not be built on: "
+                        + ", ".join(suspended_labels)
+                        + " (prove what you need from them yourself, or "
+                        "use other results)"
+                    )
+                feedback = [
+                    "Your proof "
+                    + "; and ".join(problems)
+                    + ". Cite only lemmas from the 'Available proved "
+                    "lemmas' list, each as the exact {\"user_id\", "
+                    "\"lemma_id\"} object that list shows, and cite "
+                    "references from the 'Known references' list by id. "
+                    "The two go in separate lists: cited_lemmas and "
+                    "cited_references."
+                ]
+                attempt_notes.append(
+                    f"Prover attempt {attempt}: the proof cited "
+                    f"{len(unmatched)} unknown or suspended result(s) "
+                    f"({', '.join(unmatched_labels)}); the citations were "
+                    "sent back unverified and the proof never reached the "
+                    "verifiers."
                 )
+                attempt += 1
+                continue
 
-        log(
-            f"✍️ Proof generated for {lemma_id} ({len(proof)} chars"
-            f"{', cites ' + ', '.join(dep_ids) if dep_ids else ', no citations'}).",
-            verbose,
-        )
+        all_cited = [*cited_lemmas, *cited_refs]
+        if all_cited:
+            log(
+                f"✍️ Proof generated for {lemma_id} ({len(proof)} chars, "
+                f"cites: "
+                f"{', '.join(_citation_label(d) for d in all_cited)}).",
+                verbose,
+            )
+        else:
+            log(
+                f"✍️ Proof generated for {lemma_id} ({len(proof)} chars, "
+                f"no citations).",
+                verbose,
+            )
 
         # ---------------- Step 3: the three verifier checks -----------
         # Three atomic checks, one per verifier agent, in the order
@@ -2347,7 +4906,7 @@ def run_proof_loop(
             f"Cited results (statements of exactly the lemmas and "
             f"references the proof declares it used; nothing else is "
             f"available to it):\n"
-            f"{json.dumps(verifier_context(dag, dep_ids, references), indent=2)}\n\n"
+            f"{json.dumps(verifier_context(dag, cited_lemmas, cited_refs, references), indent=2)}\n\n"
             f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
             f"Proposed proof:\n{proof}"
         )
@@ -2383,7 +4942,12 @@ def run_proof_loop(
             committed_id = on_proof(lemma_id, {
                 "statement": target["statement"],
                 "proof": proof,
-                "dependencies": dep_ids,
+                # The round may have ended before the citations were
+                # parsed (ceiling or overflow break); a lemma proved and
+                # committed never took that path, but the loop must not
+                # crash on it.
+                "cited_lemmas": list(cited_lemmas or []),
+                "cited_references": list(cited_refs or []),
             })
             proved = True
             break
@@ -2396,7 +4960,7 @@ def run_proof_loop(
         )
         reviser_user = (
             f"Conjecture:\n{conjecture}\n\n"
-            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
             f"{reviser_ref_block}\n\n"
             f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
             f"The last proof of this lemma (the one just rejected; judge "
@@ -2404,7 +4968,8 @@ def run_proof_loop(
             f"Verifier's reasoning (why the proof failed):\n{reject_just}"
         )
         revision_text, _revision_status, _partial = reason(
-            reviser_sys, reviser_user, "reviser", THINK["reviser"], verbose
+            reviser_sys, reviser_user, "reviser", THINK["reviser"], verbose,
+            tools=agent_tools(dag, suspended),
         )
         toggle_hotkey()
 
@@ -2460,12 +5025,17 @@ def run_proof_loop(
         # The id test reads the DAG fresh: the round's snapshot is stale
         # in a parallel run, and a decomposition onto an already-proved id
         # would burn rounds that add_lemma's commit-time guard would drop
-        # anyway.
+        # anyway. The id is matched against every user's lemmas: a
+        # lemma_id is unique only within one user's file.
         if (
-            action == "new_lemma"
+            allow_decomposition
+            and action == "new_lemma"
             and new_id
             and new_stmt
-            and new_id not in get_dag()["lemmas"]
+            # a smaller lemma never takes a reserved id: that id's
+            # statement is pinned to the whole conjecture
+            and not resolution.is_reserved(new_id)
+            and new_id not in lemma_id_set(get_dag())
         ):
             # Decomposition: the target is too hard to prove as stated.
             # Record the old lemma's history — and why it was set aside —
@@ -2501,7 +5071,16 @@ def run_proof_loop(
             )
             continue
 
-        if action == "revise_statement" and new_stmt and new_stmt != target["statement"]:
+        if action == "revise_statement" and resolution.is_reserved(lemma_id):
+            # The statement of a reserved id is the conjecture (or its
+            # negation) itself: revising it would only prove something
+            # else under the conjecture's name, which settles nothing.
+            log(
+                f"⚠️  Reviser proposed a revised statement for {lemma_id}, "
+                f"whose statement is pinned to conjecture.md; keeping it.",
+                verbose,
+            )
+        elif action == "revise_statement" and new_stmt and new_stmt != target["statement"]:
             target = {"id": lemma_id, "statement": new_stmt}
             last_proof = ""
             log(
@@ -2517,13 +5096,23 @@ def run_proof_loop(
                 verbose,
             )
         elif action == "new_lemma":
-            # The reviser wanted to decompose but the new id was missing or
-            # already taken; fall back to keeping the statement.
-            log(
-                "⚠️  Reviser proposed a new lemma with a missing or "
-                "already-taken id; keeping the statement instead.",
-                verbose,
-            )
+            # The reviser wanted to decompose but could not: the new id was
+            # missing or already taken, or decomposition is not allowed
+            # here at all (a repair re-proves the lemma under its own id);
+            # fall back to keeping the statement.
+            if allow_decomposition:
+                log(
+                    "⚠️  Reviser proposed a new lemma with a missing, "
+                    "reserved or already-taken id; keeping the statement "
+                    "instead.",
+                    verbose,
+                )
+            else:
+                log(
+                    "⚠️  Reviser wanted to decompose, but the repair keeps "
+                    "the lemma's id; keeping the statement instead.",
+                    verbose,
+                )
         else:
             log(
                 "↻ Reviser kept the statement; the prover re-tries with "
@@ -2568,7 +5157,11 @@ def _serial_on_proof(
     contract — return the id the lemma was committed under — holds in both
     modes. A serial run has a single writer, so the id is never already
     taken and the rename branch stays cold."""
-    committed, _renamed = commit_lemma_to_dag(lemma_id, node)
+    with _commit_section():
+        committed, _renamed = commit_lemma_to_dag(lemma_id, node)
+        # All three verifier checks accepted this proof: it is certified,
+        # the serial way the parallel on_proof below is.
+        record_certificate(committed, MODEL_NAME, verbose)
     return committed
 
 
@@ -2588,14 +5181,13 @@ def _build_reference_blocks(
             "id": r["id"],
             "slogan": r.get("slogan", ""),
             "formal statement": r.get("formal statement", ""),
-            "tags": r.get("tags", []),
         }
         for r in references
     ]
     reference_block = (
         "\n\nKnown references (theorem-level results from the parsed "
-        "collection; you may cite any of them by id in cited_lemmas without "
-        "proving them yourself):\n"
+        "collection; you may cite any of them in cited_references by id "
+        "without proving them yourself):\n"
         + json.dumps(prover_refs, indent=2)
         if prover_refs
         else ""
@@ -2608,7 +5200,6 @@ def _build_reference_blocks(
         {
             "id": r["id"],
             "slogan": r.get("slogan", ""),
-            "tags": r.get("tags", []),
         }
         for r in references
     ]
@@ -2706,6 +5297,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
     # iteration budget stood, the planner's reject list, and the lemma that
     # was in flight, if the cancellation landed mid-proof. A missing or
     # corrupt checkpoint degrades to a fresh run, never to a crash.
+    _ensure_user_dag_file()
     cp = load_checkpoint(verbose)
     if cp is not None and not os.path.exists(DAG_FILE):
         log("⚠️  Checkpoint without a DAG file; discarding it.", verbose)
@@ -2743,6 +5335,9 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         return load_dag()
 
     warned_dangling = set()
+    # Suspended lemmas already warned about this run: the warning is told
+    # once per lemma, the way the dangling-citation warning is told.
+    warned_suspended: Set[Tuple[str, str]] = set()
     _LIVE_STATE["failed_attempts"] = failed_attempts
     _LIVE_STATE["in_flight"] = in_flight
 
@@ -2751,20 +5346,52 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         check_mode_toggle(verbose)
         dag = load_dag()
 
-        # An existing DAG may cite reference ids; one that no longer exists in
-        # references.md (a re-parse dropped it) dangles every proof that used
-        # it, and the verifier would reject those for good reason. Warn once
-        # per (lemma, dependency) pair rather than every iteration.
-        known_ids = set(dag["lemmas"]) | ref_ids
-        for lid, node in dag["lemmas"].items():
-            for dep in node.get("dependencies", []):
-                if dep not in known_ids and (lid, dep) not in warned_dangling:
-                    warned_dangling.add((lid, dep))
-                    log(
-                        f"⚠️  DAG node {lid} cites {dep}, which is neither a "
-                        f"lemma nor a parsed reference; verification of it "
-                        f"will see a citation with no statement behind it."
-                    )
+        # The suspension, recomputed from the hashes, the certificates and
+        # the refutations as they stand now (".comments", "Suspension"): the
+        # lemmas this iteration's planner, selector and prover are hidden
+        # from. It is never stored in the DAG — this recomputation is the
+        # only record of it — so a lemma re-proved and certified since the
+        # last iteration is simply no longer in it.
+        susp = suspension.compute(dag["lemmas"], references, CONJECTURE_ROOT)
+        _warn_suspended(susp, verbose, warned_suspended, dag)
+        suspended = susp.suspended
+
+        # Settled? Only a certified lemma stating the conjecture (or its
+        # negation) verbatim says so — this run's, or one another user's
+        # pulled DAG file holds (resolution.py). Nothing is stored: the
+        # resolution is the lemma, and it lasts exactly as long as the
+        # lemma stays unsuspended.
+        if _settled(dag, suspended, conjecture, verbose):
+            discard_checkpoint()
+            return dag
+
+        # Citations that no longer resolve dangle every proof that used
+        # them, and the verifier would reject those for good reason: a lemma
+        # pair no user's file holds (a hand-edited DAG), or a reference id
+        # references.md no longer has (a re-parse dropped it). Warn once
+        # per (lemma, citation) pair rather than every iteration. The check
+        # runs on the complete DAG: a lemma citation is the (user_id,
+        # lemma_id) pair its file names it, a reference citation the
+        # reference's bare id.
+        for key, node in dag["lemmas"].items():
+            for dep in [*node.get("cited_lemmas", []),
+                        *node.get("cited_references", [])]:
+                exists = (
+                    dep in dag["lemmas"] if isinstance(dep, tuple)
+                    else dep in ref_ids
+                )
+                if exists or (key, dep) in warned_dangling:
+                    continue
+                warned_dangling.add((key, dep))
+                if isinstance(dep, tuple):
+                    shown, kind = _citation_label(dep), "proved lemma"
+                else:
+                    shown, kind = dep, "parsed reference"
+                log(
+                    f"⚠️  DAG node {_citation_label(key)} cites "
+                    f"{shown}, which is not a {kind}; verification of it "
+                    f"will see a citation with no statement behind it."
+                )
 
         # Checkpoint: this iteration is now the resumable position. If the
         # previous run was cancelled mid-proof, `in_flight` names the lemma
@@ -2776,7 +5403,15 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         _LIVE_STATE["in_flight"] = in_flight
         save_checkpoint(iteration, failed_attempts, in_flight, verbose)
 
-        resuming = in_flight is not None and in_flight["lemma_id"] not in dag["lemmas"]
+        resuming = (
+            in_flight is not None
+            and in_flight["lemma_id"] not in lemma_id_set(dag, suspended)
+        )
+        if resuming and _committed_uncertified(dag, susp, in_flight):
+            log(_uncertified_message(in_flight["lemma_id"]))
+            resuming = False
+            in_flight = None
+            _LIVE_STATE["in_flight"] = None
         if resuming:
             log(
                 f"♻ In-flight {in_flight['lemma_id']}: re-running prover round "
@@ -2799,13 +5434,14 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             # ---------------- Step 1: Planner ----------------
             planner_user = (
                 f"Conjecture:\n{conjecture}\n\n"
-                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
                 f"{planner_ref_block}{comments_block}\n\n"
                 f"Previously rejected attempts (avoid or decompose these):\n"
                 f"{json.dumps(failed_attempts, indent=2)}"
             )
             plan_text, plan_status, _partial = reason(
-                planner_sys, planner_user, "planner", THINK["planner"], verbose
+                planner_sys, planner_user, "planner", THINK["planner"], verbose,
+                tools=agent_tools(dag, suspended),
             )
             check_mode_toggle(verbose)
             if plan_status == "ceiling" and not plan_text:
@@ -2821,44 +5457,25 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 planner_res = extract(
                     "Extract the plan. Copy every candidate lemma the text proposes "
                     "into candidate_lemmas, preserving the order it presents them "
-                    "in. "
-                    "is_conjecture_proved must be true only if the text "
-                    "explicitly concludes the conjecture is fully proved; "
-                    "is_conjecture_disproved must be true only if the text "
-                    "explicitly concludes that a full counterexample to the "
-                    "conjecture has been established.",
+                    "in.",
                     plan_text,
                     PLANNER_SCHEMA,
                     "planner",
                     verbose,
                 )
 
-            if planner_res.get("is_conjecture_proved"):
-                log("\n🎉 Conjecture has been fully proved!", verbose)
-                dag["conjecture"] = conjecture
-                dag["status"] = "proved"
-                save_dag(dag)
-                discard_checkpoint()
-                return dag
-
-            if planner_res.get("is_conjecture_disproved"):
-                log(
-                    "\n💥 Conjecture has been disproved: a counterexample to it "
-                    "stands in the DAG.",
-                    verbose,
-                )
-                dag["conjecture"] = conjecture
-                dag["status"] = "disproved"
-                save_dag(dag)
-                discard_checkpoint()
-                return dag
-
-            candidates = planner_candidates(planner_res)
+            # A candidate under a reserved id is the conjecture (or its
+            # negation) itself: its statement is the code's, never the
+            # planner's. It then competes at selection like any other.
+            candidates = [
+                resolution.pin(c, conjecture)
+                for c in planner_candidates(planner_res)
+            ]
             if not candidates:
                 log("Planner proposed no usable lemma. Re-planning.", verbose)
                 continue
 
-            screened = screen_candidates(dag, candidates)
+            screened = screen_candidates(dag, candidates, suspended)
             summary = str(planner_res.get("plan_summary") or "")
 
             # ---------------- Step 1b: Selection ----------------
@@ -2869,7 +5486,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             next_lemma: Optional[Dict[str, Any]] = None
             if MODE == "human":
                 choice = interaction.choose(
-                    screened, dag["lemmas"].keys(), HOTKEY, summary
+                    screened, lemma_id_set(dag, suspended), HOTKEY, summary
                 )
                 if choice.action == "quit":
                     log(
@@ -2877,7 +5494,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                         "re-run the same command to resume.",
                         verbose,
                     )
-                    save_dag(dag)
+                    save_user_dag(dag)
                     return dag
                 if choice.action == "replan":
                     # Recorded against every candidate shown, because the channel
@@ -2899,23 +5516,33 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                     # person rather than on a machine-checked argument — absent on
                     # every node written by the pipeline, and on every DAG file
                     # that predates this, so read it with .get().
-                    asserted = choice.lemma or {}
-                    dag["lemmas"][asserted["id"]] = {
-                        "statement": asserted["statement"],
-                        "proof": "Asserted by the operator; not machine-proved.",
-                        "dependencies": [],   # nothing was cited; nothing was proved
-                        "provenance": "operator",
-                    }
-                    save_dag(dag)
-                    failed_attempts.pop(asserted["id"], None)
-                    log(
-                        f"🖊  Lemma {asserted['id']} accepted on your authority "
-                        f"and added to the DAG unproved.",
-                        verbose,
-                    )
+                    asserted = resolution.pin(choice.lemma or {}, conjecture)
+                    with _commit_section():
+                        committed_id, _renamed = commit_lemma_to_dag(
+                            asserted["id"],
+                            {
+                                "statement": asserted["statement"],
+                                "proof": "Asserted by the operator; not machine-proved.",
+                                # nothing was cited; nothing was proved
+                                "cited_lemmas": [],
+                                "cited_references": [],
+                                "provenance": "operator",
+                            },
+                        )
+                        failed_attempts.pop(committed_id, None)
+                        log(
+                            f"🖊  Lemma {committed_id} accepted on your authority "
+                            f"and added to the DAG unproved.",
+                            verbose,
+                        )
+                        # The operator's acceptance is certified too, with an
+                        # empty model: a person vouching, not a machine
+                        # (.comments, "Certificates").
+                        record_certificate(committed_id, "", verbose)
                     continue
-                else:
-                    next_lemma = choice.lemma
+                elif choice.lemma is not None:
+                    # A written lemma under a reserved id is pinned too.
+                    next_lemma = resolution.pin(choice.lemma, conjecture)
 
             if next_lemma is None:
                 # Automatic selection. Screening removes the candidates whose ids
@@ -2928,11 +5555,10 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 log_candidates(screened, summary, verbose)
                 usable = [cand for cand, problems in screened if not problems]
                 if not usable:
+                    # No note goes on the reject list: the screening alone
+                    # keeps these ids out, and a note per screened candidate
+                    # per iteration only grew the planner's prompt.
                     log("No candidate is currently provable; re-planning.", verbose)
-                    for cand, problems in screened:
-                        failed_attempts.setdefault(cand["id"], []).append(
-                            f"Planning error: {'; '.join(problems)}."
-                        )
                     continue
                 if len(usable) == 1:
                     next_lemma = usable[0]
@@ -2944,7 +5570,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                         )
                 else:
                     next_lemma = select_lemma(
-                        usable, dag, conjecture, summary, failed_attempts, verbose
+                        usable, dag, conjecture, summary, failed_attempts, verbose,
+                        suspended=suspended,
                     )
 
         if resuming:
@@ -3002,6 +5629,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             failed_lock=serial_failed_lock,
             get_dag=load_dag,
             toggle_hotkey=lambda: check_mode_toggle(verbose),
+            suspended=suspended,
         )
         lemma_id = result["lemma_id"]
         proved = result["proved"]
@@ -3022,6 +5650,13 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         in_flight = None
         _LIVE_STATE["in_flight"] = None
         save_checkpoint(iteration + 1, failed_attempts, None, verbose)
+
+    # The last iteration's lemma may have been the one that settles it.
+    dag = load_dag()
+    susp = suspension.compute(dag["lemmas"], references, CONJECTURE_ROOT)
+    if _settled(dag, susp.suspended, conjecture, verbose):
+        discard_checkpoint()
+        return dag
 
     log(
         f"\n⏹ Reached MAX_ITERATIONS ({MAX_ITERATIONS}) without settling the "
@@ -3166,6 +5801,26 @@ class LemmaBuffer:
                     return e["lemma"]
         return None
 
+    def release_claims(
+        self, loop_id: str, keep: Optional[str] = None
+    ) -> List[str]:
+        """Unclaim every slot loop_id holds except keep: the claims a
+        crashed loop left without a published round. Returns the ids
+        released."""
+        released: List[str] = []
+        with self.cond:
+            for e in self.slots:
+                if (
+                    e is not None
+                    and e["claimed_by"] == loop_id
+                    and e["lemma"]["id"] != keep
+                ):
+                    e["claimed_by"] = None
+                    released.append(e["lemma"]["id"])
+            if released:
+                self.cond.notify_all()
+        return released
+
     def consume(self, lemma_id: str) -> None:
         """Free the slot a settled lemma occupied. Proved, disproved by
         decomposition, or abandoned, the lemma has left the list either
@@ -3209,6 +5864,11 @@ class ParallelState:
         self.loops: Dict[str, Dict[str, Any]] = {
             lid: {"in_flight": None, "iterations_used": 0} for lid in loop_ids
         }
+        # How many lemmas each loop has settled (proved or given up) this
+        # run: the crash-restart count resets when this moves, so the
+        # restart bound is on crashes with no finished lemma between them.
+        # Run-local, not checkpointed.
+        self.finished: Dict[str, int] = {lid: 0 for lid in loop_ids}
         self.max_iterations = max_iterations
         self.plan: Optional[Dict[str, Any]] = None
         self.plan_stale = False
@@ -3286,10 +5946,12 @@ class ParallelState:
         with self.state_lock:
             self.plan = {
                 "plan_summary": str(plan.get("plan_summary") or "").strip(),
+                # Plain strings, one gap per entry, the shape
+                # parallel_planner.md and PARALLEL_PLANNER_SCHEMA ask for.
                 "priorities": [
-                    p
+                    str(p).strip()
                     for p in (plan.get("priorities") or [])
-                    if isinstance(p, dict) and str(p.get("id") or "").strip()
+                    if isinstance(p, str) and p.strip()
                 ],
             }
             moved = self.dag_version > dag_version_before
@@ -3318,6 +5980,15 @@ class ParallelState:
     def iterations_used(self, loop_id: str) -> int:
         with self.state_lock:
             return self.loops[loop_id]["iterations_used"]
+
+    def finish_lemma(self, loop_id: str) -> None:
+        """The loop's lemma settled, proved or not."""
+        with self.state_lock:
+            self.finished[loop_id] += 1
+
+    def lemmas_finished(self, loop_id: str) -> int:
+        with self.state_lock:
+            return self.finished[loop_id]
 
     def begin_lemma(self, loop_id: str) -> None:
         """A fresh lemma starts: spend one of the loop's iterations and
@@ -3436,18 +6107,20 @@ class ParallelState:
             )
 
 
-def _clean_candidate(raw: Any) -> Optional[Dict[str, Any]]:
+def _clean_candidate(raw: Any, conjecture: str) -> Optional[Dict[str, Any]]:
     """A generated or written lemma entry, validated the way the planner's
     candidates are: an id and a non-empty statement. Anything else is
     dropped, not repaired — the prompt tells the generator the shape, and a
-    dropped entry costs one generator round, not a proof."""
+    dropped entry costs one generator round, not a proof. An entry under a
+    reserved id has its statement pinned to the conjecture (or its
+    negation), whatever it said (resolution.pin)."""
     if not isinstance(raw, dict):
         return None
     lemma_id = str(raw.get("id") or "").strip()
     statement = str(raw.get("statement") or "").strip()
     if not lemma_id or not statement:
         return None
-    return {"id": lemma_id, "statement": statement}
+    return resolution.pin({"id": lemma_id, "statement": statement}, conjecture)
 
 
 def _parallel_planner(
@@ -3467,17 +6140,36 @@ def _parallel_planner(
     stale and the planner goes straight back around: no DAG change is
     lost, and the plan that steers the loops was always written for the
     DAG as it stood."""
+    warned: Set[Tuple[str, str]] = set()
     while state.running():
         if not state.wait_for_work():
             return
         if not state.running():
             return
-        dag = load_dag()
+        # The version is read before the DAG, never after: a commit landing
+        # between the two would otherwise be counted in the version but
+        # missing from the DAG this plan is written from, and install_plan
+        # would then clear the stale flag mark_plan_stale had just set.
         dag_version_before = state.dag_version_snapshot()
+        dag = load_dag()
+        # The suspension as this round stands to be planned (".comments",
+        # "Suspension"): the planner's view omits the suspended lemmas, and
+        # the warning is told here, where every DAG change is seen.
+        susp = suspension.compute(dag["lemmas"], load_references(), CONJECTURE_ROOT)
+        _warn_suspended(susp, verbose, warned, dag)
+        # Settled? The planner wakes on every DAG change, so this is where
+        # a lemma that settles the conjecture is noticed — a loop's proof,
+        # the operator's assertion, or (at start) another user's pulled
+        # file. The planner's own opinion never settles it (resolution.py).
+        kind = _settled(dag, susp.suspended, conjecture, verbose)
+        if kind is not None:
+            log("🏁 The loops are being stopped.", verbose)
+            state.set_resolution(kind)
+            return
         plan = state.plan_snapshot()
         plan_user = (
             f"Conjecture:\n{conjecture}\n\n"
-            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag), indent=2)}"
+            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, susp.suspended), indent=2)}"
             f"{ref_block}{comments_block}\n\n"
             f"Rejected attempts so far, keyed by lemma id (feedback from the "
             f"loops' prover, verifier and reviser rounds; routes already "
@@ -3490,14 +6182,15 @@ def _parallel_planner(
         text, _status, _partial = reason(
             planner_sys, plan_user, "parallel_planner",
             THINK["parallel_planner"], verbose,
+            tools=agent_tools(dag, susp.suspended),
         )
         check_mode_toggle(verbose)
         plan_res = parse_json_or_none(text) if text else None
         if plan_res is None and text:
             plan_res = extract(
-                "Extract the plan. The two flags are booleans; plan_summary "
-                "is a short string; priorities is a list of objects with id "
-                "and reason.",
+                "Extract the plan. plan_summary is a short string; "
+                "priorities is a list of strings, each one gap to close, "
+                "in the order the text gives them.",
                 text,
                 PARALLEL_PLANNER_SCHEMA,
                 "parallel_planner",
@@ -3512,21 +6205,6 @@ def _parallel_planner(
                 return
             continue
         moved = state.install_plan(plan_res, dag_version_before)
-        if bool(plan_res.get("is_conjecture_proved")) or bool(
-            plan_res.get("is_conjecture_disproved")
-        ):
-            kind = (
-                "proved"
-                if plan_res.get("is_conjecture_proved")
-                else "disproved"
-            )
-            log(
-                f"\n🏁 Planner judges the conjecture {kind}; the loops are "
-                f"being stopped.",
-                verbose,
-            )
-            state.set_resolution(kind)
-            return
         log(
             "🧠 Planner set the strategy"
             + (" — the DAG moved while it was writing, re-planning now."
@@ -3561,10 +6239,14 @@ def _parallel_generator(
             return
         plan = state.plan_snapshot() or {}
         dag = load_dag()
+        susp = suspension.compute(dag["lemmas"], load_references(), CONJECTURE_ROOT)
         buffer_snapshot = state.buffer.snapshot()
-        # Ids the new batch must not repeat: proved, buffered (claimed or
-        # not), or already rejected.
-        known = set(dag["lemmas"].keys())
+        # Ids the new batch must not repeat: proved (under any user's
+        # name: a lemma_id is unique only within one user's file, and not
+        # suspended — a suspended lemma's id is up for grabs again for the
+        # users whose files do not hold it), buffered (claimed or not), or
+        # already rejected.
+        known = lemma_id_set(dag, susp.suspended)
         known |= {e["lemma"]["id"] for e in buffer_snapshot}
         known |= set(state.failed_snapshot().keys())
         # A lemma a loop holds in flight is off-limits too: the run
@@ -3575,7 +6257,7 @@ def _parallel_generator(
             f"Current plan (follow its priorities; these are the lemmas the "
             f"loops are working toward):\n{json.dumps(plan, indent=2)}\n\n"
             f"Proved lemmas so far (already in the DAG; never restate "
-            f"them):\n{json.dumps(planner_dag_view(dag), indent=2)}\n\n"
+            f"them):\n{json.dumps(planner_dag_view(dag, susp.suspended), indent=2)}\n\n"
             f"Possible lemmas currently in the buffer (claimed_by marks the "
             f"loop that has picked one up; never duplicate any of "
             f"these):\n{json.dumps(buffer_snapshot, indent=2)}\n\n"
@@ -3586,6 +6268,7 @@ def _parallel_generator(
         text, _status, _partial = reason(
             generator_sys, gen_user, "parallel_lemma_generator",
             THINK["parallel_lemma_generator"], verbose,
+            tools=agent_tools(dag, susp.suspended),
         )
         check_mode_toggle(verbose)
         batch = parse_json_or_none(text) if text else None
@@ -3602,7 +6285,7 @@ def _parallel_generator(
         lemmas = (batch or {}).get("candidate_lemmas") or []
         fresh: List[Dict[str, Any]] = []
         for raw in lemmas:
-            cand = _clean_candidate(raw)
+            cand = _clean_candidate(raw, conjecture)
             if cand is None or cand["id"] in known:
                 continue
             known.add(cand["id"])
@@ -3636,6 +6319,9 @@ def _auto_claim(
         dag = load_dag()
         plan = state.plan_snapshot() or {}
         failed = state.failed_snapshot()
+        susp = suspension.compute(
+            dag["lemmas"], load_references(), CONJECTURE_ROOT
+        )
         return select_lemma(
             usable,
             dag,
@@ -3644,6 +6330,7 @@ def _auto_claim(
             failed,
             verbose,
             proposer="the lemma generator",
+            suspended=susp.suspended,
         )
 
     return state.buffer.claim(loop_id, pick)
@@ -3653,6 +6340,7 @@ def _parallel_human_step(
     state: ParallelState,
     loop_id: str,
     verbose: bool,
+    conjecture: str,
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """One human planning step: the buffer on the menu, as the serial run
     puts the planner's shortlist. Loops until the operator commits to a
@@ -3662,6 +6350,9 @@ def _parallel_human_step(
     global MODE
     while True:
         dag = load_dag()
+        susp = suspension.compute(
+            dag["lemmas"], load_references(), CONJECTURE_ROOT
+        )
         snapshot = state.buffer.snapshot()
         screened = [
             (
@@ -3675,7 +6366,7 @@ def _parallel_human_step(
         plan = state.plan_snapshot() or {}
         summary = str(plan.get("plan_summary") or "")
         choice = interaction.choose(
-            screened, dag["lemmas"].keys(), HOTKEY, summary
+            screened, lemma_id_set(dag, susp.suspended), HOTKEY, summary
         )
         if choice.action == "quit":
             log(
@@ -3701,32 +6392,53 @@ def _parallel_human_step(
             log(f"▶ {loop_id} handed to automation. {HOTKEY.hint()}", verbose)
             return "auto", None
         if choice.action == "assert":
-            asserted = choice.lemma or {}
-            committed = state.add_lemma(
-                asserted["id"],
-                {
-                    "statement": asserted["statement"],
-                    "proof": "Asserted by the operator; not machine-proved.",
-                    "dependencies": [],
-                    "provenance": "operator",
-                },
-            )
-            state.buffer.consume(asserted["id"])
-            if committed == asserted["id"]:
-                log(
-                    f"🖊  Lemma {asserted['id']} accepted on your authority "
-                    f"and added to the DAG unproved.",
-                    verbose,
+            asserted = resolution.pin(choice.lemma or {}, conjecture)
+            # A buffered id is claimed before it is asserted, the way a
+            # 'prove' pick is: a lemma another loop is proving is not the
+            # operator's to assert over (its slot would be freed under that
+            # loop, which would go on to commit a duplicate as id_2), and
+            # one still unclaimed must not be picked up by a loop between
+            # the commit and the consume below.
+            if asserted["id"] in {e["lemma"]["id"] for e in state.buffer.snapshot()}:
+                if state.buffer.claim_id(loop_id, asserted["id"]) is None:
+                    log(
+                        f"  {asserted['id']} is claimed by another loop, "
+                        f"which is proving it; pick another, or let that "
+                        f"loop finish.",
+                        verbose,
+                    )
+                    continue
+            with _commit_section():
+                committed = state.add_lemma(
+                    asserted["id"],
+                    {
+                        "statement": asserted["statement"],
+                        "proof": "Asserted by the operator; not machine-proved.",
+                        "cited_lemmas": [],
+                        "cited_references": [],
+                        "provenance": "operator",
+                    },
                 )
-            else:
-                # A sibling loop committed this id while the menu was up:
-                # its entry stands under the id, the assertion goes in
-                # under the renamed one.
-                log(
-                    f"🖊  Lemma {asserted['id']} entered the DAG in the "
-                    f"meantime; yours went in as {committed}.",
-                    verbose,
-                )
+                state.buffer.consume(asserted["id"])
+                if committed == asserted["id"]:
+                    log(
+                        f"🖊  Lemma {asserted['id']} accepted on your authority "
+                        f"and added to the DAG unproved.",
+                        verbose,
+                    )
+                else:
+                    # A sibling loop committed this id while the menu was up:
+                    # its entry stands under the id, the assertion goes in
+                    # under the renamed one.
+                    log(
+                        f"🖊  Lemma {asserted['id']} entered the DAG in the "
+                        f"meantime; yours went in as {committed}.",
+                        verbose,
+                    )
+                # The operator's acceptance is certified too, under the id it
+                # was committed under, with an empty model (.comments,
+                # "Certificates").
+                record_certificate(committed, "", verbose)
             continue
         # 'prove': a buffer lemma, claimed atomically, or a written one.
         lemma = choice.lemma or {}
@@ -3740,7 +6452,7 @@ def _parallel_human_step(
                 )
                 continue
             return "prove", claimed
-        cand = _clean_candidate(lemma)
+        cand = _clean_candidate(lemma, conjecture)
         if cand is None:
             log(
                 "  That written lemma has no usable id or statement; "
@@ -3783,6 +6495,17 @@ def _parallel_proof_loop(
         verbose,
     )
     while state.running():
+        # The suspension as this claim stands to be run (".comments",
+        # "Suspension"): the prover's context and the reviser's view omit
+        # its lemmas, and the "already in the DAG" test below runs against
+        # the lemmas that are not suspended — a suspended lemma a previous
+        # run died re-proving is not "already in the DAG" for this test, it
+        # is exactly what the resume is for.
+        dag_now = load_dag()
+        susp_now = suspension.compute(
+            dag_now["lemmas"], load_references(), CONJECTURE_ROOT
+        )
+        suspended_now = susp_now.suspended
         pending = state.take_in_flight(loop_id)
         if pending is not None:
             # A prover round a previous run cancelled mid-flight: re-run
@@ -3790,8 +6513,14 @@ def _parallel_proof_loop(
             # one it started under was already spent — so the resume is
             # checked before the budget: a loop that exhausted its budget
             # still finishes the lemma it died holding.
-            dag_now = load_dag()
-            if pending["lemma_id"] in dag_now.get("lemmas", {}):
+            if _committed_uncertified(dag_now, susp_now, pending):
+                state.set_in_flight(loop_id, None)
+                state.buffer.consume(
+                    pending.get("claimed_id") or pending["lemma_id"]
+                )
+                log(_uncertified_message(pending["lemma_id"]))
+                continue
+            if pending["lemma_id"] in lemma_id_set(dag_now, suspended_now):
                 # The stop landed after the lemma was proved: on_proof had
                 # already committed it. The serial run's same case — nothing
                 # to resume; drop the position and the buffer claim, and go
@@ -3827,7 +6556,9 @@ def _parallel_proof_loop(
                 # that engine before its lemma was ever proved.
                 break
             if is_human():
-                action, lemma = _parallel_human_step(state, loop_id, verbose)
+                action, lemma = _parallel_human_step(
+                    state, loop_id, verbose, conjecture
+                )
                 if action == "quit":
                     # The operator ended the run, the serial way: stop every
                     # loop (their in-flight lemmas stay in the checkpoint),
@@ -3867,22 +6598,28 @@ def _parallel_proof_loop(
             # the id it happened under, where the planner and the other
             # loops can see that the two proofs may state different
             # things.
-            committed = state.add_lemma(lid, node)
-            if committed != lid:
-                log(
-                    f"↻ {loop_id}: lemma {lid} was taken by another route "
-                    f"while this proof was in flight; committed under "
-                    f"{committed} instead.",
-                    verbose,
-                )
-                with state.failed_lock:
-                    state.failed_attempts.setdefault(lid, []).append(
-                        f"Id collision: this loop's proof of {lid} was "
-                        f"committed under {committed} because the id was "
-                        f"already in the DAG; the two proofs may state "
-                        f"different things."
+            with _commit_section():
+                committed = state.add_lemma(lid, node)
+                if committed != lid:
+                    log(
+                        f"↻ {loop_id}: lemma {lid} was taken by another route "
+                        f"while this proof was in flight; committed under "
+                        f"{committed} instead.",
+                        verbose,
                     )
-                state.write_checkpoint()
+                    with state.failed_lock:
+                        state.failed_attempts.setdefault(lid, []).append(
+                            f"Id collision: this loop's proof of {lid} was "
+                            f"committed under {committed} because the id was "
+                            f"already in the DAG; the two proofs may state "
+                            f"different things."
+                        )
+                    state.write_checkpoint()
+                # All three verifier checks accepted this proof, the serial way
+                # the _serial_on_proof boundary is: it is certified, under the id
+                # it was committed under (a renamed id is the lemma that is in the
+                # DAG now).
+                record_certificate(committed, MODEL_NAME, verbose)
             return committed
         result = run_proof_loop(
             verbose=verbose,
@@ -3905,6 +6642,7 @@ def _parallel_proof_loop(
             get_dag=load_dag,
             toggle_hotkey=lambda: check_mode_toggle(verbose),
             should_stop=lambda: not state.running(),
+            suspended=suspended_now,
         )
         if result["stopped"]:
             # A stop landed mid-round: the engine's last on_round already
@@ -3922,6 +6660,7 @@ def _parallel_proof_loop(
         # the final target — that is the statement that was actually tried.
         state.set_in_flight(loop_id, None)
         state.buffer.consume(result["claimed_id"])
+        state.finish_lemma(loop_id)
         if not result["proved"]:
             if result["attempt_notes"]:
                 state.record_failure(result["lemma_id"], result["attempt_notes"])
@@ -3930,13 +6669,8 @@ def _parallel_proof_loop(
         # goes for its next lemma.
         if not state.running():
             break
-    # Every exit path (budget spent, human quit, a stop, the buffer waiting
-    # giving up) funnels here: announce this loop is out, and if it was the
-    # last, send the stop that frees the planner and generator — nothing
-    # more will ever be claimed or added, so there is no point left in
-    # their waiting.
-    if state.note_loop_exit():
-        state.request_stop()
+    # The loop's exit is announced by its thread wrapper (_proof_thread in
+    # run_parallel), in a finally, so a crash announces it too.
 
 
 def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
@@ -3999,11 +6733,12 @@ def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
 
     loop_ids = [f"loop-{i}" for i in range(parallel_loops)]
     state = ParallelState(loop_ids, MAX_ITERATIONS)
+    _ensure_user_dag_file()
     cp = load_parallel_checkpoint(loop_ids, verbose)
     if cp is not None and not os.path.exists(DAG_FILE):
-        # The serial run's rule, kept: deleting dag.json is how the operator
-        # resets a conjecture, and a checkpoint outliving its DAG would
-        # resurrect the old budget and in-flight lemma.
+        # The serial run's rule, kept: deleting the user's DAG file is how
+        # the operator resets the run, and a checkpoint outliving its DAG
+        # would resurrect the old budget and in-flight lemma.
         log("\u26a0\ufe0f  Checkpoint without a DAG file; discarding it.", verbose)
         discard_checkpoint()
         cp = None
@@ -4043,14 +6778,76 @@ def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
             _fail_context_length(e, stop=state.request_stop)
 
     def _proof_thread(i: int, lid: str) -> None:
+        restarts = 0
+        finished_at_start = state.lemmas_finished(lid)
         try:
-            _parallel_proof_loop(
-                state, lid, i, verbose, conjecture, prover_sys, reviser_sys,
-                reference_block, reviser_ref_block, references, verifier_sys,
-                ref_ids,
-            )
-        except llm_backend.ContextLengthError as e:
-            _fail_context_length(e, stop=state.request_stop)
+            while True:
+                try:
+                    _parallel_proof_loop(
+                        state, lid, i, verbose, conjecture, prover_sys,
+                        reviser_sys, reference_block, reviser_ref_block,
+                        references, verifier_sys, ref_ids,
+                    )
+                    return
+                except llm_backend.ContextLengthError as e:
+                    # A mis-sized window, not a crash: every restart would
+                    # 400 the same way.
+                    _fail_context_length(e, stop=state.request_stop)
+                    return
+                except Exception as e:
+                    # Logged unconditionally: a crash the operator must see
+                    # is not verbose noise.
+                    log(
+                        f"💥 {lid} crashed: {type(e).__name__}: {e}\n"
+                        + traceback.format_exc().rstrip()
+                    )
+                    # The bound is on crashes in a row: a loop that finished
+                    # a lemma since its last (re)start was making progress,
+                    # so this crash starts the count again.
+                    if state.lemmas_finished(lid) > finished_at_start:
+                        restarts = 0
+                    if restarts >= MAX_LOOP_RESTARTS:
+                        log(
+                            f"⏹ {lid} crashed {restarts + 1} times in a row "
+                            f"without finishing a lemma; giving it "
+                            f"up for this run. Its in-flight round stays in "
+                            f"the checkpoint for the next run."
+                        )
+                        return
+                    restarts += 1
+                    finished_at_start = state.lemmas_finished(lid)
+                    # The restart resumes the round the loop last published
+                    # (take_in_flight), and its claim with it; any other
+                    # claim the crash left behind (claimed, but no round
+                    # published yet) goes back to the buffer, or its slot
+                    # would stay claimed for the rest of the run.
+                    pending = state.take_in_flight(lid)
+                    keep = (
+                        (pending.get("claimed_id") or pending["lemma_id"])
+                        if pending is not None else None
+                    )
+                    released = state.buffer.release_claims(lid, keep=keep)
+                    log(
+                        f"↻ {lid}: restart {restarts}/{MAX_LOOP_RESTARTS} in "
+                        f"{LOOP_RESTART_DELAY}s"
+                        + (f", resuming {pending['lemma_id']}"
+                           if pending is not None else "")
+                        + (f"; released {', '.join(released)} to the buffer"
+                           if released else "")
+                        + "."
+                    )
+                    if state.stop_event.wait(LOOP_RESTART_DELAY):
+                        return
+        finally:
+            # Every exit path (budget spent, human quit, a stop, the buffer
+            # waiting giving up, an unexpected exception) funnels here:
+            # announce this loop is out, and if it was the last, send the
+            # stop that frees the planner and generator — nothing more will
+            # ever be claimed or added, so there is no point left in their
+            # waiting. Without the finally, a loop that crashed would never
+            # be counted out and the run would hang at join().
+            if state.note_loop_exit():
+                state.request_stop()
 
     threads = [
         threading.Thread(
@@ -4082,19 +6879,23 @@ def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
     finally:
         _PARALLEL = None
 
+    if state.resolution is None:
+        # The last loop out may have committed the settling lemma after
+        # the planner stopped watching.
+        dag = load_dag()
+        susp = suspension.compute(dag["lemmas"], references, CONJECTURE_ROOT)
+        kind = _settled(dag, susp.suspended, conjecture, verbose)
+        if kind is not None:
+            state.set_resolution(kind)
     if state.resolution is not None:
-        with DAG_LOCK:
-            dag = load_dag()
-            dag["conjecture"] = conjecture
-            dag["status"] = state.resolution
-            save_dag(dag)
+        # Nothing is written to the DAG: the settling lemma is the record,
+        # and the resolution is recomputed from it (resolution.py).
         discard_checkpoint()
         log(
-            f"\n🎉 Conjecture has been {state.resolution} — the DAG "
-            f"records it and the checkpoint is cleared.",
+            f"\n🎉 Conjecture {state.resolution}; the checkpoint is cleared.",
             verbose,
         )
-        return dag
+        return load_dag()
     state.write_checkpoint()
     buffer_snapshot = state.buffer.snapshot()
     log(
@@ -4111,15 +6912,23 @@ def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
-def main() -> None:
-    global MODEL_NAME, CONJECTURE_FILE, DAG_FILE, REFERENCES_FILE
-    global COMMENTS_FILE
-    global MAX_ITERATIONS, NUM_CTX
+def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
+    """Run the main proof loop.
+
+    argv is the argument list (defaults to sys.argv[1:]); prog is the name
+    usage lines show. The proofs command calls this as
+    main(argv=["--conjecture", DIR, ...], prog="proofs run"); running the
+    file directly is unchanged.
+    """
+    global MODEL_NAME, CONJECTURE_FILE, CONJECTURE_ROOT, DAGS_DIR, DAG_FILE
+    global REFERENCES_FILE, COMMENTS_FILE
+    global MAX_ITERATIONS, NUM_CTX, USER, LEMMAS_ALL, MY_LEMMAS, TOOL_MODE
+    global LEMMAS_COMMON
     global BACKEND, PROFILE, PROMPT_PATHS, MODE, HOTKEY
     global MAX_PROOF_ATTEMPTS, CHECKPOINT_FILE
 
     parser = argparse.ArgumentParser(
-        description="Run the multi-agent theorem prover."
+        prog=prog, description="Run the multi-agent theorem prover."
     )
     # Adds --verbose / --no-verbose flags (defaults to True)
     parser.add_argument(
@@ -4164,11 +6973,6 @@ def main() -> None:
              f"{workspace.CONJECTURE_FILENAME} (default: {DEFAULT_CONJECTURE})",
     )
     parser.add_argument(
-        "--dag", default=None,
-        help="Override the DAG path. By default every run of a conjecture "
-             "shares conjectures/<name>/dag.json, whatever model wrote it.",
-    )
-    parser.add_argument(
         "--max-iterations", type=int, default=MAX_ITERATIONS,
         help=f"Loop iterations before giving up (default: {MAX_ITERATIONS})",
     )
@@ -4184,8 +6988,9 @@ def main() -> None:
         action="store_true",
         help=(
             "Ignore and delete any existing checkpoint, restarting the "
-            "iteration budget from 1. The DAG itself is kept: delete "
-            "dag.json for a genuinely clean run."
+            "iteration budget from 1. The DAG files are kept: delete "
+            "dags/<user_id>_dag.json (the current user's file) for a "
+            "genuinely clean run."
         ),
     )
     parser.add_argument(
@@ -4223,7 +7028,13 @@ def main() -> None:
         help=f"Key that toggles between manual and automatic mid-run "
              f"(default: {HOTKEY_KEYS!r}). Pass '' to disable the listener.",
     )
-    args = parser.parse_args()
+    add_lemma_window_flags(parser)
+    add_tool_flags(parser)
+    args = parser.parse_args(argv)
+    LEMMAS_ALL = args.lemmas_all
+    MY_LEMMAS = args.my_lemmas
+    LEMMAS_COMMON = args.lemmas_common
+    TOOL_MODE = args.tool_mode
 
     MODEL_NAME = args.model
     MAX_ITERATIONS = args.max_iterations
@@ -4262,13 +7073,23 @@ def main() -> None:
         PROFILE, args.num_ctx if args.num_ctx is not None else NUM_CTX
     ), args.verbose)
 
+    # The run's user, before the paths: the DAG file is named after it,
+    # and every lemma the run commits is stored under it. The model never
+    # emits a user_id; this is the one that goes in (see .comments,
+    # "User identity").
     try:
-        paths = workspace.resolve(args.conjecture, args.dag)
+        USER = config.ensure_user_id()
+        paths = workspace.resolve(args.conjecture, USER)
+    except config.UserConfigError as e:
+        parser.error(str(e))
+        return  # unreachable; parser.error exits, but keeps type checkers calm
     except workspace.ConjectureNotFound as e:
         parser.error(str(e))
         return  # unreachable; parser.error exits, but keeps type checkers calm
 
     CONJECTURE_FILE = str(paths.conjecture)
+    CONJECTURE_ROOT = str(paths.root)
+    DAGS_DIR = str(paths.dags_dir)
     DAG_FILE = str(paths.dag)
     CHECKPOINT_FILE = checkpoint_path_for(DAG_FILE)
     REFERENCES_FILE = str(paths.references)

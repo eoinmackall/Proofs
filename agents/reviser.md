@@ -11,9 +11,9 @@ explains how. It contains one of two kinds of failure.
   lemma is too difficult for the prover to complete in one go.
 
 Besides the failure itself, the message lists the lemmas already proved
-(ids and statements) and, if there are any, the known references. Use them:
-a choice must neither duplicate what is already established nor contradict
-it.
+(each with its user_id, its lemma_id, and its statement) and, if there are
+any, the known references. Use them: a choice must neither duplicate what
+is already established nor contradict it.
 
 Your job is to salvage the attempt. If the proof can be fixed, say exactly
 how to fix it. Otherwise, choose a new lemma worth proving, using what the
@@ -35,7 +35,10 @@ first one whose condition is met.
    Correct the statement so that the evidence no longer applies, changing
    no more than the evidence requires. The lemma keeps its id and its role
    in the overall strategy (a step toward proving the conjecture, or a step
-   toward a counterexample to it).
+   toward a counterexample to it). Never choose this when the target's id
+   is "conjecture" or "conjecture_negation": that statement is the
+   conjecture itself (or its negation) and cannot be changed. If it looks
+   false, say so in the diagnosis and choose "new_lemma" instead.
 
 3. "new_lemma": choose this in every other case.
 
@@ -50,6 +53,8 @@ Choosing "new_lemma":
 - Do not restate a lemma already in the proved list: those are what is
   already established here.
 - Give it a fresh id that does not collide with any id in the proved list.
+  The ids "conjecture" and "conjecture_negation" are reserved and may not
+  be used.
 
 General rules:
 - Choose exactly one action, and make the JSON fields consistent with it.

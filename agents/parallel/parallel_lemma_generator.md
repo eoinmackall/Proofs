@@ -38,12 +38,13 @@ Rules:
   attempts. Continue the numbering the list uses.
 - Do not re-propose a rejected lemma unchanged: if the plan still wants it,
   decompose it into something smaller that a single prover can close.
-- A candidate may be the conjecture itself, stated in full — but only once
-  the lemmas it rests on are actually proved.
-- Symmetrically, a candidate may be the full counterexample, stated in full
-  — but only once the lemmas that build it are actually proved, and it must
-  name a concrete refuting instance, not merely assert that one exists
-  somewhere.
+- Two ids are reserved: "conjecture" (the conjecture itself) and
+  "conjecture_negation" (that the conjecture is false, by an explicit
+  counterexample). A lemma under one of them, once proved and verified, is
+  what settles the conjecture. Propose one only once the lemmas it rests on
+  (or that build the refuting instance) are actually proved; its statement
+  is filled in by the system from the conjecture verbatim, so whatever you
+  write there is replaced. Never use these ids for anything else.
 - If "Known references" are provided, they name theorem-level results the
   provers may cite by id without proving them. Do not propose a lemma that
   merely restates a reference; it is already available.

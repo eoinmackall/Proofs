@@ -9,13 +9,25 @@ results, and writes them to references.md as a strict JSON array:
         "id": "ref_1",
         "slogan": "one plain-English sentence",
         "formal statement": "the result, self-contained, in the file's notation",
-        "reference": "Chapter 4, Theorem 4.3",
-        "tags": ["univalent functions", "conformal mapping"]
+        "reference": "Chapter 4, Theorem 4.3"
       }
     ]
 
+Who maintains it
+----------------
+references.md is the conjecture's committed reference collection
+(.comments, "References"). The conjecture's maintainer is the only one who
+runs this tool: the maintainer keeps the sources in references/ (a local,
+gitignored working copy — the raw files are never committed), parses them,
+and commits the updated references.md with the conjecture. Every other user
+pulls references.md and never regenerates it: a result they need that is
+missing is requested from the maintainer, who parses it in. The proving loop
+(main.py) only ever reads the file; nothing in it writes to it. In a clone
+without the maintainer's references/ directory this tool is a clean no-op:
+nothing to parse, and the pulled references.md is left untouched.
+
 main.py then feeds that file to the loop: the prover sees the whole
-collection and may cite any entry by id in cited_lemmas, the verifier sees
+collection and may cite any entry by id in cited_references, the verifier sees
 the formal statements of exactly the cited entries, and the planner sees an
 id + slogan shortlist while the collection stays below
 main.PLANNER_REFERENCE_LIMIT.
@@ -31,7 +43,8 @@ Id stability across re-parses
 Ids (ref_N) are assigned here, never by the model, so a citation the prover
 writes is a name this file vouches for. When references.md already exists, a
 re-parsed result whose normalized formal statement matches an existing entry
-keeps that entry's id: DAG dependencies may cite ref_N, and renumbering it
+keeps that entry's id: proved lemmas may cite ref_N in their
+cited_references, and renumbering it
 would dangle every proof that leans on it. Results newly derived this run
 take the next free numbers. Entries in the previous file whose statements
 are not re-derived this run are kept (union semantics): a flaky parse of one
@@ -40,9 +53,11 @@ therefore idempotent on a good run — same files in, same file out.
 
 Usage
 -----
-    python parsing.py --conjecture algebra_example
-    python parsing.py --conjecture algebra_example --model Qwen3.5-122B-Q4_K_M
-    python parsing.py --conjecture algebra_example --num-ctx 65536
+    proofs parse conjectures/algebra_example
+    proofs parse conjectures/algebra_example --model Qwen3.5-122B-Q4_K_M
+    proofs parse conjectures/algebra_example --num-ctx 65536
+
+(also: python proofs/parsing.py --conjecture algebra_example)
 
 --conjecture names a directory under conjectures/ holding a conjecture.md,
 as main.py does. Its references/ directory is the input; references.md,
@@ -53,11 +68,15 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-import llm_backend
-import main
-import workspace
+try:  # inside the proofs package (installed, or `python -m proofs`)
+    from . import config, llm_backend, main, workspace
+except ImportError:  # top-level modules (`python proofs/parsing.py`)
+    import config
+    import llm_backend
+    import main
+    import workspace
 
 # Files that could plausibly contain statements. Everything else in the
 # directory (images, pdfs, .gitkeep) is skipped with a note, not an error:
@@ -82,9 +101,8 @@ _REFERENCE_SCHEMA: Dict[str, Any] = {
                     "slogan": {"type": "string"},
                     "formal statement": {"type": "string"},
                     "reference": {"type": "string"},
-                    "tags": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["slogan", "formal statement", "reference", "tags"],
+                "required": ["slogan", "formal statement", "reference"],
             },
         },
     },
@@ -192,7 +210,7 @@ def parse_file(
         res = main.extract(
             "Extract the references. Copy every result the text identifies "
             'into "references", preserving the order it presents them in, and '
-            'copy each field (slogan, "formal statement", reference, tags) '
+            'copy each field (slogan, "formal statement", reference) '
             "verbatim where the text gives one. Do not add an id field.",
             content,
             _REFERENCE_SCHEMA,
@@ -226,26 +244,21 @@ def make_entry(
             verbose,
         )
         return {}
-    tags = item.get("tags")
     return {
         "id": rid,
         "slogan": str(item.get("slogan") or "").strip(),
         "formal statement": statement,
         "reference": str(item.get("reference") or "").strip(),
-        "tags": (
-            [str(t).strip() for t in tags if t is not None and str(t).strip()]
-            if isinstance(tags, list)
-            else []
-        ),
     }
 
 
 # Entry point, named run() because this module imports main and a function
 # called main would shadow it: every main.reason / main.log call below would
 # then resolve against the function instead of the module.
-def run() -> None:
+def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     ap = argparse.ArgumentParser(
-        description="Parse a conjecture's references/ directory into references.md."
+        prog=prog,
+        description="Parse a conjecture's references/ directory into references.md.",
     )
     ap.add_argument(
         "--verbose",
@@ -297,7 +310,7 @@ def run() -> None:
             "against a probed llama-server it is clamped to the ceiling."
         ),
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     # The same backend setup as main.main(): probe first, then resolve the
     # context window — an explicit --num-ctx wins, clamped only against a
@@ -325,8 +338,17 @@ def run() -> None:
         main.PROFILE, args.num_ctx if args.num_ctx is not None else num_ctx
     ), args.verbose)
 
+    # The run's user, before the paths: resolve() names the run's DAG
+    # file after it, and the description the operator sees mentions whose
+    # file the run writes. Parsing itself only reads references/ and
+    # writes references.md; the user is irrelevant to that, but the paths
+    # are the same shape a run would use.
     try:
-        paths = workspace.resolve(args.conjecture)
+        user_id = config.ensure_user_id()
+        paths = workspace.resolve(args.conjecture, user_id)
+    except config.UserConfigError as e:
+        ap.error(str(e))
+        return
     except workspace.ConjectureNotFound as e:
         ap.error(str(e))
         return
@@ -421,6 +443,17 @@ def run() -> None:
             if old is not None:
                 rid = str(old["id"])
                 reused += 1
+                # The reused id keeps its formal statement verbatim. _norm
+                # matched the two up to case and whitespace, but the Merkle
+                # hash of a cited reference is case-sensitive and keeps line
+                # breaks (merkle.reference_hash), so the fresh extraction's
+                # text would move the hash and void every certificate on a
+                # lemma that cites it. The slogan and the source are not in
+                # the hash, and are refreshed from the new extraction.
+                item = {
+                    **item,
+                    "formal statement": str(old.get("formal statement") or ""),
+                }
             else:
                 rid = f"ref_{next_id}"
                 next_id += 1
@@ -434,7 +467,8 @@ def run() -> None:
     # established and the DAG may cite. Statements not re-derived this run
     # (their file was deleted, or the model missed them) stay in the file.
     kept = [
-        r for r in previous
+        {k: v for k, v in r.items() if k != "tags"}
+        for r in previous
         if _norm(r.get("formal statement"))
         and _norm(r.get("formal statement")) not in this_run
     ]
@@ -465,7 +499,10 @@ def run() -> None:
         main.log(
             f"\n✅ Wrote {paths.references}: {len(final)} entries "
             f"({len(entries)} derived this run, {len(kept)} kept, "
-            f"{reused} ids reused, {len(entries) - reused} new).",
+            f"{reused} ids reused, {len(entries) - reused} new). It is the "
+            f"conjecture's committed collection: commit it (and push) so the "
+            f"other users' runs see the new entries — they pull this file "
+            f"rather than regenerating it.",
             args.verbose,
         )
     else:

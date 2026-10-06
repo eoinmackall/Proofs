@@ -12,7 +12,10 @@ Everything model-specific has to live in exactly one of two places, in order
 of preference:
 
   * A probe  — read off the server at startup, so it is correct for whatever
-    is actually loaded, no matter what the alias is. See probe().
+    is actually loaded, no matter what the alias is: the context ceiling, the
+    thinking support, and the name of the model that is loaded (the file name
+    a llama-server reports in /props, otherwise the first id of its
+    /v1/models list). See probe().
   * Transport  — HOW to talk to the server. Real code. There is exactly one:
     the OpenAI-compatible /v1/chat/completions endpoint. llama.cpp's
     llama-server serves it locally; a hosted API (OpenAI, OpenRouter,
@@ -44,6 +47,7 @@ Usage from main.py:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -60,6 +64,13 @@ import requests
 class Profile:
     """What we know about the loaded model. Probed where possible."""
     name: str
+    # The name the server itself gives the model it has loaded, recorded at
+    # startup (".comments", "Model name"): the file name of the model a
+    # llama-server has loaded, read off /props, or — on an endpoint with no
+    # /props — the first id of its /v1/models list. None when the server
+    # reported nothing. Kept apart from name, which is what --model asked for
+    # (an alias or a provider id the server may ignore).
+    model_name: Optional[str] = None
     context_limit: int = 65536     # ceiling of the server's KV cache (tokens).
                                    # --num_ctx must fit inside this.
     supports_thinking: bool = False
@@ -149,8 +160,63 @@ def _context_limit_from_error(text: str) -> Tuple[Optional[int], Optional[int]]:
 
 
 # ---------------------------------------------------------------------------
+# The model name the server reports (".comments", "Model name")
+# ---------------------------------------------------------------------------
+
+def _model_name_from_props(body: Dict[str, Any]) -> Optional[str]:
+    """The file name of the model a llama-server has loaded, from /props.
+
+    llama.cpp reports the loaded model's path (model_path); the file name of
+    that is what gets recorded — not the alias it was launched with, which
+    is what --model asks for. model_name / model_alias cover builds that
+    report it under those keys instead."""
+    path = body.get("model_path")
+    if isinstance(path, str) and path:
+        name = os.path.basename(path)
+        if name:
+            return name
+    for key in ("model_name", "model_alias"):
+        value = body.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _model_id_from_models(response: "requests.Response") -> Optional[str]:
+    """The first model id an OpenAI-compatible /v1/models lists, or None.
+
+    The "otherwise" route for the recorded model name (".comments",
+    "Model name"): a hosted API or other server serves no /props, but the
+    model list every OpenAI-compatible endpoint has is there, and its first
+    id is the model that will serve the run."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list):
+        return None
+    for entry in data:
+        if isinstance(entry, dict):
+            mid = entry.get("id")
+            if isinstance(mid, str) and mid:
+                return mid
+    return None
+
+
+# ---------------------------------------------------------------------------
 # The backend
 # ---------------------------------------------------------------------------
+
+@dataclass
+class ToolCall:
+    """One native tool call from a reply: its id (echoed back on the
+    result), the tool's name, and the arguments as the model wrote them —
+    a JSON string, parsed by the ToolSet that runs it."""
+    id: str
+    name: str
+    arguments: str
+
 
 @dataclass
 class Reply:
@@ -158,6 +224,29 @@ class Reply:
     thinking: str = ""
     truncated: bool = False
     usage: Dict[str, Any] = field(default_factory=dict)
+    tool_calls: List[ToolCall] = field(default_factory=list)
+
+
+# The shapes a refusal of the `tools` field itself takes: llama-server's
+# "tools param requires --jinja flag", and the hosted APIs' "does not
+# support tools", "tools are not supported", "Unrecognized request argument
+# supplied: tools", "Extra inputs are not permitted ... tools". An error that
+# merely mentions a tool (tool_call_id, a role "tool" message) does not match.
+_TOOLS_UNSUPPORTED_RE = re.compile(
+    r"jinja"
+    r"|(?:does not|doesn't|do not|don't|not) support\w*\W+(?:\w+\W+){0,3}?"
+    r"(?:tools|tool[ _-]?(?:use|call(?:ing|s)?)|function[ _-]?call(?:ing|s)?)"
+    r"|\b(?:tools|tool[ _-]?(?:use|call(?:ing|s)?)|function[ _-]?call(?:ing|s)?)"
+    r"\b[^.\n]{0,40}?\b(?:not supported|unsupported|not enabled|not available)"
+    r"|(?:unrecognized|unknown|unexpected|extra)\W+(?:\w+\W+){0,4}?['\"]?tools\b",
+    re.IGNORECASE,
+)
+
+
+class ToolsUnsupported(RuntimeError):
+    """The server refused a call because it carried `tools`: a llama-server
+    launched without --jinja, or an endpoint without tool support. The
+    caller switches to the JSON tool protocol (tools.py) and re-sends."""
 
 
 class OpenAICompatibleBackend:
@@ -237,15 +326,19 @@ class OpenAICompatibleBackend:
         Two independent checks, because they answer different questions:
 
         * /props is llama.cpp's. If it answers, this is a llama-server and we
-          get the real context ceiling and whether the chat template thinks.
-          A hosted API has no /props, so its absence is not an error — it is
-          the signature of "not llama.cpp", and we switch to the standard
-          OpenAI option set and a default context limit.
-        * /v1/models is the universal OpenAI-compatible route. When an API key
-          was supplied we hit it to make a wrong key *loud* at startup instead
-          of letting every call in the run 401. A 401/403 there is a definite
-          rejection and is surfaced as auth_error; a 404 (endpoint absent) or a
-          network error is not an auth failure, so it is left alone.
+          get the real context ceiling, whether the chat template thinks, and
+          the file name of the model it has loaded. A hosted API has no
+          /props, so its absence is not an error — it is the signature of
+          "not llama.cpp", and we switch to the standard OpenAI option set and
+          a default context limit.
+        * /v1/models is the universal OpenAI-compatible route. We hit it when
+          an API key was supplied, to make a wrong key *loud* at startup
+          instead of letting every call in the run 401 (a 401/403 there is a
+          definite rejection and is surfaced as auth_error; a 404 (endpoint
+          absent) or a network error is not an auth failure, so it is left
+          alone), and when /props gave no model name: the first id in the
+          server's model list is then the model we record (".comments",
+          "Model name").
 
         The probe's measurements (context ceiling, thinking support) are kept
         either way — they describe the server that is actually there. What
@@ -281,23 +374,34 @@ class OpenAICompatibleBackend:
                 or "</thinking>" in template
                 or "reasoning_effort" in template
             )
+            # The file name of the model the server has loaded
+            # (".comments", "Model name").
+            prof.model_name = _model_name_from_props(body)
             prof.probe_ok = True
 
-        if self.api_key:
+        # The /v1/models call does two jobs at once: verify a supplied key,
+        # and — when /props gave no model name — record the model the
+        # endpoint serves (".comments", "Model name"). A 401/403 with no key
+        # at all is expected (an unauthenticated call to a hosted API), not
+        # an auth failure, so auth_error stays key-gated.
+        if self.api_key or prof.model_name is None:
             try:
                 rm = requests.get(f"{self.host}/v1/models", timeout=30,
                                   headers=self._headers)
             except requests.RequestException:
                 rm = None
             if rm is not None:
-                if rm.status_code in (401, 403):
+                if rm.status_code in (401, 403) and self.api_key:
                     prof.auth_error = (
                         f"API key rejected by {self.host}/v1/models "
                         f"(HTTP {rm.status_code}). Check --api-key / "
                         f"$LLM_API_KEY and that it matches {self.host}."
                     )
                 elif rm.status_code == 200:
-                    prof.key_verified = True
+                    if self.api_key:
+                        prof.key_verified = True
+                    if prof.model_name is None:
+                        prof.model_name = _model_id_from_models(rm)
 
         # Reconcile the dialect: auto takes whatever the probe found, the
         # other backends are taken on faith. describe() flags a mismatch.
@@ -313,9 +417,16 @@ class OpenAICompatibleBackend:
         self.profile = prof
         return prof
 
-    def chat(self, messages: List[Dict[str, str]], *, think: Any = None,
+    def chat(self, messages: List[Dict[str, Any]], *, think: Any = None,
              schema: Optional[Dict[str, Any]] = None,
-             options: Optional[Dict[str, Any]] = None) -> Reply:
+             options: Optional[Dict[str, Any]] = None,
+             tools: Optional[List[Dict[str, Any]]] = None,
+             tool_choice: Optional[str] = None) -> Reply:
+        """One completion. tools is the OpenAI-style `tools` field (a
+        ToolSet's specs()), and tool_choice its companion ("none" makes the
+        model answer rather than call, with the tools still declared for the
+        tool messages already in the conversation). A server that refuses
+        tools raises ToolsUnsupported."""
         merged = dict(self.profile.sampling if self.profile else {})
         merged.update(options or {})
 
@@ -364,12 +475,27 @@ class OpenAICompatibleBackend:
                                     "schema": schema},
                 }
 
+        if tools:
+            payload["tools"] = tools
+            if tool_choice:
+                payload["tool_choice"] = tool_choice
+
         r = requests.post(f"{self.host}/v1/chat/completions", json=payload,
                           timeout=self.timeout, headers=self._headers)
         if r.status_code >= 400:
             limit, prompt_tokens = _context_limit_from_error(r.text)
             if limit is not None:
                 raise ContextLengthError(limit, prompt_tokens)
+            # llama-server without --jinja answers a tools call with an
+            # error naming the flag; other endpoints say the field is not
+            # supported. Only that counts: an error that merely mentions
+            # tools (a bad tool_call_id, a malformed tool message) is about
+            # this conversation, not about the server, and switching the
+            # whole run to the JSON protocol over it would be wrong.
+            if tools and _TOOLS_UNSUPPORTED_RE.search(r.text):
+                raise ToolsUnsupported(
+                    f"HTTP {r.status_code}: {r.text[:300]}"
+                )
         r.raise_for_status()
         body = r.json()
         # Fold this call's real usage into the running chars/token estimate:
@@ -379,7 +505,19 @@ class OpenAICompatibleBackend:
                    sum(len(str(m.get("content") or "")) for m in messages))
         choice = (body.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
+        calls: List[ToolCall] = []
+        for i, tc in enumerate(msg.get("tool_calls") or []):
+            fn = (tc or {}).get("function") or {}
+            if fn.get("name"):
+                args = fn.get("arguments")
+                calls.append(ToolCall(
+                    id=str(tc.get("id") or f"call_{i}"),
+                    name=str(fn["name"]),
+                    arguments=(args if isinstance(args, str)
+                               else json.dumps(args or {})),
+                ))
         return Reply(
+            tool_calls=calls,
             content=msg.get("content") or "",
             # Which key holds the trace depends on the server: vLLM used
             # `reasoning_content` up through v0.15, renamed it to `reasoning`
@@ -456,8 +594,9 @@ def chars_per_token() -> float:
 def describe(prof: Profile, requested_ctx: int) -> str:
     """Startup banner, plus warnings when the request is unsatisfiable."""
     lines = [
-        f"model={prof.name} "
-        f"ctx_limit={prof.context_limit} thinking={prof.supports_thinking}"
+        f"model={prof.name}"
+        + (f" loaded={prof.model_name}" if prof.model_name else "")
+        + f" ctx_limit={prof.context_limit} thinking={prof.supports_thinking}"
     ]
     if prof.auth_error:
         lines.insert(0, f"  ⛔ {prof.auth_error}")

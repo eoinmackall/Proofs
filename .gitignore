@@ -1,6 +1,15 @@
 __pycache__/
-conjectures/algebra_example/references/*
-conjectures/semisimplicity/
+*.egg-info/
+build/
+result
+# Reference input material is the conjecture maintainer's local working
+# copy: the maintainer points `proofs parse` at it, and the parsed output
+# (references.md, beside the directory) is what gets committed with the
+# conjecture. Other users pull references.md; they never see the inputs.
+conjectures/*/references/
+# Each user's private notes for the planner: never committed or shared,
+# so every user keeps their own (.comments, "Comments").
+conjectures/*/comments.md
 .comments
 *.checkpoint.json
 # Per-writer temp files a crashed checkpoint write can leave behind
