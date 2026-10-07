@@ -275,7 +275,7 @@ def describe(paths: RunPaths) -> str:
     ]
     if paths.dag.exists():
         lines.append(
-            f"  ↻ resuming from existing {paths.dag.name} "
+            f"  resuming from existing {paths.dag.name} "
             f"(delete it for a clean run)"
         )
     if paths.dags_dir.is_dir():
@@ -287,7 +287,7 @@ def describe(paths: RunPaths) -> str:
         )
         if others:
             lines.append(
-                f"  ⬡ other users' DAG files in {paths.dags_dir.name}/: "
+                f"  other users' DAG files in {paths.dags_dir.name}/: "
                 f"{', '.join(others)} — merged into the run, never written"
             )
     checkpoint = paths.dag.with_name(
@@ -295,7 +295,7 @@ def describe(paths: RunPaths) -> str:
     )
     if checkpoint.exists():
         lines.append(
-            f"  ♻ checkpoint {checkpoint.name} present — the run resumes "
+            f"  checkpoint {checkpoint.name} present — the run resumes "
             f"from it (--fresh to restart the budget)"
         )
     # Runs from before DAGs were per-user left dag.json and
@@ -304,14 +304,14 @@ def describe(paths: RunPaths) -> str:
     legacy_shared = paths.root / LEGACY_DAG_FILENAME
     if legacy_shared.is_file():
         lines.append(
-            f"  ⚠ ignoring {legacy_shared.name} — the pre-per-user shared "
+            f"  ignoring {legacy_shared.name} — the pre-per-user shared "
             f"DAG; move it to {paths.dags_dir.name}/<user_id>{USER_DAG_SUFFIX} "
             f"to carry its lemmas into the run"
         )
     legacy = sorted(p.name for p in paths.root.glob("dag-*.json"))
     if legacy:
         lines.append(
-            f"  ⚠ ignoring per-model DAG{'s' if len(legacy) > 1 else ''} "
+            f"  ignoring per-model DAG{'s' if len(legacy) > 1 else ''} "
             f"{', '.join(legacy)} — the per-user DAGs in {paths.dags_dir.name}/ "
             f"replaced them"
         )
@@ -321,7 +321,7 @@ def describe(paths: RunPaths) -> str:
     legacy_cp = sorted(p.name for p in paths.root.glob("*.checkpoint.json"))
     if legacy_cp:
         lines.append(
-            f"  ⚠ ignoring stale checkpoint{'s' if len(legacy_cp) > 1 else ''} "
+            f"  ignoring stale checkpoint{'s' if len(legacy_cp) > 1 else ''} "
             f"{', '.join(legacy_cp)} — checkpoints now live beside the "
             f"user's DAG file in {paths.dags_dir.name}/"
         )
@@ -339,7 +339,7 @@ def describe(paths: RunPaths) -> str:
             n = -1
         if n < 0:
             lines.append(
-                f"  ⚠ references={paths.references.name} is not valid JSON; "
+                f"  references={paths.references.name} is not valid JSON; "
                 f"the loop will ignore it"
             )
         else:
@@ -352,6 +352,6 @@ def describe(paths: RunPaths) -> str:
         )
     if paths.overridden_prompts:
         lines.append(
-            f"  ✎ local prompt overrides: {', '.join(paths.overridden_prompts)}"
+            f"  local prompt overrides: {', '.join(paths.overridden_prompts)}"
         )
     return "\n".join(lines)

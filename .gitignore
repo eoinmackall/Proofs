@@ -15,6 +15,16 @@ conjectures/*/comments.md
 # Per-writer temp files a crashed checkpoint write can leave behind
 # (named <checkpoint>.<pid>.<thread>.tmp).
 *.checkpoint.json.*.tmp
+# Cross-process lock sidecars beside the DAG and certificate files
+# (locking.py), and the temp files a crashed write can leave behind: every
+# writer of a committed file writes <file>...tmp beside it, then
+# os.replace (or os.link, for a refutation).
+conjectures/*/dags/*.lock
+conjectures/*/certificates/*.lock
+conjectures/*/dags/*.tmp
+conjectures/*/certificates/*.tmp
+conjectures/*/refutations/.*.tmp
+conjectures/*/references.md.*.tmp
 # Never commit API keys (README "Backend": --api-key / $LLM_API_KEY).
 .env
 .env.*

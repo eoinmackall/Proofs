@@ -317,8 +317,6 @@ class OpenAICompatibleBackend:
         return self.profile.is_llama_cpp
 
     def probe(self) -> Profile:
-        global _RUNNING_CHARS_PER_TOKEN
-
         """Read what we can about the server before a run starts.
 
         Two independent checks, because they answer different questions:
@@ -343,6 +341,7 @@ class OpenAICompatibleBackend:
         an explicit backend wins over the probe, and a mismatch is flagged in
         describe() rather than silently obeyed.
         """
+        global _RUNNING_CHARS_PER_TOKEN
         prof = Profile(name=self.model, backend=self.backend)
 
         try:
@@ -596,13 +595,13 @@ def describe(prof: Profile, requested_ctx: int) -> str:
         + f" ctx_limit={prof.context_limit} thinking={prof.supports_thinking}"
     ]
     if prof.auth_error:
-        lines.insert(0, f"  ⛔ {prof.auth_error}")
+        lines.insert(0, f"  {prof.auth_error}")
     if prof.key_verified:
-        lines.append("  🔑 API key verified against /v1/models.")
+        lines.append("  API key verified against /v1/models.")
     if prof.is_llama_cpp and not prof.probed_llama_cpp:
         # Forced llama.cpp against a server that has no /props route.
         lines.append(
-            "  ⚠️  --backend llamacpp was forced, but the server has no /props "
+            "  --backend llamacpp was forced, but the server has no /props "
             "route: the full llama.cpp option set (top_k/min_p) and thinking "
             "suppression are sent anyway. If this is not really a "
             "llama-server, a strict provider will 400 them — and the context "
@@ -611,14 +610,14 @@ def describe(prof: Profile, requested_ctx: int) -> str:
     elif prof.probed_llama_cpp and not prof.is_llama_cpp:
         # Forced standard OpenAI against a server that does answer /props.
         lines.append(
-            "  ⚠️  --backend openai was forced, but the server answers /props "
+            "  --backend openai was forced, but the server answers /props "
             "(a llama.cpp server): only the standard OpenAI fields are sent "
             "and thinking is not suppressed for schema calls, so on a real "
             "llama-server those replies may come back fenced."
         )
     elif not prof.is_llama_cpp:
         lines.append(
-            "  ℹ️  Not a llama.cpp server (no /props route): the context "
+            "  Not a llama.cpp server (no /props route): the context "
             "limit is a default unless --num-ctx is given, and only the "
             "standard OpenAI sampling fields are sent (llama.cpp's "
             "top_k/min_p are dropped)."
@@ -626,7 +625,7 @@ def describe(prof: Profile, requested_ctx: int) -> str:
     if requested_ctx > prof.context_limit:
         if prof.probed_llama_cpp:
             lines.append(
-                f"  ⚠️  --num-ctx {requested_ctx} exceeds the server's "
+                f"  --num-ctx {requested_ctx} exceeds the server's "
                 f"{prof.context_limit}. llama-server fixes this at launch: "
                 f"restart it with -c {requested_ctx}. Clamping to "
                 f"{prof.context_limit} for now."
@@ -639,7 +638,7 @@ def describe(prof: Profile, requested_ctx: int) -> str:
             # into a loud stop naming the server's own number
             # (ContextLengthError).
             lines.append(
-                f"  ℹ️  --num-ctx {requested_ctx} replaces the "
+                f"  --num-ctx {requested_ctx} replaces the "
                 f"{prof.context_limit} default on record (this endpoint "
                 f"reports no context limit). If the provider's real window "
                 f"is smaller, the first call that outruns it is 400'd and "
@@ -648,14 +647,14 @@ def describe(prof: Profile, requested_ctx: int) -> str:
             )
     if not prof.probe_ok and not prof.key_verified:
         lines.append(
-            "  ⚠️  Capability probe failed and no API key was verified — is "
+            "  Capability probe failed and no API key was verified — is "
             "the server up, and is this the right host? Everything below is a "
             "default, not a measurement. "
             "(open-webui answers on 8080 but has no /props route.)"
         )
     if not prof.supports_thinking:
         lines.append(
-            "  ⚠️  No thinking capability reported. The generation budget "
+            "  No thinking capability reported. The generation budget "
             "assumes a reasoning trace, so it will be far larger than needed "
             "— harmless, since num_predict is a ceiling, not a target."
         )

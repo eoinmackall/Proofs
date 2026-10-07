@@ -187,15 +187,27 @@ def record(
     with _LOCK:
         directory = dir_for(conjecture_dir)
         os.makedirs(directory, exist_ok=True)
-        path = directory / base
-        n = 2
-        while path.exists():
-            path = directory / (base[: -len(".json")] + f"-{n}.json")
-            n += 1
-        tmp = str(path) + ".tmp"
+        # The temp file is per writer and the name is claimed with
+        # os.link, which fails when the name exists: an exists() test
+        # followed by os.replace would let two processes (proofs verify
+        # and proofs repair of the same user, in the same second) pick the
+        # same free name and the second replace would erase the first
+        # rejection. The link is atomic, so the file appears whole.
+        tmp = directory / f".{base}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(_dumps(obj))
-        os.replace(tmp, path)
+        try:
+            path = directory / base
+            n = 2
+            while True:
+                try:
+                    os.link(tmp, path)
+                    break
+                except FileExistsError:
+                    path = directory / (base[: -len(".json")] + f"-{n}.json")
+                    n += 1
+        finally:
+            os.remove(tmp)
     return path
 
 

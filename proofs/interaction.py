@@ -269,7 +269,7 @@ def render(
     if plan_summary:
         out.append(_wrap(f"Strategy: {plan_summary}", indent="  "))
     for i, (cand, problems) in enumerate(screened, start=1):
-        flag = "  ⚠ " + "; ".join(problems) if problems else ""
+        flag = "  " + "; ".join(problems) if problems else ""
         out.append(f"  [{i}] {cand.get('id', '?')}{flag}")
         out.append(_wrap(cand.get("statement", "(no statement)")))
     return "\n".join(out)

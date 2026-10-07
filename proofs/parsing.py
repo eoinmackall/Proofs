@@ -65,6 +65,7 @@ output.
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -144,9 +145,11 @@ def load_previous(path: Path, verbose: bool) -> List[Dict[str, Any]]:
 
     This module owns the file, so a corrupt one is a harder stop than for
     main.load_references: starting fresh would renumber ids the DAG already
-    cites. Absent is fine (first run); unparseable warns and starts fresh
-    only after saying so, because a half-written file from an interrupted
-    run is the usual cause and re-running on the remaining files is the fix.
+    cites — ref_N would name a different statement, and every lemma citing
+    it would lose its certificate. Absent is fine (first run); unparseable
+    stops the parse before any model call, with the file untouched, so the
+    maintainer can repair it (a git merge that left conflict markers is the
+    usual cause; this module's own writes are atomic) and re-run.
     """
     if not path.is_file():
         return []
@@ -161,13 +164,16 @@ def load_previous(path: Path, verbose: bool) -> List[Dict[str, Any]]:
             raise ValueError("top-level JSON is not an array")
         return [r for r in data if isinstance(r, dict)]
     except (OSError, ValueError, json.JSONDecodeError) as e:
+        # Logged unconditionally: a stop the maintainer must see is not
+        # verbose noise.
         main.log(
-            f"⚠️  existing {path.name} is not a JSON array of objects ({e}); "
-            f"starting fresh. Ids the DAG may cite are gone — if that file "
-            f"mattered, restore it and re-run.",
-            verbose,
+            f"The existing {path} is not a JSON array of objects ({e}). "
+            f"Parsing would start the ids over at ref_1 and re-point the ids "
+            f"the DAG cites at other statements, so nothing is parsed and "
+            f"the file is left as it is. Repair it (look for git conflict "
+            f"markers, or restore it with git checkout) and re-run."
         )
-        return []
+        raise SystemExit(1)
 
 
 def parse_file(
@@ -195,13 +201,13 @@ def parse_file(
     )
     if status == "ceiling" and not content:
         main.log(
-            f"  ⛔ {filename}: parsing hit the context wall: the file is too "
+            f"  {filename}: parsing hit the context wall: the file is too "
             f"long for one pass. Split it into chapters and re-run.",
             verbose,
         )
         return []
     if not content:
-        main.log(f"  ⚠️  {filename}: the parser returned nothing.", verbose)
+        main.log(f"  {filename}: the parser returned nothing.", verbose)
         return []
 
     res = main.parse_json_or_none(content)
@@ -238,7 +244,7 @@ def make_entry(
     statement = str(item.get("formal statement") or "").strip()
     if not statement:
         main.log(
-            f"  ⚠️  {source}: dropping a result with no formal statement "
+            f"  {source}: dropping a result with no formal statement "
             f"({str(item.get('slogan'))[:80]!r}).",
             verbose,
         )
@@ -369,7 +375,7 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     parsable = [p for p in files if is_parsable(p)]
     for p in files:
         if not is_parsable(p):
-            main.log(f"  ↷ skipping {p.name}: not a text file.", args.verbose)
+            main.log(f"  skipping {p.name}: not a text file.", args.verbose)
 
     if not parsable:
         main.log(
@@ -404,18 +410,18 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     for path in parsable:
         text = path.read_text(encoding="utf-8", errors="replace").strip()
         if not text:
-            main.log(f"  ↷ {path.name}: empty, skipping.", args.verbose)
+            main.log(f"  {path.name}: empty, skipping.", args.verbose)
             continue
         est = main.PROFILE.estimate_tokens(text)
         if est > int(MAX_FILE_FRACTION * num_ctx):
             main.log(
-                f"  ⚠️  skipping {path.name}: ~{est} tokens leaves no room for "
+                f"  skipping {path.name}: ~{est} tokens leaves no room for "
                 f"a reply inside the {num_ctx} context. Split the file into "
                 f"chapters and re-run.",
                 args.verbose,
             )
             continue
-        main.log(f"📖 Parsing {path.name} (~{est} tokens)…", args.verbose)
+        main.log(f"Parsing {path.name} (~{est} tokens)…", args.verbose)
         try:
             items = parse_file(system_prompt, text, path.name, args.verbose)
         except llm_backend.ContextLengthError as e:
@@ -432,7 +438,7 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
                 continue  # make_entry reports it when it lands
             if key in this_run:
                 main.log(
-                    f"  ↷ {path.name}: duplicate statement already extracted "
+                    f"  {path.name}: duplicate statement already extracted "
                     f"this run; keeping the first.",
                     args.verbose,
                 )
@@ -473,7 +479,7 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     ]
     for r in kept:
         main.log(
-            f"  ↻ keeping {r.get('id')} from the previous file: not "
+            f"  keeping {r.get('id')} from the previous file: not "
             f"re-derived this run ({str(r.get('reference'))[:60]!r}).",
             args.verbose,
         )
@@ -493,10 +499,17 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     )
     final_json = json.dumps(final, indent=2)
     if final_json != previous_json:
-        with open(paths.references, "w", encoding="utf-8") as f:
+        # Temp file beside it, then os.replace: an interrupted write must
+        # leave the previous file whole, never a cut-off one the next parse
+        # would refuse to read.
+        tmp = paths.references.with_name(
+            f"{paths.references.name}.{os.getpid()}.tmp"
+        )
+        with open(tmp, "w", encoding="utf-8") as f:
             f.write(final_json + "\n")
+        os.replace(tmp, paths.references)
         main.log(
-            f"\n✅ Wrote {paths.references}: {len(final)} entries "
+            f"\nWrote {paths.references}: {len(final)} entries "
             f"({len(entries)} derived this run, {len(kept)} kept, "
             f"{reused} ids reused, {len(entries) - reused} new). It is the "
             f"conjecture's committed collection: commit it (and push) so the "
@@ -506,7 +519,7 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
         )
     else:
         main.log(
-            f"\n✅ {paths.references} unchanged: {len(final)} entries "
+            f"\n{paths.references} unchanged: {len(final)} entries "
             f"({len(entries)} re-derived, {len(kept)} kept, "
             f"{reused} ids reused).",
             args.verbose,

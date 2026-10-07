@@ -77,8 +77,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 try:  # inside the proofs package (installed, or `python -m proofs`)
-    from . import merkle
+    from . import locking, merkle
 except ImportError:  # top-level modules (`python proofs/certificates.py`)
+    import locking
     import merkle
 
 # The directory beside dags/ that holds the certificate files.
@@ -107,8 +108,10 @@ USER_KEYS = (USER_ID_KEY, USER_NAME_KEY, USER_EMAIL_KEY)
 
 # One lock for the whole process: in a parallel run several loops accept
 # lemmas at the same moment, and the read-modify-write of one file must be
-# atomic within this process. Across processes and machines the files are
-# per-user and coordinated by git, the same way the DAG files are.
+# atomic within this process. Across processes on one machine (proofs run
+# and proofs verify of the same user) the file lock in locking.py does the
+# same job; across machines the files are per-user and coordinated by git,
+# the same way the DAG files are.
 _LOCK = threading.Lock()
 
 
@@ -258,7 +261,7 @@ def record(
         "date": when,
         "count": 1,
     }
-    with _LOCK:
+    with _LOCK, locking.file_lock(path):
         text = path.read_text(encoding="utf-8") if path.is_file() else ""
         replaced = False
         header_line: Optional[str] = None
@@ -351,7 +354,9 @@ def prune(
     kept: List[Dict[str, Any]] = []
     dropped: List[Dict[str, Any]] = []
     raw_kept: List[str] = []
-    with _LOCK:
+    with _LOCK, locking.file_lock(path):
+        if not path.is_file():
+            return [], []
         text = path.read_text(encoding="utf-8")
         header_on_disk: Optional[str] = None
         for line in text.splitlines():
