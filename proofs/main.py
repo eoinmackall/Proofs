@@ -265,7 +265,7 @@ PROMPT_PATHS: Dict[str, str] = {name: name for name in workspace.PROMPT_FILES}
 
 MAX_ITERATIONS = 10
 LLM_MAX_RETRIES = 3
-REQUEST_TIMEOUT = 1800       # Thinking models are slow; give them room
+REQUEST_TIMEOUT = 36000      # 10 hours: thinking models are slow; give them room
 
 # How many lemmas the planner shortlists per iteration. Raising this costs
 # planner tokens and, in human mode, attention; five is about as many
