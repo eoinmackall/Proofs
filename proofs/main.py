@@ -737,10 +737,13 @@ def _warn_suspended(
 
     One case gets its own message: a lemma committed but never certified —
     suspended only for having no certificate, with no refutation and no
-    certificate line in any file, ever. That is a run stopped between the
-    commit of an accepted proof and its certificate (a kill, or a failed
-    certificate write); nothing is wrong with the proof that anyone has
-    recorded, and proofs verify is how it gets its certificate."""
+    certificate line in any file, ever. A commit certifies before it
+    writes (_certify_before_write), so that is a certificate that was not
+    issued: its write failed, or the hash had moved since the
+    verification, as the committing run logged; or a run from before the
+    certify-first order stopped between its commit and its certificate.
+    Nothing is wrong with the proof that anyone has recorded, and proofs
+    verify is how it gets its certificate."""
     pending = [
         p for p in sorted(susp.suspended)
         if warned is None or p not in warned
@@ -760,8 +763,9 @@ def _warn_suspended(
         ):
             dag_path = os.path.join(DAGS_DIR, f"{u}_dag.json")
             log(
-                f"{u}:{lid} was committed but never certified — a run "
-                f"stopped between the commit and the certificate. It is "
+                f"{u}:{lid} was committed but never certified — its "
+                f"certificate was not issued (see the log of the run that "
+                f"committed it). It is "
                 f"suspended (hidden from the planner, the selector and the "
                 f"prover) until certified: run proofs verify {dag_path} "
                 f"{lid}.",
@@ -1217,19 +1221,30 @@ def _stored_node(node: Dict[str, Any], last_prover_id: str) -> Dict[str, Any]:
 
 
 def commit_lemma_to_dag(
-    lemma_id: str, node: Dict[str, Any]
+    lemma_id: str, node: Dict[str, Any], verified_hash: Optional[str],
+    verbose: bool = True,
 ) -> Tuple[str, bool]:
-    """Commit node to the current user's DAG file under lemma_id, or under a
-    fresh non-colliding id if lemma_id is already taken in that file. The id
-    check and the write are one step under the DAG lock, so the check can
-    never go stale: a writer that finds its id taken commits under
-    lemma_id_2 (or _3, ...) rather than over the first proof. A
-    collision is with the current user's own lemmas: lemma_id is unique only
-    within one user's DAG, so a lemma another user proved under the same id
-    is no collision at all. The node is stored in the shape _stored_node
-    gives it, with the current user as its last_prover_id and the moment of
-    the commit as proved_at (the lemma window's recency). Returns
-    (committed_id, renamed).
+    """Certify node and commit it to the current user's DAG file under
+    lemma_id, or under a fresh non-colliding id if lemma_id is already
+    taken in that file. The id check and the write are one step under the
+    DAG lock, so the check can never go stale: a writer that finds its id
+    taken commits under lemma_id_2 (or _3, ...) rather than over the first
+    proof. A collision is with the current user's own lemmas: lemma_id is
+    unique only within one user's DAG, so a lemma another user proved under
+    the same id is no collision at all. The node is stored in the shape
+    _stored_node gives it, with the current user as its last_prover_id and
+    the moment of the commit as proved_at (the lemma window's recency).
+    Returns (committed_id, renamed).
+
+    All three verifier checks accepted node, so it is certified under the
+    id it is committed under — before the write, not after
+    (_certify_before_write): readers load the DAG and the certificates
+    without a lock, and in this order the lemma is never in the file
+    without its certificate. A reader between the two writes sees a
+    certificate for a lemma the DAG does not hold yet, which counts for
+    nothing; the reverse order would show it a committed lemma with no
+    certificate, suspended. verified_hash is the hash the verifiers
+    checked (_verified_hash), compared with the hash at the commit there.
 
     The check and the write are one step across processes too: the file
     lock (locking.py) keeps a proofs repair or a second run of the same
@@ -1246,6 +1261,9 @@ def commit_lemma_to_dag(
             while f"{lemma_id}_{suffix}" in lemmas:
                 suffix += 1
             committed_id = f"{lemma_id}_{suffix}"
+        _certify_before_write(
+            USER, committed_id, node, verified_hash, verbose,
+        )
         lemmas[committed_id] = _stored_node(node, USER)
         data["lemmas"] = lemmas
         _write_user_file(data)
@@ -1261,50 +1279,60 @@ def commit_lemma_to_dag(
 # into this run's user's file, the verifier's, whoever owns the lemma. The storage, the upsert rule and the validity check
 # live in certificates.py; this is the run's one entry point to them.
 
-def record_certificate(
-    lemma_id: str, model: str, verbose: bool = True, owner: Optional[str] = None,
-    verified_hash: Optional[str] = None,
+def _certify_before_write(
+    owner: str, lemma_id: str, node: Dict[str, Any],
+    verified_hash: Optional[str], verbose: bool = True,
 ) -> None:
-    """Record a certificate for a lemma this run just accepted.
+    """Record a certificate for a lemma this run just accepted, before the
+    lemma is written: the commit's first half (commit_lemma_to_dag,
+    _replace_lemma_in_owner_file).
 
-    The hash is the lemma's current Merkle hash, recomputed after the
-    commit from the DAG reloaded from the files and references.md, so the
-    line covers the proof that is in the file now and stays valid until
+    The caller holds DAG_LOCK and the file lock on the owner's DAG file,
+    and writes node to (owner, lemma_id) right after, so the hash is the
+    one the lemma will have once the write lands: the DAG loaded from the
+    files with node in place under its pair, over references.md. The
+    write adds only last_prover_id and proved_at, neither of which the
+    Merkle hash covers. The line covers that proof and stays valid until
     the lemma's statement, its proof, or the statement of anything it
-    cites changes. model is the verifier's model name. A
-    certificate is the record of an acceptance; a failure to write it must
-    not undo the acceptance, so every failure here degrades to a warning.
+    cites changes. The model recorded is the verifier's (_recorded_model).
 
-    owner is the lemma's owner, the certificate's user_id. It defaults to
-    the current user: the run commits only its own lemmas, while proofs
-    repair commits a re-proof in place in the owner's file (see
-    repair_entry()). The verifier is either way the user whose run accepted
-    the proof, and the line goes into that user's certificates/ file — never
-    the owner's.
+    The order is the point. Readers — load_dag(), suspension.compute —
+    take no lock, so whichever file is written first is what a reader can
+    see alone. A certificate whose lemma is not in the DAG yet counts for
+    nothing (suspension only looks up the lemmas the DAG holds), while a
+    lemma in the DAG without its certificate is suspended. Certified
+    first, the lemma is never in the file without its certificate; a
+    crash between the two writes leaves an orphan line that matches
+    nothing, and proofs prune clears it.
+
+    A certificate is the record of an acceptance; a failure to write it
+    must not undo the acceptance, so every failure here degrades to a
+    warning and the caller writes the lemma anyway — suspended, until
+    proofs verify certifies it.
+
+    owner is the lemma's owner, the certificate's user_id: the current
+    user for a run's commit, while proofs repair commits a re-proof in
+    place in the owner's file (see repair_entry()). The verifier is either
+    way the user whose run accepted the proof, and the line goes into that
+    user's certificates/ file — never the owner's.
 
     verified_hash is the hash of the version the verifiers checked
     (_verified_hash: the proof over the DAG and references they were shown).
-    When the hash after the commit differs — a lemma it cites, or
+    When the hash at the commit differs — a lemma it cites, or
     references.md, changed between the verification and the commit (a
     proofs repair, a pull) — the certificate would cover a version nobody
     verified, so none is issued: the lemma stays suspended until proofs
     verify checks the version in the file. None skips the comparison
     (_verified_hash gives None for a proof whose hash cannot be computed,
-    and the hash after the commit then reports why).
+    and the hash here then reports why).
     """
-    owner = owner or USER
+    model = _recorded_model()
     try:
-        dag = load_dag()
-        m = merkle.Merkle(dag["lemmas"], load_references())
-        h = m.hash(owner, lemma_id)
-    except KeyError:
-        log(
-            f"No certificate for {lemma_id}: it is not in the DAG "
-            f"just loaded; the acceptance stands, the certificate is "
-            f"skipped.",
-            verbose,
-        )
-        return
+        lemmas = dict(load_dag()["lemmas"])
+        lemmas[(owner, lemma_id)] = {
+            **node, "user_id": owner, "lemma_id": lemma_id,
+        }
+        h = merkle.Merkle(lemmas, load_references()).hash(owner, lemma_id)
     except merkle.MerkleCycleError as e:
         log(f"No certificate for {lemma_id}: {e}", verbose)
         return
@@ -1491,7 +1519,8 @@ def _dependency_order(
 
 
 def _replace_lemma_in_owner_file(
-    owner: str, lemma_id: str, node: Dict[str, Any]
+    owner: str, lemma_id: str, node: Dict[str, Any],
+    verified_hash: Optional[str], verbose: bool = True,
 ) -> None:
     """Replace the lemma in place in the owner's DAG file (see
     repair_entry()): the (user_id, lemma_id) pair the refutation named is
@@ -1509,6 +1538,12 @@ def _replace_lemma_in_owner_file(
     is under the DAG lock and the file lock (locking.py) and atomic, the
     way the run's file writes are, so a proofs run of the owner on this
     machine cannot commit over it or under it.
+
+    The re-proof is certified under the same locks before the file is
+    replaced (_certify_before_write), the order commit_lemma_to_dag
+    certifies in and for the same reason: a reader between the two writes
+    sees the old proof with its old certificate, or the new proof with its
+    new one, never the new proof uncertified.
     """
     path = os.path.join(DAGS_DIR, f"{owner}_dag.json")
     with DAG_LOCK, locking.file_lock(path):
@@ -1519,6 +1554,7 @@ def _replace_lemma_in_owner_file(
         lemmas = data.get("lemmas")
         if not isinstance(lemmas, dict) or lemma_id not in lemmas:
             raise KeyError(f"{owner}:{lemma_id} is not in {path}")
+        _certify_before_write(owner, lemma_id, node, verified_hash, verbose)
         # A re-proof is a fresh proof: its proved_at moves it to the front
         # of the lemma window, as a new commit does.
         lemmas[lemma_id] = _stored_node(node, USER)
@@ -2098,10 +2134,8 @@ def repair_entry(
                 verified_hash: Optional[str],
             ) -> str:
                 with _commit_section():
-                    _replace_lemma_in_owner_file(u, proof_lid, proof_node)
-                    record_certificate(
-                        proof_lid, _recorded_model(), verbose, owner=u,
-                        verified_hash=verified_hash,
+                    _replace_lemma_in_owner_file(
+                        u, proof_lid, proof_node, verified_hash, verbose,
                     )
                 return proof_lid
 
@@ -2320,6 +2354,20 @@ def _prune_hint(root: Path, verbose: bool) -> None:
         )
 
 
+@contextlib.contextmanager
+def _all_dag_file_locks():
+    """Hold DAG_LOCK and the file lock (locking.py) on every DAG file in
+    dags/, taken in sorted order, for the block. The lock order is DAG
+    files before certificate files, everywhere (see locking.py): a commit
+    holds one DAG file's lock while it writes the certificate, so this
+    takes no certificate lock until every DAG lock is held."""
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(DAG_LOCK)
+        for path in sorted(glob.glob(os.path.join(DAGS_DIR, "*_dag.json"))):
+            stack.enter_context(locking.file_lock(path))
+        yield
+
+
 def prune_entry(
     *,
     dir: str,
@@ -2360,24 +2408,34 @@ def prune_entry(
     REFERENCES_FILE = str(paths.references)
     USER = user_id
     log(workspace.describe(paths))
-    dag = load_dag()
-    references = load_references()
-    m = merkle.Merkle(dag["lemmas"], references)
-    # Every lemma's current hash, a pair the DAG holds but cannot hash
-    # (a citation cycle) kept as None: its certificates match nothing
-    # either, and the map still says the lemma was there, so the log can
-    # name the reason. Per pair, the way suspension.compute does it:
-    # Merkle.all() would raise on the first cycle and hash nothing after.
-    hashes: Dict[Tuple[str, str], Optional[str]] = {}
-    for pair in dag["lemmas"]:
-        try:
-            hashes[pair] = m.hash(*pair)
-        except merkle.MerkleCycleError:
-            hashes[pair] = None
+    # Every DAG file stays locked from the load to the rewrite. A commit
+    # certifies before it writes the lemma (_certify_before_write), so for
+    # a moment a fresh certificate names a lemma no DAG file holds yet;
+    # read in that moment, it would look like a line for a lemma that is
+    # gone, and go. The commit holds the lock on the file it writes for
+    # both of its writes, so with every file locked here, prune sees each
+    # commit either not started or finished. proofs repair writes another
+    # user's file, which is why it is every file and not the user's own.
     try:
-        kept, dropped = certificates.prune(
-            CONJECTURE_ROOT, USER, hashes, user=_user_header()
-        )
+        with _all_dag_file_locks():
+            dag = load_dag()
+            references = load_references()
+            m = merkle.Merkle(dag["lemmas"], references)
+            # Every lemma's current hash, a pair the DAG holds but cannot
+            # hash (a citation cycle) kept as None: its certificates match
+            # nothing either, and the map still says the lemma was there,
+            # so the log can name the reason. Per pair, the way
+            # suspension.compute does it: Merkle.all() would raise on the
+            # first cycle and hash nothing after.
+            hashes: Dict[Tuple[str, str], Optional[str]] = {}
+            for pair in dag["lemmas"]:
+                try:
+                    hashes[pair] = m.hash(*pair)
+                except merkle.MerkleCycleError:
+                    hashes[pair] = None
+            kept, dropped = certificates.prune(
+                CONJECTURE_ROOT, USER, hashes, user=_user_header()
+            )
     except OSError as e:
         log(f"Could not read or rewrite {USER}'s certificate file: {e}")
         return 1
@@ -2659,9 +2717,11 @@ _PARALLEL: "ParallelState" = None
 # can run concurrently with another: the serial success boundary and each
 # parallel loop's. Two writers can't clobber each other's addition —
 # commit_lemma_to_dag checks the id under the lock, and a writer that
-# finds its id taken commits under a fresh one. Readers reload under it
-# too (fresh per round), so a loop never plans or proves against a stale
-# DAG.
+# finds its id taken commits under a fresh one. Readers do not take it:
+# load_dag() reads the files as they stand (fresh per round), which is why
+# a commit certifies before it writes (_certify_before_write) — a reader
+# can catch the moment between the two, and in that order it sees nothing
+# wrong there.
 DAG_LOCK = threading.Lock()
 # The checkpoint-file lock, held by ParallelState.write_checkpoint() across
 # the whole snapshot-then-replace. In parallel mode every loop's claim
@@ -4617,8 +4677,8 @@ def run_proof_loop(
     establishes (the caller publishes it and checkpoints it), and `on_proof`
     is called with the lemma's DAG node when a proof survives all three
     verifier checks, and with the node's hash as the verifiers checked it
-    (_verified_hash), which the caller hands to record_certificate (the
-    caller commits it and returns the id it committed under — the lemma's
+    (_verified_hash), which the caller hands to commit_lemma_to_dag (the
+    caller certifies and commits it and returns the id it committed under — the lemma's
     id, unless that id was already taken and the commit renamed it). Every failed_attempts mutation happens under
     `failed_lock` — a formality in the serial run, where the lock is never
     contended, and what keeps the shared reject list coherent in a parallel
@@ -5348,14 +5408,14 @@ def _verified_hash(
     """The Merkle hash of a proof as the verifiers checked it: the node's
     statement, proof and citations, over the DAG and references they were
     shown — the round's snapshot, not the files as they stand at the
-    commit. record_certificate compares it with the hash after the commit
+    commit. _certify_before_write compares it with the hash at the commit
     and certifies only when the two agree.
 
     The node is hashed under a key no lemma can have (an empty-looking
     pair a user.id never matches), so it neither replaces a lemma of the
     snapshot nor depends on the id it will be committed under: the hash
     covers no id. None when the hash cannot be computed (a citation cycle
-    below it), and record_certificate then reports the cycle itself."""
+    below it), and _certify_before_write then reports the cycle itself."""
     key = ("\x00verified", "\x00verified")
     try:
         return merkle.Merkle({**dag["lemmas"], key: node}, references).hash(*key)
@@ -5517,11 +5577,11 @@ def _serial_on_proof(
     under it, an id the screening lets through — and the commit is then
     renamed beside it."""
     with _commit_section():
-        committed, _renamed = commit_lemma_to_dag(lemma_id, node)
-        # All three verifier checks accepted this proof: it is certified,
-        # the serial way the parallel on_proof below is.
-        record_certificate(
-            committed, _recorded_model(), verbose, verified_hash=verified_hash,
+        # All three verifier checks accepted this proof: the commit
+        # certifies it, then writes it, the way the parallel on_proof's
+        # does.
+        committed, _renamed = commit_lemma_to_dag(
+            lemma_id, node, verified_hash, verbose,
         )
     return committed
 
@@ -6405,7 +6465,10 @@ class ParallelState:
 
     # -- the DAG -------------------------------------------------------------
 
-    def add_lemma(self, lemma_id: str, node: Dict[str, Any]) -> str:
+    def add_lemma(
+        self, lemma_id: str, node: Dict[str, Any],
+        verified_hash: Optional[str], verbose: bool = True,
+    ) -> str:
         """Commit a lemma to the shared DAG — the atomic part of the
         design. The commit itself is check-and-write under the DAG lock
         (commit_lemma_to_dag): two loops can land on one id — the reviser
@@ -6413,14 +6476,19 @@ class ParallelState:
         round, and the id it picks can also sit in the buffer where a
         sibling is proving it — and a caller that finds its id taken
         takes a fresh non-colliding id (lemma_id_2, ...) instead, so no
-        node is ever overwritten and no proof is dropped. Then bump the
+        node is ever overwritten and no proof is dropped. The commit
+        certifies the lemma before it writes it (verified_hash, see
+        commit_lemma_to_dag), so the planner this wakes, and any loop
+        reloading the DAG, never finds it uncertified. Then bump the
         version the planner watches, clear the lemma's reject notes, mark
         the plan stale (the DAG changed, so the plan owes a re-read), and
         checkpoint. The version is visible only after the file is down, so
         a replan triggered by it always sees the new lemma. Returns the id
         the lemma was committed under — lemma_id unless it was already
         taken."""
-        committed, _renamed = commit_lemma_to_dag(lemma_id, node)
+        committed, _renamed = commit_lemma_to_dag(
+            lemma_id, node, verified_hash, verbose,
+        )
         with self.state_lock:
             self.dag_version += 1
         with self.failed_lock:
@@ -6800,7 +6868,7 @@ def _parallel_human_step(
                 continue
             lid, node, vh = verified
             with _commit_section():
-                committed = state.add_lemma(lid, node)
+                committed = state.add_lemma(lid, node, vh, verbose)
                 state.buffer.consume(lid)
                 if committed != lid:
                     # A sibling loop committed this id while the verifiers
@@ -6811,9 +6879,6 @@ def _parallel_human_step(
                         f"yours went in as {committed}.",
                         verbose,
                     )
-                record_certificate(
-                    committed, _recorded_model(), verbose, verified_hash=vh,
-                )
             continue
         # 'prove': a buffer lemma, claimed atomically, or a written one.
         lemma = choice.lemma or {}
@@ -6977,7 +7042,11 @@ def _parallel_proof_loop(
             # loops can see that the two proofs may state different
             # things.
             with _commit_section():
-                committed = state.add_lemma(lid, node)
+                # All three verifier checks accepted this proof: add_lemma
+                # certifies it under the id it is committed under (a
+                # renamed id is the lemma that is in the DAG now), then
+                # writes it.
+                committed = state.add_lemma(lid, node, verified_hash, verbose)
                 if committed != lid:
                     log(
                         f"{loop_id}: lemma {lid} was taken by another route "
@@ -6993,14 +7062,6 @@ def _parallel_proof_loop(
                             f"different things."
                         )
                     state.write_checkpoint()
-                # All three verifier checks accepted this proof, the serial way
-                # the _serial_on_proof boundary is: it is certified, under the id
-                # it was committed under (a renamed id is the lemma that is in the
-                # DAG now).
-                record_certificate(
-                    committed, _recorded_model(), verbose,
-                    verified_hash=verified_hash,
-                )
             return committed
         result = run_proof_loop(
             verbose=verbose,

@@ -164,7 +164,7 @@ def record(
 
     The file is the rejection as it happened: the lemma by its owner and id,
     its Merkle hash at the moment of the rejection (the caller recomputed
-    it, the way main.record_certificate recomputes a certificate's hash),
+    it, the way main._certify_before_write computes a certificate's hash),
     the user whose run rejected it and the model under which the rejection
     happened, the moment, the verdict, and the model's justification.
 

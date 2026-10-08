@@ -16,6 +16,12 @@ new one. Lock files are gitignored (*.lock) and never deleted — deleting
 one while another process waits on it would let a third lock a fresh
 inode beside it.
 
+Lock order: DAG files before certificate files. A commit holds its DAG
+file's lock while it writes the certificate (main._certify_before_write),
+and proofs prune takes every DAG file's lock, in sorted order, before the
+certificate file's. Nothing may take a DAG file's lock while holding a
+certificate file's, or the two can deadlock.
+
 Where fcntl does not exist (Windows) the lock is a no-op: the thread locks
 still serialise one run, and concurrent commands of one user are unsafe
 there, as they were before this module.
