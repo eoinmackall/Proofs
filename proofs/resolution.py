@@ -29,12 +29,8 @@ DAG file, that
 The test is on the statement, not on the id: the id is only the trigger
 for pinning, and a proof committed under a renamed id (conjecture_2,
 after a collision) settles the conjecture as well as the original would.
-A refutation or a repair anywhere below a resolving lemma suspends it
-through the Merkle hashes, and the conjecture is open again.
-
-A lemma the operator asserted at the menu (provenance "operator") counts:
-the operator's certificate is a certificate. It is reported as
-operator-asserted.
+A refutation, or a lemma left uncertified, anywhere below a resolving
+lemma suspends it, and the conjecture is open again.
 
 This module is deliberately standalone, the way merkle.py is: it imports
 nothing from this package but merkle.
@@ -81,7 +77,6 @@ class Resolution:
 
     kind: str          # "proved" or "disproved"
     pair: Pair         # (user_id, lemma_id) of the settling lemma
-    operator: bool     # asserted at the menu rather than machine-proved
 
 
 def is_reserved(lemma_id: Any) -> bool:
@@ -138,16 +133,11 @@ def find(
         if kind is None:
             continue
         out.append(
-            Resolution(
-                kind=kind,
-                pair=(str(pair[0]), str(pair[1])),
-                operator=node.get("provenance") == "operator",
-            )
+            Resolution(kind=kind, pair=(str(pair[0]), str(pair[1])))
         )
     return out
 
 
 def describe(res: Resolution) -> str:
     """One line for the log: what is settled, and by which lemma."""
-    how = " (operator-asserted)" if res.operator else ""
-    return f"the conjecture is {res.kind} by {res.pair[0]}:{res.pair[1]}{how}"
+    return f"the conjecture is {res.kind} by {res.pair[0]}:{res.pair[1]}"

@@ -112,11 +112,13 @@ the statement; only when there is nothing to build on, or the reviser has
 nothing usable, does the planner decompose.
 
 In --mode human the picker is a person, and picking is two decisions rather
-than one. A number and Enter accepts that candidate as true on your
-authority: it goes straight into the DAG, with no prover call and no verifier
-calls, marked "provenance": "operator". A trailing 'p' — "3p" — sends it down
-the ordinary pipeline instead, for when you are confident it is the right next
-step but not that it is true. You can also write your own lemma ('w', or 'wp'
+than one: which lemma, and who proves it. A number and Enter means you prove
+that candidate yourself: you paste or type your proof and its citations, and
+the three verifiers check it exactly as they check the prover's — accepted, it
+enters the DAG with you as its last prover; rejected, the objection is shown
+and the menu comes back. Nothing enters the DAG on anyone's say-so. A trailing
+'p' — "3p" — sends it down the ordinary pipeline instead, the prover writing
+the proof. You can also write your own lemma ('w' to prove it yourself, 'wp'
 to have it proved), or send the planner back to think again.
 
 You can cross between them mid-run, in either direction, without restarting.
@@ -202,7 +204,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -757,20 +759,6 @@ def _warn_suspended(
             and (u, lid) not in ever_certified
         ):
             dag_path = os.path.join(DAGS_DIR, f"{u}_dag.json")
-            node = (dag or {}).get("lemmas", {}).get((u, lid)) or {}
-            if node.get("provenance") == "operator":
-                # No proof to verify: the verifiers would reject the
-                # placeholder text and write a refutation.
-                log(
-                    f"{u}:{lid} was asserted by the operator but its "
-                    f"certificate was never written — a run stopped between "
-                    f"the commit and the certificate. It is suspended "
-                    f"until certified. Do not proofs verify it (there is no "
-                    f"proof to check): remove it from {dag_path} and assert "
-                    f"it again at the menu.",
-                    verbose,
-                )
-                continue
             log(
                 f"{u}:{lid} was committed but never certified — a run "
                 f"stopped between the commit and the certificate. It is "
@@ -1013,8 +1001,11 @@ def load_dag() -> Dict[str, Any]:
     Each file in dags/ is one user's lemmas, named <user_id>_dag.json, and
     the merge keys them by the pair (user_id, lemma_id) — a bare lemma_id
     is unique only within one user's file, so the pair is the only key that
-    cannot collide. Every node carries both fields, with the file's name
-    authoritative for its owner. Citations are stored the same way
+    cannot collide. The file stores neither half inside a node (see
+    _stored_node): in memory every node is given both, user_id from the
+    file's name — the lemma's owner — and lemma_id from its key. A stored
+    node's last_prover_id names who wrote its proof, not who owns it, and
+    is not an identity. Citations are stored the same way
     (see load_dag()): cited_lemmas is an array of {"user_id",
     "lemma_id"} objects, read in memory as a list of (user_id, lemma_id)
     tuples, and cited_references a separate array of bare reference ids.
@@ -1196,6 +1187,35 @@ def _ensure_user_dag_file() -> None:
             _write_user_file({"lemmas": {}})
 
 
+def _stored_node(node: Dict[str, Any], last_prover_id: str) -> Dict[str, Any]:
+    """A lemma node in the shape a DAG file stores it, and nothing else:
+
+        statement, proof, cited_lemmas, cited_references,
+        last_prover_id, proved_at
+
+    The owner is not stored in the node — it is the file's name,
+    <owner>_dag.json — and neither is the lemma_id, which is the node's
+    key; load_dag() supplies both in memory. last_prover_id is the user
+    whose run wrote the proof now in the file: the owner for a lemma their
+    own run proved, the repairer for one re-proved by proofs repair.
+    Citations are stored the load_dag() way: cited_lemmas as
+    {"user_id", "lemma_id"} objects naming each cited lemma's owner,
+    cited_references as bare ids. proved_at is the moment of this write,
+    the lemma window's recency. Neither last_prover_id nor proved_at is in
+    the Merkle hash, which covers only the statement, the proof and the
+    cited statements."""
+    return {
+        "statement": node["statement"],
+        "proof": node["proof"],
+        "cited_lemmas": [
+            _dep_to_json(dep) for dep in node.get("cited_lemmas", [])
+        ],
+        "cited_references": list(node.get("cited_references", [])),
+        "last_prover_id": last_prover_id,
+        "proved_at": certificates.now_iso(),
+    }
+
+
 def commit_lemma_to_dag(
     lemma_id: str, node: Dict[str, Any]
 ) -> Tuple[str, bool]:
@@ -1203,16 +1223,13 @@ def commit_lemma_to_dag(
     fresh non-colliding id if lemma_id is already taken in that file. The id
     check and the write are one step under the DAG lock, so the check can
     never go stale: a writer that finds its id taken commits under
-    lemma_id_2 (or _3, ...) rather than over the first proof, and the
-    renamed node carries "renamed_from" so the DAG stays self-explanatory. A
+    lemma_id_2 (or _3, ...) rather than over the first proof. A
     collision is with the current user's own lemmas: lemma_id is unique only
     within one user's DAG, so a lemma another user proved under the same id
-    is no collision at all. The node is stored with its user_id and lemma_id
-    and its citations in the two stored fields (see load_dag()):
-    cited_lemmas as {"user_id", "lemma_id"} objects, cited_references as
-    bare ids — no hashes, anywhere in the file — and the moment of the
-    commit as proved_at (the lemma window's recency). Returns (committed_id,
-    renamed).
+    is no collision at all. The node is stored in the shape _stored_node
+    gives it, with the current user as its last_prover_id and the moment of
+    the commit as proved_at (the lemma window's recency). Returns
+    (committed_id, renamed).
 
     The check and the write are one step across processes too: the file
     lock (locking.py) keeps a proofs repair or a second run of the same
@@ -1229,22 +1246,7 @@ def commit_lemma_to_dag(
             while f"{lemma_id}_{suffix}" in lemmas:
                 suffix += 1
             committed_id = f"{lemma_id}_{suffix}"
-        new_node = dict(node)
-        new_node["user_id"] = USER
-        new_node["lemma_id"] = committed_id
-        # When the lemma was proved: the lemma window's recency order.
-        # Not part of the Merkle hash, which covers only the statement,
-        # the proof and the citations.
-        new_node["proved_at"] = certificates.now_iso()
-        new_node["cited_lemmas"] = [
-            _dep_to_json(d) for d in node.get("cited_lemmas", [])
-        ]
-        new_node["cited_references"] = list(
-            node.get("cited_references", [])
-        )
-        if committed_id != lemma_id:
-            new_node["renamed_from"] = lemma_id
-        lemmas[committed_id] = new_node
+        lemmas[committed_id] = _stored_node(node, USER)
         data["lemmas"] = lemmas
         _write_user_file(data)
         return committed_id, committed_id != lemma_id
@@ -1255,7 +1257,7 @@ def commit_lemma_to_dag(
 # ----------------------------------------------------------------------------
 # The record that a lemma was accepted (see certificates.py). The run
 # writes a certificate the moment an acceptance happens — the three verifier
-# checks accepting a proof, or the operator asserting one in human mode —
+# checks accepting a proof, the prover's or the operator's —
 # into this run's user's file, the verifier's, whoever owns the lemma. The storage, the upsert rule and the validity check
 # live in certificates.py; this is the run's one entry point to them.
 
@@ -1268,8 +1270,8 @@ def record_certificate(
     The hash is the lemma's current Merkle hash, recomputed after the
     commit from the DAG reloaded from the files and references.md, so the
     line covers the proof that is in the file now and stays valid until
-    the lemma's statement, its proof, or anything it cites changes. model
-    is the verifier's model name; a human acceptance records "". A
+    the lemma's statement, its proof, or the statement of anything it
+    cites changes. model is the verifier's model name. A
     certificate is the record of an acceptance; a failure to write it must
     not undo the acceptance, so every failure here degrades to a warning.
 
@@ -1286,8 +1288,9 @@ def record_certificate(
     references.md, changed between the verification and the commit (a
     proofs repair, a pull) — the certificate would cover a version nobody
     verified, so none is issued: the lemma stays suspended until proofs
-    verify checks the version in the file. None skips the comparison: an
-    operator's assertion has no verification to compare against.
+    verify checks the version in the file. None skips the comparison
+    (_verified_hash gives None for a proof whose hash cannot be computed,
+    and the hash after the commit then reports why).
     """
     owner = owner or USER
     try:
@@ -1309,7 +1312,7 @@ def record_certificate(
         dag_path = os.path.join(DAGS_DIR, f"{owner}_dag.json")
         log(
             f"No certificate for {lemma_id}: something it stands on (a "
-            f"cited lemma, or references.md) changed between the "
+            f"cited lemma's statement, or references.md) changed between the "
             f"verification and the commit, so the version in the file is "
             f"not the one the verifiers checked. It stays suspended until "
             f"verified again: run proofs verify {dag_path} {lemma_id}.",
@@ -1497,11 +1500,12 @@ def _replace_lemma_in_owner_file(
     only the current user's file, this may write another user's file — the
     only write to another user's DAG file anywhere in the system.
 
-    The node is stored in the pipeline's commit shape — statement, proof,
-    the cited_lemmas pair objects, cited_references, user_id, lemma_id,
-    proved_at — the same shape a run's commit writes, so a repaired lemma reads the
-    same as a run-committed one; a stale field of the node it replaces
-    (the old proof's provenance among them) is dropped with it. The write
+    The node is stored in the shape a run's commit writes (_stored_node),
+    so a repaired lemma reads the same as a run-committed one, with the
+    repairer — the current user — as its last_prover_id: the owner stays
+    the file's name, and the node says who wrote the proof now in it. A
+    field of the node it replaces that _stored_node does not write is
+    dropped with it. The write
     is under the DAG lock and the file lock (locking.py) and atomic, the
     way the run's file writes are, so a proofs run of the owner on this
     machine cannot commit over it or under it.
@@ -1515,19 +1519,9 @@ def _replace_lemma_in_owner_file(
         lemmas = data.get("lemmas")
         if not isinstance(lemmas, dict) or lemma_id not in lemmas:
             raise KeyError(f"{owner}:{lemma_id} is not in {path}")
-        lemmas[lemma_id] = {
-            "statement": node["statement"],
-            "proof": node["proof"],
-            "cited_lemmas": [
-                _dep_to_json(dep) for dep in node.get("cited_lemmas", [])
-            ],
-            "cited_references": list(node.get("cited_references", [])),
-            "user_id": owner,
-            "lemma_id": lemma_id,
-            # A re-proof is a fresh proof: it moves to the front of the
-            # lemma window, as a new commit does.
-            "proved_at": certificates.now_iso(),
-        }
+        # A re-proof is a fresh proof: its proved_at moves it to the front
+        # of the lemma window, as a new commit does.
+        lemmas[lemma_id] = _stored_node(node, USER)
         if owner == USER:
             # The run's own file: refresh the identity header at the top,
             # the way _write_user_file does it. Another user's file keeps
@@ -1911,16 +1905,17 @@ def repair_entry(
     another user's DAG file — certified, and the lemma's refutations
     dismissed.
 
-    Because the new proof changes the lemma's hash, and so the hash of
-    every lemma that depends on it, those dependents lose their valid
-    certificates the moment the in-place commit happens and are
-    suspended until verified again. The repair therefore climbs the
-    dependency chain, re-verifying each dependent in dependency order and
-    re-proving a rejected one the same way, its own rejection as the
-    justification. A lemma that cannot be re-proved keeps the proof it
-    had and the refutation that counts against it, and the climb goes on:
-    the hash change has already happened, whether or not its proof
-    sticks, so it and its dependents stay suspended.
+    A new proof under the same statement changes only the lemma's own
+    hash — a dependent's hash covers the statements it cites, not their
+    proofs (see merkle.py) — so its dependents keep their certificates.
+    When the reviser revised the statement, the lemmas citing it lose
+    theirs the moment the in-place commit happens. The repair therefore
+    climbs the dependency chain in dependency order, re-verifying each
+    dependent whose certificate no longer matches and re-proving a
+    rejected one the same way, its own rejection as the justification. A
+    lemma that cannot be re-proved keeps the proof it had and the
+    refutation that counts against it, and the climb goes on, so it and
+    its dependents stay suspended.
 
     Returns the exit code: 0 when the lemma was re-verified or re-proved
     and every dependent re-verified or re-proved; 1 when a re-proof
@@ -1995,6 +1990,9 @@ def repair_entry(
     global _DEFERRED_INTERRUPT
     previous_handler = signal.signal(signal.SIGINT, _on_sigint_repair)
     _DEFERRED_INTERRUPT = _raise_interrupt
+    # Whether any lemma was re-proved in place: its replaced proof's
+    # certificate is now stale, and the repair ends with the prune hint.
+    reproved = False
     try:
         try:
             outcome, just = verify_stored_lemma(
@@ -2063,6 +2061,7 @@ def repair_entry(
             proof and its counting refutation in the file, the lemma
             suspended.
             """
+            nonlocal reproved
             dag0 = load_dag()
             node = dag0["lemmas"].get((u, lid))
             if node is None:
@@ -2151,6 +2150,7 @@ def repair_entry(
                         f"{ref_path}: {e}",
                         verbose,
                     )
+            reproved = True
             log(
                 f"{u}:{lid} re-proved in place; the new proof stands "
                 f"under its own id.",
@@ -2166,14 +2166,18 @@ def repair_entry(
             )
             return 1
 
-        # The new proof changed the lemma's hash, and so the hash of
-        # every lemma that depends on it: their certificates no longer
-        # match and they are suspended until verified again. Climb the
-        # dependency chain, re-verifying each dependent in dependency
-        # order, and re-proving a rejected one the same way, its own
-        # rejection as the justification. A dependent that cannot be
-        # re-proved stays suspended and the climb goes on: the hash
-        # change has already happened, whether or not its proof sticks.
+        # A new proof under the same statement changes only the lemma's
+        # own hash: a dependent's hash covers the statements it cites,
+        # not their proofs, so its certificate still matches and nothing
+        # above needs verifying. A statement the reviser revised does
+        # change the hash of every lemma citing it, and those lose their
+        # certificates. Climb the dependency chain in dependency order,
+        # re-verifying each dependent whose certificate no longer matches
+        # — checked as the climb reaches it, so a dependent whose own
+        # statement is revised on the way takes its citers along — and
+        # re-proving a rejected one the same way, its own rejection as the
+        # justification. A dependent that cannot be re-proved stays
+        # suspended and the climb goes on.
         chain = _dependent_chain(load_dag(), (owner, lemma_id))
         if not chain:
             log(
@@ -2183,16 +2187,30 @@ def repair_entry(
             )
             return 0
         log(
-            f"{len(chain)} dependent(s) of {owner}:{lemma_id} lost "
-            f"their certificates with the new hash; re-verifying them in "
-            f"dependency order: "
+            f"Checking the {len(chain)} dependent(s) of {owner}:{lemma_id} "
+            f"in dependency order, re-verifying those whose certificates "
+            f"no longer match: "
             + ", ".join(f"{u}:{lid}" for u, lid in chain)
             + ".",
             verbose,
         )
         failed: List[Tuple[str, str]] = []
+        reverified = 0
         for u, lid in chain:
             dag = load_dag()
+            try:
+                h = merkle.Merkle(dag["lemmas"], references).hash(u, lid)
+            except merkle.MerkleCycleError as e:
+                log(f"{e}", verbose)
+                failed.append((u, lid))
+                continue
+            if any(
+                certificates.is_valid(c, h)
+                for c in certificates.load_all(CONJECTURE_ROOT)
+                if (c.get("user_id"), c.get("lemma_id")) == (u, lid)
+            ):
+                continue
+            reverified += 1
             try:
                 dep_outcome, dep_just = verify_stored_lemma(
                     dag, references, u, lid, conjecture_text, verifier_sys,
@@ -2241,9 +2259,9 @@ def repair_entry(
             )
             return 1
         log(
-            f"The repair is done: {owner}:{lemma_id} and its "
-            f"{len(chain)} dependent(s) are verified, the rejected ones "
-            f"re-proved.",
+            f"The repair is done: {owner}:{lemma_id} re-proved; "
+            f"{reverified} of its {len(chain)} dependent(s) needed "
+            f"re-verifying, the rejected ones re-proved.",
             verbose,
         )
         return 0
@@ -2257,6 +2275,49 @@ def repair_entry(
     finally:
         signal.signal(signal.SIGINT, previous_handler)
         _DEFERRED_INTERRUPT = None
+        if reproved:
+            _prune_hint(root, verbose)
+
+
+def _prune_hint(root: Path, verbose: bool) -> None:
+    """After a repair that re-proved a lemma: say how many of the current
+    user's certificates no longer match — the lines proofs prune would
+    drop — and the command that drops them. A re-proof leaves the
+    certificate of the proof it replaced in the file (certificates are a
+    record, never rewritten by an acceptance), and the repair itself does
+    not prune: that is the user's call, the way it is everywhere else.
+    Silent when nothing is stale, or when the files cannot be read."""
+    try:
+        dag = load_dag()
+        m = merkle.Merkle(dag["lemmas"], load_references())
+        lines = certificates.load(certificates.file_for(CONJECTURE_ROOT, USER))
+    except (OSError, ValueError):
+        return
+    stale = 0
+    for line in lines:
+        # prune judges only the lines the user issued (see
+        # certificates.prune); a hand-edited line for another verifier
+        # is kept, so it is not counted here either.
+        if str(line.get("verifier") or "") != USER:
+            continue
+        pair = (str(line.get("user_id") or ""), str(line.get("lemma_id") or ""))
+        try:
+            h: Optional[str] = m.hash(*pair)
+        except (KeyError, merkle.MerkleCycleError):
+            h = None
+        if h is None or not certificates.is_valid(line, h):
+            stale += 1
+    if stale:
+        try:
+            shown = os.path.relpath(root)
+        except ValueError:  # another drive (Windows): keep it absolute
+            shown = str(root)
+        log(
+            f"{stale} of your certificate(s) no longer match a lemma (the "
+            f"replaced proofs' among them). They are harmless, but to drop "
+            f"them run: proofs prune {shown}",
+            verbose,
+        )
 
 
 def prune_entry(
@@ -2278,7 +2339,8 @@ def prune_entry(
     verifier are pruned, whoever owns the lemmas they cover.
 
     A line goes when its lemma's hash has moved (the proof, the statement,
-    or something below it changed), when the lemma is no longer in the
+    or the statement of something it cites changed), when the lemma is no
+    longer in the
     DAG at all, or when the lemma has no hash any more (a citation cycle,
     the case suspension.compute reads as "no certificate is valid for
     it") — a certificate that matches nothing is the stale record prune
@@ -5301,6 +5363,135 @@ def _verified_hash(
         return None
 
 
+def _operator_citation_check(
+    dag: Dict[str, Any],
+    ref_ids: Set[str],
+    suspended: Set[Tuple[str, str]],
+) -> Callable[[List[Any], List[Any]], Optional[str]]:
+    """The menu's check_citations (see interaction.choose): the operator's
+    citations, run through the prover's check, and the reason they cannot
+    be used — an unknown or suspended lemma, a reference the collection
+    does not hold — or None when every one resolves."""
+
+    def check(raw_lemmas: List[Any], raw_refs: List[Any]) -> Optional[str]:
+        _l, _r, unmatched = _check_prover_citations(
+            raw_lemmas, raw_refs, dag, ref_ids, suspended
+        )
+        if not unmatched:
+            return None
+        why = {
+            "lemma": "no such lemma in the DAG",
+            "suspended": "suspended — refuted, uncertified, or standing on one that is",
+            "reference": "no such lemma or reference",
+            "other": "not a citation",
+        }
+        return "cannot cite " + "; ".join(
+            f"{label} ({why.get(kind, kind)})" for label, kind in unmatched
+        )
+
+    return check
+
+
+def _verify_operator_proof(
+    choice: "interaction.Choice",
+    dag: Dict[str, Any],
+    references: List[Dict[str, Any]],
+    ref_ids: Set[str],
+    suspended: Set[Tuple[str, str]],
+    conjecture: str,
+    verifier_sys: Dict[str, str],
+    verbose: bool,
+) -> Optional[Tuple[str, Dict[str, Any], Optional[str]]]:
+    """The operator's own proof of a lemma (an "own_proof" Choice) through
+    the three verifier checks, exactly as the proof loop puts the prover's:
+    the conjecture, the statements of what the proof cites and nothing
+    else, the target, the proof. No lemma enters the DAG on the operator's
+    say-so; the operator stands in for the prover, not for the verifiers.
+
+    Returns (lemma_id, node, verified_hash) for the caller to commit and
+    certify when all three accept — the operator is the commit's
+    last_prover_id, as the run's user — or None, the reason logged, when
+    a citation does not resolve, a verifier rejects the proof (its
+    objection is shown), or a verifier gives no verdict. The caller then
+    puts the menu back."""
+    lemma = resolution.pin(choice.lemma or {}, conjecture)
+    lemma_id = str(lemma.get("id") or "").strip()
+    statement = str(lemma.get("statement") or "").strip()
+    proof = str(choice.proof or "").strip()
+    if not lemma_id or not statement or not proof:
+        log("  That lemma has no usable id, statement or proof.", verbose)
+        return None
+    cited_lemmas, cited_refs, unmatched = _check_prover_citations(
+        choice.cited_lemmas, choice.cited_references, dag, ref_ids, suspended
+    )
+    if unmatched:
+        log(
+            "  Your proof cites results that cannot be used: "
+            + ", ".join(label for label, _ in unmatched)
+            + ". Nothing was verified.",
+            verbose,
+        )
+        return None
+    target = {"id": lemma_id, "statement": statement}
+    log(
+        f"Verifying your proof of {lemma_id} ({len(proof)} chars"
+        + (
+            ", cites: " + ", ".join(
+                _citation_label(d) for d in [*cited_lemmas, *cited_refs]
+            )
+            if cited_lemmas or cited_refs else ", no citations"
+        )
+        + ").",
+        verbose,
+    )
+    verifier_user = (
+        f"Conjecture:\n{conjecture}\n\n"
+        f"Cited results (statements of exactly the lemmas and "
+        f"references the proof declares it used; nothing else is "
+        f"available to it):\n"
+        f"{json.dumps(verifier_context(dag, cited_lemmas, cited_refs, references), indent=2)}\n\n"
+        f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
+        f"Proposed proof:\n{proof}"
+    )
+    for step, agent in enumerate(VERIFIER_AGENTS, 1):
+        role = agent[:-3]
+        decision, justification = _run_verifier(
+            role, verifier_sys[agent], verifier_user, verbose,
+        )
+        log(
+            f"Verifier {step}/{len(VERIFIER_AGENTS)} ({role}): "
+            f"{decision.upper() or '???'} — {justification}",
+            verbose,
+        )
+        if decision == "reject":
+            log(
+                f"Your proof of {lemma_id} was rejected by {role}; nothing "
+                f"was added. Back to the menu.",
+                verbose,
+            )
+            return None
+        if decision != "accept":
+            log(
+                f"No verdict on your proof of {lemma_id} from {role} (the "
+                f"server failed or the reply could not be read); nothing "
+                f"was added. Back to the menu.",
+                verbose,
+            )
+            return None
+    log(
+        f"Your proof of {lemma_id} passed all {len(VERIFIER_AGENTS)} "
+        f"verifier checks. Adding to DAG.",
+        verbose,
+    )
+    node = {
+        "statement": statement,
+        "proof": proof,
+        "cited_lemmas": list(cited_lemmas),
+        "cited_references": list(cited_refs),
+    }
+    return lemma_id, node, _verified_hash(dag, references, node)
+
+
 def _serial_on_round(
     iteration: int,
     failed_attempts: Dict[str, List[str]],
@@ -5655,9 +5846,32 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             # --mode auto honest as a control.
             next_lemma: Optional[Dict[str, Any]] = None
             if MODE == "human":
+                check = _operator_citation_check(dag, ref_ids, suspended)
                 choice = interaction.choose(
-                    screened, lemma_id_set(dag, suspended), HOTKEY, summary
+                    screened, lemma_id_set(dag, suspended), HOTKEY, summary,
+                    check_citations=check,
                 )
+                # The operator's own proof goes through the verifiers here;
+                # a rejected one (or one with no verdict) puts the same
+                # menu back, with no re-plan in between.
+                own_committed: Optional[str] = None
+                while choice.action == "own_proof":
+                    verified = _verify_operator_proof(
+                        choice, dag, references, ref_ids, suspended,
+                        conjecture, verifier_sys, verbose,
+                    )
+                    if verified is not None:
+                        lid, node, vh = verified
+                        own_committed = _serial_on_proof(lid, node, vh, verbose)
+                        failed_attempts.pop(lid, None)
+                        break
+                    choice = interaction.choose(
+                        screened, lemma_id_set(dag, suspended), HOTKEY,
+                        summary, check_citations=check,
+                    )
+                if own_committed is not None:
+                    save_checkpoint(iteration + 1, failed_attempts, None, verbose)
+                    continue
                 if choice.action == "quit":
                     log(
                         "\nStopped by the operator; DAG and checkpoint kept — "
@@ -5681,38 +5895,6 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 if choice.action == "auto":
                     MODE = "auto"
                     log(f"Automation resumed. {HOTKEY.hint()}", verbose)
-                elif choice.action == "assert":
-                    # The operator has vouched for it, so there is nothing for the
-                    # prover or the verifiers to do: no proof is generated, no
-                    # review is run, and the lemma is in the DAG before the next
-                    # iteration reloads it. `provenance` marks it as resting on a
-                    # person rather than on a machine-checked argument — absent on
-                    # every node written by the pipeline, and on every DAG file
-                    # that predates this, so read it with .get().
-                    asserted = resolution.pin(choice.lemma or {}, conjecture)
-                    with _commit_section():
-                        committed_id, _renamed = commit_lemma_to_dag(
-                            asserted["id"],
-                            {
-                                "statement": asserted["statement"],
-                                "proof": "Asserted by the operator; not machine-proved.",
-                                # nothing was cited; nothing was proved
-                                "cited_lemmas": [],
-                                "cited_references": [],
-                                "provenance": "operator",
-                            },
-                        )
-                        failed_attempts.pop(committed_id, None)
-                        log(
-                            f"Lemma {committed_id} accepted on your authority "
-                            f"and added to the DAG unproved.",
-                            verbose,
-                        )
-                        # The operator's acceptance is certified too, with an
-                        # empty model: a person vouching, not a machine
-                        # (see certificates.py).
-                        record_certificate(committed_id, "", verbose)
-                    continue
                 elif choice.lemma is not None:
                     # A written lemma under a reserved id is pinned too.
                     next_lemma = resolution.pin(choice.lemma, conjecture)
@@ -6349,7 +6531,7 @@ def _parallel_planner(
         _warn_suspended(susp, verbose, warned, dag)
         # Settled? The planner wakes on every DAG change, so this is where
         # a lemma that settles the conjecture is noticed — a loop's proof,
-        # the operator's assertion, or (at start) another user's pulled
+        # the operator's, or (at start) another user's pulled
         # file. The planner's own opinion never settles it (resolution.py).
         kind = _settled(dag, susp.suspended, conjecture, verbose)
         if kind is not None:
@@ -6533,12 +6715,16 @@ def _parallel_human_step(
     loop_id: str,
     verbose: bool,
     conjecture: str,
+    references: List[Dict[str, Any]],
+    ref_ids: Set[str],
+    verifier_sys: Dict[str, str],
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """One human planning step: the buffer on the menu, as the serial run
     puts the planner's shortlist. Loops until the operator commits to a
     lemma, hands the loop to automation, or quits — a quit stops the whole
-    run, not just this loop, and says so. Re-plans and asserts are
-    recorded and the menu comes right back, the serial way."""
+    run, not just this loop, and says so. Re-plans are recorded and the
+    menu comes right back, the serial way; so does the operator's own
+    proof, committed when the verifiers accept it and not otherwise."""
     global MODE
     while True:
         dag = load_dag()
@@ -6558,7 +6744,10 @@ def _parallel_human_step(
         plan = state.plan_snapshot() or {}
         summary = str(plan.get("plan_summary") or "")
         choice = interaction.choose(
-            screened, lemma_id_set(dag, susp.suspended), HOTKEY, summary
+            screened, lemma_id_set(dag, susp.suspended), HOTKEY, summary,
+            check_citations=_operator_citation_check(
+                dag, ref_ids, susp.suspended
+            ),
         )
         if choice.action == "quit":
             log(
@@ -6583,54 +6772,48 @@ def _parallel_human_step(
             MODE = "auto"
             log(f"{loop_id} handed to automation. {HOTKEY.hint()}", verbose)
             return "auto", None
-        if choice.action == "assert":
-            asserted = resolution.pin(choice.lemma or {}, conjecture)
-            # A buffered id is claimed before it is asserted, the way a
-            # 'prove' pick is: a lemma another loop is proving is not the
-            # operator's to assert over (its slot would be freed under that
-            # loop, which would go on to commit a duplicate as id_2), and
-            # one still unclaimed must not be picked up by a loop between
-            # the commit and the consume below.
-            if asserted["id"] in {e["lemma"]["id"] for e in state.buffer.snapshot()}:
-                if state.buffer.claim_id(loop_id, asserted["id"]) is None:
-                    log(
-                        f"  {asserted['id']} is claimed by another loop, "
-                        f"which is proving it; pick another, or let that "
-                        f"loop finish.",
-                        verbose,
-                    )
-                    continue
-            with _commit_section():
-                committed = state.add_lemma(
-                    asserted["id"],
-                    {
-                        "statement": asserted["statement"],
-                        "proof": "Asserted by the operator; not machine-proved.",
-                        "cited_lemmas": [],
-                        "cited_references": [],
-                        "provenance": "operator",
-                    },
+        if choice.action == "own_proof":
+            own = resolution.pin(choice.lemma or {}, conjecture)
+            own_id = str(own.get("id") or "").strip()
+            # A buffered id is claimed before the operator's proof is
+            # verified, the way a 'prove' pick is: a lemma another loop is
+            # proving is not the operator's to prove over (its slot would be
+            # freed under that loop, which would go on to commit a
+            # duplicate as id_2), and one still unclaimed must not be
+            # picked up by a loop while the verifiers run.
+            buffered = own_id in {e["lemma"]["id"] for e in state.buffer.snapshot()}
+            if buffered and state.buffer.claim_id(loop_id, own_id) is None:
+                log(
+                    f"  {own_id} is claimed by another loop, which is "
+                    f"proving it; pick another, or let that loop finish.",
+                    verbose,
                 )
-                state.buffer.consume(asserted["id"])
-                if committed == asserted["id"]:
+                continue
+            verified = _verify_operator_proof(
+                choice, dag, references, ref_ids, susp.suspended,
+                conjecture, verifier_sys, verbose,
+            )
+            if verified is None:
+                if buffered:
+                    # Back in the buffer for any loop, this one included.
+                    state.buffer.release_claims(loop_id)
+                continue
+            lid, node, vh = verified
+            with _commit_section():
+                committed = state.add_lemma(lid, node)
+                state.buffer.consume(lid)
+                if committed != lid:
+                    # A sibling loop committed this id while the verifiers
+                    # ran: its entry stands under the id, the operator's
+                    # proof goes in under the renamed one.
                     log(
-                        f"Lemma {asserted['id']} accepted on your authority "
-                        f"and added to the DAG unproved.",
+                        f"Lemma {lid} entered the DAG in the meantime; "
+                        f"yours went in as {committed}.",
                         verbose,
                     )
-                else:
-                    # A sibling loop committed this id while the menu was up:
-                    # its entry stands under the id, the assertion goes in
-                    # under the renamed one.
-                    log(
-                        f"Lemma {asserted['id']} entered the DAG in the "
-                        f"meantime; yours went in as {committed}.",
-                        verbose,
-                    )
-                # The operator's acceptance is certified too, under the id it
-                # was committed under, with an empty model (see
-                # certificates.py).
-                record_certificate(committed, "", verbose)
+                record_certificate(
+                    committed, _recorded_model(), verbose, verified_hash=vh,
+                )
             continue
         # 'prove': a buffer lemma, claimed atomically, or a written one.
         lemma = choice.lemma or {}
@@ -6749,7 +6932,8 @@ def _parallel_proof_loop(
                 break
             if is_human():
                 action, lemma = _parallel_human_step(
-                    state, loop_id, verbose, conjecture
+                    state, loop_id, verbose, conjecture,
+                    references, ref_ids, verifier_sys,
                 )
                 if action == "quit":
                     # The operator ended the run, the serial way: stop every

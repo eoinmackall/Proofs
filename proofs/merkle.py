@@ -2,7 +2,7 @@
 
 A lemma's hash is the SHA-256 of a canonical JSON object holding the
 lemma's normalized statement, its normalized proof, and the sorted
-hashes of everything the lemma cites:
+statement hashes of everything the lemma cites:
 
     {
         "cited":     [<hash>, <hash>, ...],
@@ -11,19 +11,24 @@ hashes of everything the lemma cites:
     }
 
 written with sorted keys and no whitespace (canonical_json), UTF-8
-encoded, and hashed. A cited lemma contributes its own hash; a cited
-reference contributes the SHA-256 of its normalized formal statement —
-the id and the slogan are deliberately out, because a citation pins the
-result, not its label: a maintainer who rewords a slogan must not
-invalidate the proofs that cite it.
+encoded, and hashed. A cited lemma contributes the SHA-256 of its
+normalized statement, and a cited reference the SHA-256 of its
+normalized formal statement — the same function for both
+(statement_hash). The ids, the slogans and a cited lemma's proof are
+deliberately out, because a citation pins the result, not its label or
+how it was established: a maintainer who rewords a slogan, or a repair
+that re-proves a lemma under the same statement, must not invalidate the
+proofs that cite it.
 
-Because every hash carries the hashes of everything below it, a new
-proof or statement for any lemma changes the hash of every lemma that
-depends on it — and, by the same rule applied again, of everything that
-depends on that, all the way to the top of the DAG. That is the point:
-the hash is a fingerprint of the lemma *and* of the ground it stands
-on, so "the certificate covers this proof" is checkable from the files
-alone.
+The hash therefore covers exactly what a verifier is shown: the lemma's
+own statement and proof and the statements of what it cites. A new
+statement for a lemma changes the hash of every lemma that cites it
+directly, and those must be verified again; a new proof under the same
+statement changes only the lemma's own hash. Whether the ground a lemma
+stands on is sound is not the hash's question but suspension's
+(suspension.py): a lemma that cites a lemma without a valid certificate,
+or with a counting refutation, is suspended, transitively, all the way to
+the top of the DAG.
 
 No hash is stored in any DAG file: it is a function of the files'
 contents, recomputed on demand. That is also what makes it shared —
@@ -42,9 +47,13 @@ Hashes are computed on demand, in dependency order, with each result
 cached: Merkle.hash() recurses into a lemma's citations before hashing
 the lemma itself, and every hash it computes is kept in Merkle.cache,
 so the whole DAG costs one pass per lemma no matter how often the
-results are asked for afterwards, and in what order. A DAG with a
-citation cycle cannot be hashed in dependency order, and says so with a
-MerkleCycleError rather than recursing until it overflows.
+results are asked for afterwards, and in what order. The recursion is no
+longer needed for the value — a cited lemma contributes only its
+statement — but it is kept for what it rules out: a DAG with a citation
+cycle says so with a MerkleCycleError, and a lemma in a cycle has no
+hash, so no certificate can be valid for it. Without that, two lemmas
+each certified on the other's statement would be circular reasoning that
+nothing flags.
 
 This module is deliberately standalone: it imports nothing from this
 package, so everything that keys off these hashes — certificates.py,
@@ -74,6 +83,7 @@ __all__ = [
     "normalize",
     "reference_hash",
     "sha256_hex",
+    "statement_hash",
 ]
 
 # A lemma is identified by the pair (user_id, lemma_id); a bare lemma_id
@@ -137,13 +147,20 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def statement_hash(statement: Any) -> str:
+    """A cited result's contribution to a lemma's hash: the SHA-256 of
+    its normalized statement. The same for a cited lemma (its
+    "statement") and a cited reference (its "formal statement"), since a
+    verifier is shown the statement and nothing else of either."""
+    return sha256_hex(normalize(statement).encode("utf-8"))
+
+
 def reference_hash(reference: Mapping[str, Any]) -> str:
-    """A cited reference's contribution to a lemma's hash: the SHA-256 of
-    its normalized "formal statement". The id
+    """A cited reference's contribution to a lemma's hash: the
+    statement_hash of its "formal statement". The id
     and the slogan are deliberately not in it: a citation pins the
     result, not its label."""
-    statement = reference.get("formal statement", "")
-    return sha256_hex(normalize(statement).encode("utf-8"))
+    return statement_hash(reference.get("formal statement", ""))
 
 
 def _unresolved(kind: str, *parts: str) -> str:
@@ -247,9 +264,10 @@ class Merkle:
 
         Computed on demand, in dependency order: the hashes of everything
         the lemma cites are computed (and cached) before the lemma's
-        own is, so the lemma's hash carries the hashes of everything
-        below it. A second ask for the same pair returns the cached
-        result without recomputing anything.
+        own is — not for their value, since a cited lemma contributes
+        only its statement, but so that a citation cycle anywhere below
+        the lemma is found. A second ask for the same pair returns the
+        cached result without recomputing anything.
 
         Raises KeyError for a pair the DAG does not hold, and
         MerkleCycleError when the citations run in a circle.
@@ -359,7 +377,7 @@ class Merkle:
 
     def _cited_hashes(self, node: Mapping[str, Any]) -> List[str]:
         """The sorted, duplicate-free hashes of everything the node cites:
-        each cited lemma's own hash, each cited reference's formal-
+        each cited lemma's statement hash, each cited reference's formal-
         statement hash, and the marker of _unresolved() for a citation
         that resolves to nothing. Sorting is what "the sorted hashes of
         everything it cites" says: the set of cited hashes, not their
@@ -368,7 +386,12 @@ class Merkle:
         hashes: List[str] = []
         for pair in pairs:
             if pair in self._lemmas:
-                hashes.append(self.hash(*pair))
+                # Hashed for the cycle check (see hash()); the value is
+                # the cited statement's alone.
+                self.hash(*pair)
+                hashes.append(
+                    statement_hash(self._lemmas[pair].get("statement"))
+                )
             else:
                 hashes.append(_unresolved("lemma", *pair))
         for rid in refs:

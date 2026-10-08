@@ -11,9 +11,10 @@ work on one conjecture: each user's lemmas go in their own DAG file,
 `conjectures/NAME/dags/<user_id>_dag.json`, and every run reads all the
 users' files as one complete DAG. Every acceptance is recorded as a
 *certificate* and every rejection on re-verification as a *refutation*,
-both tied to a hash of the lemma and everything beneath it. A lemma that has
-no valid certificate, or has a refutation against it, is *suspended* and is
-not built on until it is verified again. See
+both tied to a hash of what the verifiers were shown: the lemma and the
+statements it cites. A lemma that has no valid certificate, or has a
+refutation against it, or cites a lemma in either state, is *suspended* and
+is not built on until it is verified again. See
 [Sharing a conjecture](#sharing-a-conjecture).
 
 By default the loop is serial: one lemma in flight at a time. `--parallel N`
@@ -37,11 +38,14 @@ Each iteration:
      to come through the prover and the verifiers. The planner's best-first
      order is the fallback: it is taken when the selector fails or when only
      one candidate survives.
-   - `--mode human`: a menu appears. Type a number and Enter to accept that
-     lemma as true on your own authority (it goes straight into the DAG,
-     marked `"provenance": "operator"`). Type `Np` to send a lemma through
-     the ordinary proving pipeline instead. You can also write your own
-     lemma (`w`, or `wp` to have it proved) or send the planner back.
+   - `--mode human`: a menu appears. Type a number and Enter to prove that
+     lemma yourself: paste or type your proof and its citations, and it
+     goes through the same three verifiers as the prover's (see
+     [Proving a lemma yourself](#proving-a-lemma-yourself)). Type `Np` to
+     send a lemma through the ordinary proving pipeline instead. You can
+     also write your own lemma (`w` to prove it yourself, `wp` to have it
+     proved) or send the planner back. Nothing enters the DAG without
+     passing the verifiers.
 3. **Prover** (`prover.md`) writes a complete, rigorous proof of the chosen
    lemma, citing only lemmas already in the DAG.
 4. **Verifiers** (`verifier_1.md`, `verifier_2.md`, `verifier_3.md`) check it
@@ -99,9 +103,8 @@ The test is on the statement, so a proof committed under a renamed id
 iteration and once after the last; the parallel planner checks on every DAG
 change. Either way, a run stops when another user's pulled DAG settles the
 conjecture. Editing `conjecture.md`, or a refutation or repair anywhere
-below the settling lemma, reopens the conjecture on its own. A conjecture
-asserted by the operator at the menu counts, and is reported as
-operator-asserted. A DAG that proves both the conjecture and its negation
+below the settling lemma, reopens the conjecture on its own. A DAG that
+proves both the conjecture and its negation
 settles nothing: the run warns and carries on.
 
 ### Thinking vs. structured output
@@ -379,6 +382,34 @@ direction, without restarting:
 `proofs/interaction.py` explains why the toggle is a keystroke in one place
 and a line of input in the other.
 
+### Proving a lemma yourself
+
+At the menu, a number and Enter (or `w` for a lemma you write) means you
+supply the proof:
+
+1. **The proof.** Paste it, or type it, then press Enter to submit. A paste
+   arrives whole, line breaks and all, because the prompt turns on the
+   terminal's bracketed-paste mode. To type a line break, press Alt+Enter or
+   Ctrl+J. Shift+Enter also works in terminals that send it differently from
+   Enter (kitty, WezTerm, others with the keyboard protocol turned on); most
+   send it as Enter, which submits. Backspace and Ctrl+U edit; Ctrl+D on an
+   empty proof cancels. Without a terminal (a pipe, or Windows), the proof is
+   read line by line and ended by a line holding a single `.`.
+2. **The citations**, cited as the prover cites them: lemmas by owner and id,
+   references by id. Type them on one line separated by commas, e.g.
+   `alice:lemma_5, eoinm:lemma_12, ref_3`, or paste the prover's JSON
+   (`{"cited_lemmas": [{"user_id": ..., "lemma_id": ...}], "cited_references": [...]}`).
+   An empty line means none. If you paste the prover's whole output object
+   (with a `"proof"` field) as the proof, its citations are taken from it. A
+   citation that does not parse, or that names a lemma that does not exist or
+   is suspended, or a reference not in `references.md`, is reported as an
+   error and asked for again; your proof is kept.
+3. **Verification.** The three verifiers check your proof exactly as they
+   check the prover's, seeing the same things: the statements of what you
+   cite and nothing else. If all three accept, the lemma is committed to your
+   DAG file with you as its `last_prover_id` and certified. If one rejects,
+   its objection is shown and the menu comes back. Nothing is written.
+
 ## Sharing a conjecture
 
 A conjecture is shared by putting its directory in a git repository that
@@ -412,22 +443,28 @@ git add conjectures/NAME && git commit -m "..." && git push
 ### Certificates and the Merkle hash
 
 Every lemma has a **Merkle hash** (`proofs/merkle.py`): the SHA-256 of its
-whitespace-normalised statement and proof together with the hashes of
-everything it cites. A cited lemma contributes its own hash; a cited
-reference contributes the hash of its formal statement. A change to a
-lemma therefore changes the hash of every lemma above it. Hashes are never
-stored: everyone who has the same files computes the same hashes.
+whitespace-normalised statement and proof together with the hashes of the
+statements of everything it cites. A cited lemma contributes the hash of
+its statement and a cited reference the hash of its formal statement — not
+their ids, and not a cited lemma's proof. The hash therefore covers exactly
+what the verifiers are shown. A new statement for a lemma changes the hash
+of every lemma that cites it; a new proof under the same statement changes
+only the lemma's own hash. Whether everything beneath a lemma is sound is
+[suspension](#suspension)'s question, which walks the whole citation
+closure. A citation cycle leaves the lemmas in it with no hash at all.
+Hashes are never stored: everyone who has the same files computes the same
+hashes.
 
 A **certificate** (`proofs/certificates.py`) records an acceptance: one
 line in the verifier's own `certificates/<user_id>.jsonl` holding the
-lemma's pair, its hash at the time, the verifier's `user_id`, the model
-(empty for an operator assertion), the date and a count. A run writes one
-whenever all three verifiers accept a proof, or when the operator asserts a
-lemma at the menu. `proofs verify` writes one for each lemma it accepts.
+lemma's pair, its hash at the time, the verifier's `user_id`, the model,
+the date and a count. A run writes one whenever all three verifiers accept
+a proof, the prover's or the operator's. `proofs verify` writes one for
+each lemma it accepts.
 Accepting the same lemma again with the same model increments the count
 rather than adding a line. A certificate is **valid** only while its hash
-matches the lemma's current hash, so editing a lemma, or anything it
-stands on, quietly invalidates the certificates above it.
+matches the lemma's current hash, so editing a lemma, or the statement of
+anything it cites, quietly invalidates its certificates.
 
 ### Refutations
 
@@ -473,9 +510,15 @@ verify` on it to give it its certificate.
   Otherwise the lemma is re-proved through the prover, verifiers and
   reviser — without decomposition, since it must keep its id — and the new
   proof is written *in place* in the owner's DAG file. This is the one
-  command that writes another user's DAG file. The new proof changes the
-  hash of every lemma that depends on it, so the repair then re-verifies
-  each dependent in dependency order, re-proving any that are rejected.
+  command that writes another user's DAG file. A new proof under the same
+  statement leaves every dependent's certificate valid. If the reviser
+  revised the statement, the lemmas citing it lose their certificates, so
+  the repair then climbs the dependents in dependency order, re-verifying
+  each one whose certificate no longer matches and re-proving any that are
+  rejected. A re-proof leaves the certificate of the proof it replaced in
+  your certificate file, so a repair that re-proved anything ends by saying
+  how many of your certificates are now stale and that `proofs prune DIR`
+  drops them.
 - **`proofs prune DIR`** drops the lines of your own certificate file
   whose hashes no longer match. Other users' files are never touched.
 - **`proofs status PATH lemma_id`** lists, for the lemma and everything it
@@ -517,7 +560,7 @@ Claiming is atomic. A loop's selector is shown the unclaimed lemmas and its
 pick is committed under lock; if another loop took the lemma in the meantime,
 the selector is re-run on what remains, so two loops never work on one id. A
 claimed lemma keeps its slot until it is settled — proved or given up after
-`MAX_PROOF_ATTEMPTS` rounds — or the operator asserts it from the menu.
+`MAX_PROOF_ATTEMPTS` rounds — or the operator proves it from the menu.
 
 The buffer is not the only route to an id: a reviser that decomposes a hard
 lemma picks a fresh id the buffer does not know about, and two loops can
@@ -525,9 +568,8 @@ land on the same id (both decompose to it, or one decomposes to it while a
 sibling proves the buffer's copy of it). The commit to the DAG checks the id
 under the DAG lock and the first proof stands under the id; a colliding
 proof is never dropped — it is committed under a fresh non-colliding id
-(`P1_2`, `P1_3`, ...), marked with `"renamed_from": "P1"` so the DAG stays
-self-explanatory, and the rename is recorded on the shared reject list so
-the planner can see that the two proofs may state different things.
+(`P1_2`, `P1_3`, ...), and the rename is recorded on the shared reject list
+so the planner can see that the two proofs may state different things.
 
 ### The planner and the generator
 
@@ -563,10 +605,9 @@ run.
 `--mode human` takes the place of **loop-0**: the operator sits at loop-0's
 menu while loops 1..N-1 run unattended. The menu shows the shared buffer —
 each lemma marked with the loop that has claimed it — and everything the
-serial menu can do works the same: assert a lemma on your authority (it goes
-straight into the shared DAG as `"provenance": "operator"`), send one through
-the proving pipeline, write your own, or reject the buffer and send the
-planner back. The hotkey and the menu's `a` still hand loop-0 between human
+serial menu can do works the same: prove a lemma yourself (the verifiers
+check it before it goes into the shared DAG), send one through the proving
+pipeline, write your own, or reject the buffer and send the planner back. The hotkey and the menu's `a` still hand loop-0 between human
 and automatic mid-run; the other loops are always automatic. Quitting from
 the menu stops the whole run, not just
 loop-0 — the other loops' in-flight lemmas go into the checkpoint and resume
@@ -648,6 +689,23 @@ controlled comparison — results are entangled from the first shared lemma.
 `dag-<backend>-<model>.json` files — are no longer read, and the run banner
 says so; move one to `dags/<user_id>_dag.json` to carry its lemmas over.
 They will be suspended until `proofs verify` certifies them.)
+
+A DAG file is a JSON object: the owner's `user.id`, `user.name` and
+`user.email`, then `"lemmas"`, a map from each lemma_id to its node. A node
+stores exactly:
+
+| Field | Meaning |
+| --- | --- |
+| `statement` | The lemma's statement. |
+| `proof` | The proof now in the file. |
+| `cited_lemmas` | The lemmas the proof cites, as `{"user_id", "lemma_id"}` pairs. Each `user_id` is the cited lemma's **owner**: the name of the file it lives in. |
+| `cited_references` | The references the proof cites, by id. |
+| `last_prover_id` | Who wrote the proof now in the file. This is the owner for a lemma their own run proved, and the repairer for one that `proofs repair` re-proved in someone else's file. |
+| `proved_at` | When that proof was written (the lemma window's recency). |
+
+A lemma's owner is never stored inside the node: it is the file's name,
+`<owner>_dag.json`. Its id is the node's key. Only `statement`, `proof` and
+the cited statements go into the [Merkle hash](#certificates-and-the-merkle-hash).
 
 Prompt files are looked up in the conjecture directory first, then in
 `agents/`, so a conjecture that needs a special prompt (e.g. a prover primed

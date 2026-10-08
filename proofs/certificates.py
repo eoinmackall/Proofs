@@ -30,8 +30,9 @@ fields in this order:
 
 user_id and lemma_id identify the lemma (a bare lemma_id is unique only
 within one user's file), the verifier is the user_id of the person who
-performed the verification, and model is the name of the verifier/model
-that did it — empty for a human acceptance, which is not a model. A user
+performed the verification, and model is the name of the verifier model
+that did it (an empty model is a human acceptance, which older versions of
+the menu could record; none is written now). A user
 writes only their own certificate file: the file is named for the verifier,
 the user whose run issued the certificate, never for the lemma's owner, so
 a certificate for another user's lemma still lands in the verifier's own
@@ -49,10 +50,13 @@ certificate and gets its own line.
 
 Validity is not stored, it is checked: a certificate is valid only if its
 hash matches the lemma's current Merkle hash (see merkle.py), recomputed
-from the DAG and references.md as they stand now. The hash covers the
-lemma's statement and proof and the hashes of everything it cites, so any
-change to the lemma — or to a lemma it stands on, all the way down — breaks
-the match, and the certificate is known not to cover the proof any more.
+from the DAG and references.md as they stand now. The hash covers what
+the verifiers were shown — the lemma's statement and proof and the
+statements of everything it cites — so a change to the lemma, or to the
+statement of a result it cites, breaks the match, and the certificate is
+known not to cover the proof any more. A new proof of a cited lemma under
+the same statement does not: whether the ground is sound is suspension's
+question, not the certificate's (see suspension.py).
 This module records and compares hashes; computing the "current" one is the
 caller's job (merkle.Merkle over the DAG and the references collection).
 
