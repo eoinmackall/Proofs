@@ -1149,6 +1149,21 @@ def _user_header() -> Dict[str, str]:
     }
 
 
+def _require_owner(paths: "workspace.RunPaths", user_id: str, parser) -> None:
+    """Refuse a command that writes the user's own files — the DAG file,
+    the certificate file — when those files carry another person's name
+    and email (workspace.owner_conflict): user.id is not unique, and a
+    second person under the same id would write into the first's files."""
+    try:
+        workspace.check_owner(
+            paths, user_id,
+            config.get(config.USER_NAME_KEY) or "",
+            config.get(config.USER_EMAIL_KEY) or "",
+        )
+    except workspace.OwnerConflict as e:
+        parser.error(str(e))
+
+
 def _write_user_file(data: Dict[str, Any]) -> None:
     """Whole-file write of the current user's DAG file: temp file beside it,
     then os.replace, the checkpoint's way. The parallel loops read the DAG
@@ -1806,6 +1821,7 @@ def _verify_session(
         paths = workspace.resolve(conjecture_dir, user_id)
     except workspace.ConjectureNotFound as e:
         parser.error(str(e))
+    _require_owner(paths, user_id, parser)
     CONJECTURE_FILE = str(paths.conjecture)
     CONJECTURE_ROOT = str(paths.root)
     DAGS_DIR = str(paths.dags_dir)
@@ -2402,6 +2418,7 @@ def prune_entry(
         paths = workspace.resolve(dir, user_id)
     except workspace.ConjectureNotFound as e:
         parser.error(str(e))
+    _require_owner(paths, user_id, parser)
     CONJECTURE_ROOT = str(paths.root)
     DAGS_DIR = str(paths.dags_dir)
     DAG_FILE = str(paths.dag)
@@ -7567,6 +7584,7 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     except workspace.ConjectureNotFound as e:
         parser.error(str(e))
         return  # unreachable; parser.error exits, but keeps type checkers calm
+    _require_owner(paths, USER, parser)
 
     CONJECTURE_FILE = str(paths.conjecture)
     CONJECTURE_ROOT = str(paths.root)

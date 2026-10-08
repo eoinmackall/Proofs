@@ -355,3 +355,100 @@ def describe(paths: RunPaths) -> str:
             f"  local prompt overrides: {', '.join(paths.overridden_prompts)}"
         )
     return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
+# Ownership: whether the run's user is the user who owns the files its
+# user_id names.
+# ----------------------------------------------------------------------------
+# user.id names a user's files and nothing enforces that it is unique: two
+# people who pick the same id would write one DAG file and one certificate
+# file between them, each run rewriting the header with its own name and
+# email. One person on two machines is fine — same id, same email — so the
+# identity stamped at the top of the files (see config.py) is the test:
+# email decides when the file records one, name when it records none, and a
+# file that records neither (or has no header, from before headers) is
+# taken as the run's.
+
+class OwnerConflict(Exception):
+    """The user's files carry another person's identity."""
+
+
+def _stored_identity(path: Path) -> Optional[Dict[str, str]]:
+    """The identity header of a user's DAG file (top-level keys) or
+    certificate file (first line), or None when there is none to read."""
+    if not path.is_file():
+        return None
+    try:
+        if path.suffix == ".jsonl":
+            with open(path, encoding="utf-8") as f:
+                data = json.loads(f.readline() or "null")
+            if not certificates.is_header(data):
+                return None
+        else:
+            data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None  # unreadable: the writers report it themselves
+    if not isinstance(data, dict):
+        return None
+    return {
+        k: str(data.get(k) or "").strip()
+        for k in (certificates.USER_NAME_KEY, certificates.USER_EMAIL_KEY)
+    }
+
+
+def owner_files(root: Path, user_id: str) -> List[Path]:
+    """The files user_id names in the conjecture at root, the ones that
+    carry its owner's identity: dags/<user_id>_dag.json and
+    certificates/<user_id>.jsonl."""
+    return [
+        root / DAGS_DIRNAME / (user_id + USER_DAG_SUFFIX),
+        certificates.file_for(root, user_id),
+    ]
+
+
+def owner_conflict(
+    root: Path, user_id: str, name: str, email: str
+) -> Optional[str]:
+    """Why the user with this name and email may not write user_id's files
+    in the conjecture at root, or None when they may.
+
+    Emails are compared ignoring case and surrounding space. A file that
+    records an email conflicts with a config that holds a different one, or
+    none — an unset email cannot show it is the same person. A file that
+    records only a name conflicts with a different name."""
+    name, email = name.strip(), email.strip()
+    for path in owner_files(root, user_id):
+        stored = _stored_identity(path)
+        if stored is None:
+            continue
+        s_name = stored[certificates.USER_NAME_KEY]
+        s_email = stored[certificates.USER_EMAIL_KEY]
+        if s_email:
+            if s_email.lower() == email.lower():
+                continue
+            mine = f"user.email {email!r}" if email else "no user.email"
+            theirs = f"user.email {s_email!r}"
+        elif s_name and name and s_name != name:
+            mine, theirs = f"user.name {name!r}", f"user.name {s_name!r}"
+        else:
+            continue
+        rel = path.relative_to(root)
+        return (
+            f"user.id {user_id!r} is already taken in {root.name}: "
+            f"{rel} belongs to {s_name or 'someone'} ({theirs}), and your "
+            f"config has {mine}. Each person needs their own user.id — set "
+            f"one with proofs config --global user.id ID. If that file is "
+            f"yours under an old name or email, set yours to match (proofs "
+            f"config --global user.email ...), or edit the user.name and "
+            f"user.email at the top of {user_id}{USER_DAG_SUFFIX} and on the "
+            f"first line of {user_id}.jsonl."
+        )
+    return None
+
+
+def check_owner(paths: RunPaths, user_id: str, name: str, email: str) -> None:
+    """Raise OwnerConflict when owner_conflict finds one."""
+    reason = owner_conflict(paths.root, user_id, name, email)
+    if reason is not None:
+        raise OwnerConflict(reason)

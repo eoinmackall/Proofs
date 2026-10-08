@@ -277,6 +277,18 @@ it as it stands when it writes another user's file (the repair's one
 cross-user write), since it does not hold that user's name and email. The
 certificate's readers skip the line; it names no lemma.
 
+The stamp is also how proofs tells the owner of a `user.id` apart from
+someone else who picked the same one. A `user.id` is not registered
+anywhere, so `proofs run`, `verify`, `repair` and `prune` check the
+`user.email` stamped on the user's DAG and certificate files against the
+config's (ignoring case; the `user.name` is compared when a file records no
+email), and refuse to run when they differ — or when the file records an
+email and the config holds none. One person on several machines, with the
+same `user.id` and `user.email` everywhere, passes. `proofs config` warns
+when a change it just made clashes with a conjecture in the current
+checkout. To move your own files to a new email, set the new one and edit
+the stamp at the top of both files to match.
+
 ```sh
 proofs run conjectures/algebra_example
 proofs run conjectures/algebra_example --model Qwen3.5-122B-Q4_K_M

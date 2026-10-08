@@ -427,6 +427,25 @@ def _config_command(
         config.set(args.key, args.value)  # an empty value unsets
     except ValueError as e:
         parser.error(str(e))
+    _warn_owner_conflicts()
+
+
+def _warn_owner_conflicts(project_root: Path = Path(".")) -> None:
+    """After an identity key is set, warn about every conjecture under
+    project_root whose files under the config's user.id carry another
+    person's name and email (workspace.owner_conflict). A warning, not an
+    error: the config is global and this checkout is only one place the id
+    is used; the commands that write the files refuse on their own."""
+    uid = config.get(config.USER_ID_KEY)
+    if uid is None:
+        return
+    name = config.get(config.USER_NAME_KEY) or ""
+    email = config.get(config.USER_EMAIL_KEY) or ""
+    for conj in workspace.available(project_root):
+        root = project_root / workspace.CONJECTURES_ROOT / conj
+        reason = workspace.owner_conflict(root, uid, name, email)
+        if reason is not None:
+            print(f"proofs: warning: {reason}", file=sys.stderr)
 
 
 def _cmd_new(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
