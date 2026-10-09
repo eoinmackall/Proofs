@@ -437,12 +437,14 @@ def owner_conflict(
         return (
             f"user.id {user_id!r} is already taken in {root.name}: "
             f"{rel} belongs to {s_name or 'someone'} ({theirs}), and your "
-            f"config has {mine}. Each person needs their own user.id — set "
-            f"one with proofs config --global user.id ID. If that file is "
-            f"yours under an old name or email, set yours to match (proofs "
-            f"config --global user.email ...), or edit the user.name and "
-            f"user.email at the top of {user_id}{USER_DAG_SUFFIX} and on the "
-            f"first line of {user_id}.jsonl."
+            f"config has {mine}.\n"
+            f"Each person needs their own user.id — set one with "
+            f"proofs config --global user.id ID.\n"
+            f"If that file is yours under an old name or email, set yours to "
+            f"match (proofs config --global user.email ...), or edit the "
+            f"user.name and user.email at the top of "
+            f"{user_id}{USER_DAG_SUFFIX} and on the first line of "
+            f"{user_id}.jsonl."
         )
     return None
 
