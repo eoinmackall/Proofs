@@ -33,6 +33,21 @@ succeeded. Each lemma must stand entirely on its own: never assume a sibling
 candidate has been proved, and never make one candidate a step towards
 another, because the loops may take them in any order.
 
+What a statement is: a mathematical proposition and nothing else. It is
+stored permanently and cited by later proofs.
+- Its form is "Let ... (the objects and hypotheses). Then ... (one
+  conclusion)." An "if and only if" counts as one conclusion; several
+  independent claims do not, and belong in separate candidates.
+- It says what is true, never how to prove it: no instruction to the
+  prover ("prove", "show", "use", "without reproving"), no proof route, no
+  hint, no history, no title, no commentary, no words in capitals for
+  emphasis.
+- It does not cite lemmas or references by id; a hypothesis it needs is
+  written out in mathematical terms.
+- It defines only the notation its conclusion uses, and is about as long as
+  a lemma in a research paper (as a guide, under roughly 120 words).
+Some proved lemmas may not follow this form; do not imitate them.
+
 Rules:
 - Every id must be unique within the batch and must not collide with any id
   already known: the proved lemmas or the possible-lemma list. Continue the

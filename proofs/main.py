@@ -2149,6 +2149,7 @@ def repair_entry(
                 "feedback": (
                     [f"Verifier: {justification}"] if justification else []
                 ),
+                "guidance": "",
                 "attempt_notes": [],
                 "last_proof": "",
             }
@@ -2917,6 +2918,7 @@ def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
                 "target": clean_target,
                 "attempt": attempt,
                 "feedback": [n for n in (raw.get("feedback") or []) if isinstance(n, str)],
+                "guidance": str(raw.get("guidance") or ""),
                 "attempt_notes": [n for n in (raw.get("attempt_notes") or []) if isinstance(n, str)],
                 "last_proof": str(raw.get("last_proof") or ""),
             }
@@ -2967,6 +2969,7 @@ def _validate_in_flight(raw: Any) -> Optional[Dict[str, Any]]:
         "target": clean_target,
         "attempt": attempt,
         "feedback": [n for n in (raw.get("feedback") or []) if isinstance(n, str)],
+        "guidance": str(raw.get("guidance") or ""),
         "attempt_notes": [
             n for n in (raw.get("attempt_notes") or []) if isinstance(n, str)
         ],
@@ -4793,14 +4796,21 @@ def run_proof_loop(
         }
     # The prover sees only the most recent failure: feedback is rebuilt
     # after each rejected round, so a retry reads the last verdict and
-    # diagnosis, not the history of every earlier attempt.
+    # diagnosis, not the history of every earlier attempt. guidance is the
+    # exception: the reviser's diagnosis that came with the current
+    # statement (a new lemma or a revised one) — the route, the useful
+    # lemmas, the mistakes to avoid — kept for every prover round on that
+    # statement, replaced when the reviser sets another, and dropped with
+    # the loop: it is never stored with the lemma.
     if resuming:
         feedback: List[str] = list(in_flight.get("feedback") or [])
+        guidance = str(in_flight.get("guidance") or "")
         attempt_notes: List[str] = list(in_flight.get("attempt_notes") or [])
         first_attempt = in_flight["attempt"]
         last_proof = str(in_flight.get("last_proof") or "")
     else:
         feedback: List[str] = []
+        guidance = ""
         attempt_notes: List[str] = []
         first_attempt = 1
         last_proof = ""
@@ -4841,6 +4851,7 @@ def run_proof_loop(
             "target": target,
             "attempt": attempt,
             "feedback": feedback,
+            "guidance": guidance,
             "attempt_notes": attempt_notes,
             "last_proof": last_proof,
         }
@@ -4864,6 +4875,12 @@ def run_proof_loop(
             f"{json.dumps(prover_context(dag, suspended), indent=2)}"
             f"{reference_block}\n\n"
             f"Lemma to prove:\n{json.dumps(target, indent=2)}\n"
+            + (
+                f"\nReviser's guidance for this statement (it holds for "
+                f"every attempt at it):\n{guidance}\n"
+                if guidance
+                else ""
+            )
             + (
                 f"\nFeedback from the previous attempt "
                 f"(the most recent rejection only):\n"
@@ -4943,8 +4960,12 @@ def run_proof_loop(
                 f"the reviser is choosing a smaller lemma or a corrected "
                 f"statement from the partial work."
             ]
-            if diagnosis:
-                overflow_feedback.append(f"Reviser's diagnosis: {diagnosis}")
+            # The diagnosis rides along only where the reviser's choice
+            # takes it: the guidance of a new or revised statement, or the
+            # notes of a lemma given up on.
+            diagnosis_note = (
+                [f"Reviser's diagnosis: {diagnosis}"] if diagnosis else []
+            )
             # The id test reads the DAG fresh: the round's snapshot is
             # stale in a parallel run, and a decomposition onto an
             # already-proved id would burn rounds that add_lemma's
@@ -4974,6 +4995,7 @@ def run_proof_loop(
                     f"{lemma_id} instead."
                 ]
                 feedback = []
+                guidance = diagnosis
                 last_proof = ""
                 attempt = 1
                 log(
@@ -5001,7 +5023,8 @@ def run_proof_loop(
                     f"Revised statement proposed: {new_stmt}"
                 )
                 feedback = overflow_feedback
-                attempt_notes.extend(overflow_feedback)
+                guidance = diagnosis
+                attempt_notes.extend(overflow_feedback + diagnosis_note)
                 attempt += 1
                 log(
                     f"Reviser revised the lemma after the overflow; the "
@@ -5016,7 +5039,7 @@ def run_proof_loop(
                     "will decompose.",
                     verbose,
                 )
-                attempt_notes.extend(overflow_feedback)
+                attempt_notes.extend(overflow_feedback + diagnosis_note)
                 attempt_notes.append(
                     "Lemma too large: the prover exhausted its context "
                     "window and the reviser could neither split it further "
@@ -5030,7 +5053,7 @@ def run_proof_loop(
                     "allowed here.",
                     verbose,
                 )
-                attempt_notes.extend(overflow_feedback)
+                attempt_notes.extend(overflow_feedback + diagnosis_note)
                 attempt_notes.append(
                     "Lemma too large: the prover exhausted its context "
                     "window and the reviser could not revise its statement "
@@ -5329,8 +5352,12 @@ def run_proof_loop(
         new_stmt = str(revision_res.get("new_statement") or "").strip()
 
         feedback = [f"Verifier: {reject_just}"]
-        if diagnosis:
-            feedback.append(f"Reviser's diagnosis: {diagnosis}")
+        # A kept statement's diagnosis is the fix for this rejection and
+        # goes with it, for the next round only; a new or revised
+        # statement's diagnosis becomes its guidance instead (below).
+        diagnosis_note = (
+            [f"Reviser's diagnosis: {diagnosis}"] if diagnosis else []
+        )
 
         # The id test reads the DAG fresh: the round's snapshot is stale
         # in a parallel run, and a decomposition onto an already-proved id
@@ -5359,8 +5386,10 @@ def run_proof_loop(
                 f"target was judged too hard to prove as stated)."
             ]
             # A fresh lemma has no rejection of its own, so the prover
-            # starts clean rather than inheriting the old proof's verdict.
+            # starts clean rather than inheriting the old proof's verdict;
+            # what the reviser learned from it comes as guidance.
             feedback = []
+            guidance = diagnosis
             last_proof = ""
             attempt = 1
             log(
@@ -5388,6 +5417,9 @@ def run_proof_loop(
                 verbose,
             )
             feedback.append(f"Revised statement proposed: {new_stmt}")
+            guidance = diagnosis
+            attempt_notes.extend(diagnosis_note)
+            diagnosis_note = []
         elif action == "revise_statement":
             log(
                 "Reviser flagged a statement revision but gave none "
@@ -5418,6 +5450,9 @@ def run_proof_loop(
                 "the verdict as feedback.",
                 verbose,
             )
+        # The statement stands (a revision empties diagnosis_note above),
+        # so the diagnosis is the fix.
+        feedback.extend(diagnosis_note)
         attempt_notes.extend(feedback)
         attempt += 1
         # Loop continues: the next prover round works on `target`, with

@@ -34,6 +34,10 @@ Rules:
 - Justify every step; show all computations explicitly.
 - Cover all cases and edge conditions; do not say "clearly" or "obviously" in place of an argument.
 - If feedback from previously rejected proofs of this lemma is provided, explicitly address and fix every issue it raises.
+- If "Reviser's guidance" is provided, it comes from the agent that chose or
+  revised this statement after an earlier failed proof: a suggested route,
+  lemmas likely to be useful, and mistakes to avoid. Weigh it, but it is
+  advice, not part of the statement; you still prove exactly the statement.
 - "cited_lemmas" must list every provided lemma your proof actually relies
   on, and nothing else, each as the object {"user_id": "...",
   "lemma_id": "..."} copied from its entry; "cited_references" must list
