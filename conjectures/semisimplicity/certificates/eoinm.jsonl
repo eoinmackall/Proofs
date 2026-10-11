@@ -1,4 +1,4 @@
-{"user.id":"eoinm","user.name":"Eoin Mackall","user.email":"eoinmackall@gmail.com"}
+{"user.id":"eoinm","user.name":"Eoin  Mackall","user.email":"eoinmackall@gmail.com"}
 {"user_id":"eoinm","lemma_id":"lemma_5","hash":"69b8aa832adb9b063d1375ce853cc3f9105fa68478b0f5e4604c25d640d70140","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-07T03:39:32Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_4","hash":"947e6ed3f4d38e6ca22ac1171799faa9d14e94d8c01f0cac20476c18294d2f31","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-07T03:53:14Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_8","hash":"6f2af4aef0d7ea3138b57b75bbe546b6d306eae4e8972f76c6ca0095ba4f2354","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-07T03:54:46Z","count":1}
@@ -28,3 +28,27 @@
 {"user_id":"eoinm","lemma_id":"lemma_36","hash":"4943877c7d616bc2466140c258f9d15bb4316596d6eb4a531cbee2a163149eea","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-08T05:19:45Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_39","hash":"53c82405ce9350f51f96f8796ee7b85b6046f3e5b0c19683442ef4d9b6a082d3","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-08T17:06:30Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_44","hash":"227aeefe7239c24a76573e876d923a0222e66c98af0efb2431b90cb2ae8ba399","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-08T17:39:17Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_48","hash":"1e2c87939323cc5b205d876126d78f0599c40ef1741a257de6e612a2b3ab0c26","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T06:05:16Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_47","hash":"5ac0bb6b8072527c6a5936517ee151f6dd3e53f413b2f72da4bd2f2c7ebcc99d","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T06:29:32Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_52","hash":"2ded057103ab500f0619c120058f16b751079d387abef57cc3025c9101deaccc","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T06:36:50Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_53","hash":"2bdecc11482cf663a1d9eb77fbbcb3d815fdc03309c8cfd1c5cbde7a7a8f5800","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T07:02:36Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_45_finite_frob","hash":"bdf8fca0c556909efb97ba7c2529c516906efa69fc34ba77f23a595f0f44b144","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T07:41:18Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_49","hash":"7b31bbc2da339487a889b4ae16454b87726d3eb68d60830c9d6a2fa8691b9c23","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T08:07:20Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_55","hash":"4f73f546f5fedf44eabce3accf3bf20dfa0af824dcac23d46461655b4dd77e48","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T09:16:24Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_56","hash":"a36479e42dcfcea8bc1510b3ac3cd0b3cd89d68edc18b32387687c11cafe6b93","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T10:03:42Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_55_2","hash":"45917fca5a58ca55a241c517c133ce7cd96cd58d3d7cc82eb1b69106964d6efb","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T10:42:55Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_60","hash":"afe2411473931522d722ed9cedc61e4f9d30b38528546d8d3f688f4cfc68945c","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T11:47:16Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_59","hash":"c8c9b2e9aff00d050ff29bf1c26ee751a34203ccc204c766a8362055ab981049","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T11:52:07Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_64","hash":"d589488ed6b44511ae6263122f34136a1e8834ca23f7bd80032a89bd2c57c55b","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T15:12:29Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_65","hash":"869cdd0cf12a445b9b5615b5920140fcc7e40419cf574b8ea033c5d77955547e","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T15:34:51Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_63","hash":"2ff819c7159dc2aef716ffe252af3dc3240a5604b16af1f95e86c811661ec2e8","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T16:01:52Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_50","hash":"fed918b71d2b702fdf19dc32c97271b734744d610777418e90215a568dfc8dd0","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T18:38:21Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_69","hash":"4789554a80af0430236a7c498d07776a8427172eed6fe060153a8e0e32f414a6","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T19:27:30Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_68","hash":"e4bc5a2652d7501b54336103804340f77b8bbabc21c59f1dac4d28305ce500d6","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T20:13:10Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_62","hash":"c9d8a761c1a1f536d19306e539a8fde8b353121ded67ed826dbdf708f9d1adb4","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T20:59:55Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_72","hash":"e1a0c7152901bf0a41891b617faeb912ddad43f6a3f576442a0fbce5b9b69a65","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T21:33:42Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_73","hash":"72e5fd92c0452366c6703a54f301c028712771d7b50d0a34c8d36cb7af521965","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T22:23:52Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_74","hash":"62294bc6ca61d282307c713e9d4069054b2c1e2778625dd534606c0cba91a82c","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-09T23:30:04Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_66","hash":"04972ee5d467cb55bea479cbcb0c5652d36c6a27a42f6fa4a2b0cae63c90d8a3","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-10T02:35:06Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_71","hash":"57011293ec31b1074969ea817f8e439e2c9dd0a2c5e8f1313982294f82ec0ace","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-10T06:03:40Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_76","hash":"baf1694ceed5ed640af47be78a4973a67ccb9d99d2783af485c91f77d0e280dc","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-10T07:16:27Z","count":1}
