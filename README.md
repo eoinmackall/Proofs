@@ -27,7 +27,7 @@ and a lemma generator that work for all the loops at once — see
 Each iteration:
 
 1. **Planner** (`planner.md`) reads the conjecture, the lemmas proved so far,
-   and any previously rejected attempts, and proposes
+   and the most recently rejected lemmas, and proposes
    `PLANNER_CANDIDATES` (5) candidate lemmas, best-first, working either
    toward a proof of the conjecture or — where it looks false — toward a
    concrete counterexample to it.
@@ -342,6 +342,7 @@ server options.
 | `--backend {auto,llamacpp,openai}` | `auto` | Which dialect of the OpenAI-compatible endpoint to speak: the full llama.cpp option set (with thinking suppressed for schema calls), or the standard OpenAI set. `auto` takes the probe's answer; the other two force it, for when the probe can't see the real server. |
 | `--max-iterations N` | 10 | Loop iterations before giving up. |
 | `--max-proof-attempts N` | 3 | Prover rounds per lemma before it is given up. |
+| `--max-rejected-lemmas N` | 4 | How many of the most recently rejected lemmas — ones that went through every prover round without being proved — the planning agents are shown, by statement only. `0` shows none. |
 | `--lemmas-all N` | 25 | How many of the most recently proved lemmas (anyone's) the agents see in full; every other proved lemma is listed by `user_id` and `lemma_id` only. `-1` shows all. Also taken by `proofs repair`. |
 | `--my-lemmas N` | 25 | How many of your own most recently proved lemmas the agents also see in full, overlap with `--lemmas-all` shown once. `-1` shows all. Also taken by `proofs repair`. |
 | `--lemmas-common K` | 10 | How many *common lemmas* the agents also see, statement only: the lemmas outside the two recency windows that the shown lemmas cite most often (direct citations only). Ties are broken in a random order fixed for the run. A lemma nothing shown cites never ranks. `-1` shows every cited lemma. Also taken by `proofs repair`. |
@@ -580,8 +581,8 @@ land on the same id (both decompose to it, or one decomposes to it while a
 sibling proves the buffer's copy of it). The commit to the DAG checks the id
 under the DAG lock and the first proof stands under the id; a colliding
 proof is never dropped — it is committed under a fresh non-colliding id
-(`P1_2`, `P1_3`, ...), and the rename is recorded on the shared reject list
-so the planner can see that the two proofs may state different things.
+(`P1_2`, `P1_3`, ...), and the rename is logged; the planner sees both
+lemmas in the DAG.
 
 ### The planner and the generator
 
@@ -731,7 +732,8 @@ Ctrl-C lands while an accepted lemma is being committed and certified, the
 run finishes that step first (press Ctrl-C again to force), so a lemma is
 never left committed without its certificate. The checkpoint records what a
 cancelled run would otherwise lose: where the iteration budget stood, the
-planner's reject list (the `failed_attempts` the next planner call reads),
+planner's reject list (`rejected_lemmas`: the statements of the last
+`--max-rejected-lemmas` lemmas that spent every prover round unproved),
 and, if the cancellation landed mid-proof, the lemma in flight, which prover
 round it was on, and the feedback the earlier rounds of that attempt already
 produced. The file is written at the safe boundaries — the top of each

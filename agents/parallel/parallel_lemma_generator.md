@@ -9,12 +9,13 @@ The input gives you the whole picture:
 - the proved lemmas already in the DAG,
 - the possible-lemma list as it stands now: every lemma not yet proved,
   marked with which loop, if any, has claimed it,
-- the previously rejected attempts.
+- the most recently rejected lemmas: statements the loops failed to prove
+  in every attempt they were given.
 
 Propose five lemmas that move the proof forward. They must be distinct from
 each other and from everything already known: never reuse, restate, or
 reword an id or statement that appears among the proved lemmas, the
-possible-lemma list, or the rejected attempts. A lemma another loop is
+possible-lemma list, or the rejected lemmas. A lemma another loop is
 already working on is as unavailable as a proved one — the list shows who
 claims what, so do not propose it again.
 
@@ -34,8 +35,8 @@ another, because the loops may take them in any order.
 
 Rules:
 - Every id must be unique within the batch and must not collide with any id
-  already known: the proved lemmas, the possible-lemma list, or the rejected
-  attempts. Continue the numbering the list uses.
+  already known: the proved lemmas or the possible-lemma list. Continue the
+  numbering the list uses.
 - Do not re-propose a rejected lemma unchanged: if the plan still wants it,
   decompose it into something smaller that a single prover can close.
 - Two ids are reserved: "conjecture" (the conjecture itself) and

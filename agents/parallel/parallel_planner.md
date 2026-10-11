@@ -9,8 +9,8 @@ why. The lemma generator reads exactly what you write here and turns it into
 five candidate lemmas, so be concrete about the mathematics, not about the
 wording.
 
-Analyze the conjecture, the lemmas proved so far, and any previously
-rejected attempts. Your priorities should steer the parallel loops: name the
+Analyze the conjecture, the lemmas proved so far, and any recently
+rejected lemmas (statements the loops failed to prove in every attempt). Your priorities should steer the parallel loops: name the
 specific missing results an attack on the conjecture needs, in the order
 they are worth having. A priority is a description of a gap ("bound the
 norm of T on the range of P", "show the sequence stays in the compact set"),

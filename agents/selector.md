@@ -18,9 +18,9 @@ Weigh each candidate on:
 - Size: a statement that is too broad or too strong is harder to prove and
   easier to get subtly wrong than one a careful referee can check. A smaller
   lemma that unblocks the next steps can beat a bigger one.
-- History: a candidate similar to one in the rejected-attempts list is
-  unlikely to succeed unchanged. Prefer a route the verifier has not already
-  found wanting.
+- History: a candidate similar to one of the rejected lemmas (statements
+  the prover failed to prove in every attempt it was given) is unlikely to
+  succeed unchanged. Prefer a route that has not already failed.
 - Value: among the candidates likely to succeed, prefer the one that best
   advances the planner's stated strategy.
 

@@ -31,7 +31,9 @@ Cancelling and resuming
 The run keeps a checkpoint, `dags/<user_id>_dag.checkpoint.json`, beside
 the user's DAG file it is building (it is per user, the way the DAG file
 is, and gitignored). It holds what the DAG files do not: the position of
-the iteration budget, the planner's reject list (`failed_attempts`), and —
+the iteration budget, the planner's reject list (`rejected_lemmas`: the
+statements of the last --max-rejected-lemmas lemmas that went through every
+prover round unproved), and —
 when the run is cancelled in the middle of a proof — the lemma that was in
 flight, with the target statement (the reviser may have revised it), the
 prover round it was on, the feedback that round was about to be given, and
@@ -43,7 +45,7 @@ the end of each iteration — and by the SIGINT handler itself on Ctrl-C,
 which writes the last safe boundary's state and exits 130; a second Ctrl-C
 force-exits. Re-running the same command resumes from the checkpoint:
 the budget continues where it stopped, the planner keeps seeing the same
-reject notes, and a lemma cancelled mid-proof goes straight back to the
+rejected lemmas, and a lemma cancelled mid-proof goes straight back to the
 prover for the interrupted round rather than through planning again (which
 is what makes a mid-proof Ctrl-C cost the interrupted call, not the whole
 iteration). An interrupted call is never restored — that one is re-run —
@@ -85,7 +87,8 @@ stated — from the shape of its last proof — is decomposed into a smaller
 lemma (a fresh id, a sub-statement the last proof left unjustified), which
 the prover then starts on with a fresh budget. The loop allows
 MAX_PROOF_ATTEMPTS prover rounds per lemma per iteration
-(--max-proof-attempts), then gives the lemma up and asks the planner again.
+(--max-proof-attempts), then gives the lemma up and asks the planner again;
+the statement it gave up on goes on the reject list the planner reads.
 
 When a call runs into the context wall
 --------------------------------------
@@ -402,6 +405,11 @@ VERIFIER_AGENTS = ("verifier_1.md", "verifier_2.md", "verifier_3.md")
 # How many prover rounds one iteration may spend on a lemma before giving it
 # up and re-planning.
 MAX_PROOF_ATTEMPTS = 3
+# How many rejected lemmas the planner is shown: the most recent ones, each
+# a lemma that went through every prover round without a proof the
+# verifiers accepted. Only their statements are kept — the reject list
+# steers the planner away from what failed, not through why it failed.
+MAX_REJECTED_LEMMAS = 4
 # Parallel mode: how many times a proof loop that crashed (an unexpected
 # exception, not a stop) is restarted in a row — the count resets whenever
 # the loop finishes a lemma — before it is given up for the run, and how
@@ -2169,8 +2177,6 @@ def repair_entry(
                 fresh_target=None,
                 on_round=lambda state: None,
                 on_proof=on_proof,
-                failed_attempts={},
-                failed_lock=threading.Lock(),
                 get_dag=load_dag,
                 toggle_hotkey=lambda: None,
                 allow_decomposition=False,
@@ -2706,7 +2712,7 @@ def export_entry(
 # the last boundary established, without reaching into run_loop's locals.
 _LIVE_STATE: Dict[str, Any] = {
     "iteration": None,
-    "failed_attempts": None,
+    "rejected_lemmas": None,
     "in_flight": None,
 }
 _sigint_count = 0
@@ -2743,7 +2749,7 @@ DAG_LOCK = threading.Lock()
 # The checkpoint-file lock, held by ParallelState.write_checkpoint() across
 # the whole snapshot-then-replace. In parallel mode every loop's claim
 # (begin_lemma), round boundary (set_in_flight), DAG commit (add_lemma) and
-# reject note (record_failure) rewrites the checkpoint, as does the SIGINT
+# rejection (record_rejection) rewrites the checkpoint, as does the SIGINT
 # handler's snapshot, so the writers are serialised as a unit: the slots
 # and the reject list snapshotted are the ones that land in the file, and
 # an older snapshot that snapshots first but replaces last can never land
@@ -2751,6 +2757,64 @@ DAG_LOCK = threading.Lock()
 # file is per writer and the swap is os.replace — so the lock is about
 # which snapshot wins, not about readers seeing a half-write.)
 CHECKPOINT_LOCK = threading.Lock()
+
+
+def note_rejection(
+    rejected: List[Dict[str, str]], lemma_id: str, statement: str
+) -> None:
+    """Put a lemma on the reject list, in place: most recent last, an
+    earlier entry with the same id or statement replaced, and the list cut
+    to the newest MAX_REJECTED_LEMMAS."""
+    rejected[:] = [
+        e for e in rejected
+        if e["id"] != lemma_id and e["statement"] != statement
+    ]
+    rejected.append({"id": lemma_id, "statement": statement})
+    excess = len(rejected) - MAX_REJECTED_LEMMAS
+    if excess > 0:
+        del rejected[:excess]
+
+
+def drop_rejection(rejected: List[Dict[str, str]], lemma_id: str) -> None:
+    """Take a lemma off the reject list, in place: it is proved now."""
+    rejected[:] = [e for e in rejected if e["id"] != lemma_id]
+
+
+def clean_rejected(raw: Any) -> List[Dict[str, str]]:
+    """A checkpoint's reject list, validated and cut to the cap. Anything
+    that is not an {"id", "statement"} entry is dropped — including the
+    older per-id notes format, which carried no statements to keep."""
+    out: List[Dict[str, str]] = []
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict):
+            continue
+        lid = str(e.get("id") or "").strip()
+        stmt = str(e.get("statement") or "").strip()
+        if lid and stmt:
+            note_rejection(out, lid, stmt)
+    return out
+
+
+def rejected_block(rejected: List[Dict[str, str]]) -> str:
+    """The reject list as the planning agents read it: the statements only."""
+    statements = [e["statement"] for e in rejected]
+    return (
+        f"Rejected lemmas (the most recent; each went through all "
+        f"{MAX_PROOF_ATTEMPTS} prover rounds without a proof the verifiers "
+        f"accepted — do not propose these again unchanged):\n"
+        + (json.dumps(statements, indent=2) if statements else "(none)")
+    )
+
+
+def replan_note(shown: List[Dict[str, Any]], notes: List[str]) -> str:
+    """The operator's 'replan' at the human menu, as the next planning call
+    reads it: the statements that were turned down, and why."""
+    statements = [str(c.get("statement") or "") for c in shown]
+    return (
+        "The operator turned down the last shortlist without trying it:\n"
+        f"{json.dumps(statements, indent=2)}\n"
+        "Operator's reason: " + (" ".join(notes) or "(none given)")
+    )
 
 
 def checkpoint_path_for(dag_path: str) -> str:
@@ -2767,7 +2831,7 @@ def checkpoint_path_for(dag_path: str) -> str:
 
 def save_checkpoint(
     iteration: int,
-    failed_attempts: Dict[str, List[str]],
+    rejected_lemmas: List[Dict[str, str]],
     in_flight: Optional[Dict[str, Any]],
     verbose: bool = True,
 ) -> None:
@@ -2786,7 +2850,7 @@ def save_checkpoint(
     data: Dict[str, Any] = {
         "version": 1,
         "iteration": int(iteration),
-        "failed_attempts": {k: list(v) for k, v in failed_attempts.items()},
+        "rejected_lemmas": [dict(e) for e in rejected_lemmas],
     }
     if in_flight is not None:
         data["in_flight"] = in_flight
@@ -2796,7 +2860,7 @@ def save_checkpoint(
 def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
     """Read and validate the checkpoint.
 
-    Returns {"iteration", "failed_attempts", "in_flight"}, or None when there
+    Returns {"iteration", "rejected_lemmas", "in_flight"}, or None when there
     is no usable checkpoint. A checkpoint that cannot be trusted is discarded
     rather than fatal: the DAG is the permanent record, and the checkpoint
     only saves re-paying for a cancelled run's completed work. Corrupt files
@@ -2837,14 +2901,7 @@ def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
             verbose)
         discard_checkpoint()
         return None
-    failed_raw = data.get("failed_attempts")
-    failed_attempts: Dict[str, List[str]] = {}
-    if isinstance(failed_raw, dict):
-        failed_attempts = {
-            k: [n for n in v if isinstance(n, str)]
-            for k, v in failed_raw.items()
-            if isinstance(v, list)
-        }
+    rejected_lemmas = clean_rejected(data.get("rejected_lemmas"))
     in_flight: Optional[Dict[str, Any]] = None
     raw = data.get("in_flight")
     if isinstance(raw, dict):
@@ -2871,7 +2928,7 @@ def load_checkpoint(verbose: bool = True) -> Optional[Dict[str, Any]]:
             )
     return {
         "iteration": iteration,
-        "failed_attempts": failed_attempts,
+        "rejected_lemmas": rejected_lemmas,
         "in_flight": in_flight,
     }
 
@@ -2881,7 +2938,7 @@ def _validate_in_flight(raw: Any) -> Optional[Dict[str, Any]]:
 
     The shape the serial and parallel checkpoints share: the lemma id, the
     target as the reviser last left it, the prover round to re-run, the
-    feedback and reject notes it carries, and the last proof of it (the one
+    feedback and attempt notes it carries, and the last proof of it (the one
     just rejected — what the reviser judges its difficulty by). The claim
     id is kept beside the lemma id for the same reason the engine does:
     a decomposition may have moved the prover off the claimed id, and the
@@ -2923,7 +2980,7 @@ def load_parallel_checkpoint(
     """Read and validate the version-2 (parallel-mode) checkpoint.
 
     Returns {"loops": {loop_id: {"in_flight", "iterations_used"}},
-    "failed_attempts"}, or None when there is nothing to resume. A
+    "rejected_lemmas"}, or None when there is nothing to resume. A
     checkpoint written by a run with a different set of loops is ignored
     rather than half-applied: per-loop slots are not transferable between
     runs of different shape. As with the serial loader, a file that is not
@@ -2947,16 +3004,7 @@ def load_parallel_checkpoint(
         log(f"{os.path.basename(CHECKPOINT_FILE)} was written by a run "
             f"with a different set of loops; ignoring it.", verbose)
         return None
-    failed_raw = data.get("failed_attempts")
-    if not isinstance(failed_raw, dict):
-        log(f"{os.path.basename(CHECKPOINT_FILE)} has no usable "
-            f"failed-attempts section; ignoring it.", verbose)
-        return None
-    failed_attempts: Dict[str, List[str]] = {
-        k: [n for n in v if isinstance(n, str)]
-        for k, v in failed_raw.items()
-        if isinstance(v, list)
-    }
+    rejected_lemmas = clean_rejected(data.get("rejected_lemmas"))
     loops: Dict[str, Dict[str, Any]] = {}
     for lid in loop_ids:
         raw = raw_loops.get(lid)
@@ -2970,7 +3018,7 @@ def load_parallel_checkpoint(
         if not isinstance(iterations_used, int) or iterations_used < 0:
             iterations_used = 0
         loops[lid] = {"in_flight": in_flight, "iterations_used": iterations_used}
-    return {"loops": loops, "failed_attempts": failed_attempts}
+    return {"loops": loops, "rejected_lemmas": rejected_lemmas}
 
 
 def _atomic_write_checkpoint_file(data: Dict[str, Any], verbose: bool) -> None:
@@ -3126,12 +3174,12 @@ def _interrupt_serial() -> None:
     state = _LIVE_STATE
     if (
         state["iteration"] is not None
-        and state["failed_attempts"] is not None
+        and state["rejected_lemmas"] is not None
         and CHECKPOINT_FILE
     ):
         save_checkpoint(
             state["iteration"],
-            state["failed_attempts"],
+            state["rejected_lemmas"],
             state["in_flight"],
             verbose=False,
         )
@@ -4446,7 +4494,7 @@ def select_lemma(
     dag: Dict[str, Any],
     conjecture: str,
     plan_summary: str,
-    failed_attempts: Dict[str, List[str]],
+    rejected_lemmas: List[Dict[str, str]],
     verbose: bool,
     proposer: str = "the planner",
     suspended: Optional[Set[Tuple[str, str]]] = None,
@@ -4466,9 +4514,7 @@ def select_lemma(
         f"Conjecture:\n{conjecture}\n\n"
         f"Planner's strategy summary:\n{plan_summary or '(none)'}\n\n"
         f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}\n\n"
-        f"Previously rejected attempts (routes the prover and the verifiers "
-        f"have already found wanting):\n"
-        f"{json.dumps(failed_attempts, indent=2)}\n\n"
+        f"{rejected_block(rejected_lemmas)}\n\n"
         f"Candidate lemmas, in the order {proposer} offered them. Exactly "
         f"one will be sent to the prover; choose from these only:\n"
         f"{json.dumps(usable, indent=2)}"
@@ -4655,8 +4701,6 @@ def run_proof_loop(
     fresh_target: Optional[Dict[str, Any]],
     on_round,
     on_proof,
-    failed_attempts: Dict[str, List[str]],
-    failed_lock: "threading.Lock",
     get_dag,
     toggle_hotkey,
     should_stop=None,
@@ -4696,10 +4740,9 @@ def run_proof_loop(
     verifier checks, and with the node's hash as the verifiers checked it
     (_verified_hash), which the caller hands to commit_lemma_to_dag (the
     caller certifies and commits it and returns the id it committed under — the lemma's
-    id, unless that id was already taken and the commit renamed it). Every failed_attempts mutation happens under
-    `failed_lock` — a formality in the serial run, where the lock is never
-    contended, and what keeps the shared reject list coherent in a parallel
-    one.
+    id, unless that id was already taken and the commit renamed it). The
+    reject list is the caller's too: the engine only reports, in
+    "exhausted", whether the lemma it ended on spent every prover round.
 
     The suspension (see suspension.py) is recomputed at every round from
     the DAG get_dag() returns: the prover's context and the reviser's
@@ -4711,14 +4754,18 @@ def run_proof_loop(
     node suspended in some file is lifted by proofs verify or proofs
     repair re-accepting it.
 
-    Returns {"proved", "lemma_id", "committed_id", "claimed_id", "target",
-    "proof", "attempt_notes"}. committed_id is the id the proof was
+    Returns {"proved", "exhausted", "lemma_id", "committed_id",
+    "claimed_id", "target", "proof", "attempt_notes"}. exhausted is True
+    when the final target (after any revisions and decompositions) went
+    through all MAX_PROOF_ATTEMPTS prover rounds unproved — the one outcome
+    the caller puts on the reject list; a lemma given up early (an overflow
+    the reviser could not rescue) or stopped is not. committed_id is the id the proof was
     committed under (None when not proved); the caller's on_proof decides
     it. claimed_id is the id this claim started from: lemma_id is wherever
     the prover ended up, and a decomposition may have moved it, so the
     caller frees its buffer slot keyed on claimed_id, not lemma_id. The
-    caller records the final failure when not proved (from attempt_notes)
-    and clears its in-flight state; the engine leaves no other traces.
+    caller records the final target when exhausted and clears its
+    in-flight state; the engine leaves no other traces.
     """
     resuming = initial is not None
     in_flight = initial if initial is not None else {}
@@ -4746,9 +4793,7 @@ def run_proof_loop(
         }
     # The prover sees only the most recent failure: feedback is rebuilt
     # after each rejected round, so a retry reads the last verdict and
-    # diagnosis, not the history of every earlier attempt. That history
-    # is kept for the planner in failed_attempts — decomposing or
-    # rerouting is its job, not the prover's.
+    # diagnosis, not the history of every earlier attempt.
     if resuming:
         feedback: List[str] = list(in_flight.get("feedback") or [])
         attempt_notes: List[str] = list(in_flight.get("attempt_notes") or [])
@@ -4756,8 +4801,7 @@ def run_proof_loop(
         last_proof = str(in_flight.get("last_proof") or "")
     else:
         feedback: List[str] = []
-        with failed_lock:
-            attempt_notes: List[str] = list(failed_attempts.get(lemma_id, []))
+        attempt_notes: List[str] = []
         first_attempt = 1
         last_proof = ""
     proved = False
@@ -4769,6 +4813,7 @@ def run_proof_loop(
         if should_stop is not None and should_stop():
             return {
                 "proved": False,
+                "exhausted": False,
                 "lemma_id": lemma_id,
                 "committed_id": None,
                 "claimed_id": claimed_id,
@@ -4917,20 +4962,10 @@ def run_proof_loop(
                 and new_id not in lemma_id_set(get_dag())
             ):
                 # The reviser found a smaller lemma worth trying. Set the
-                # overflowing lemma aside (its history is recorded under its
-                # own id) and start the prover on the smaller lemma with a
-                # fresh budget and no inherited verdict.
+                # overflowing lemma aside and start the prover on the
+                # smaller lemma with a fresh budget and no inherited
+                # verdict.
                 old_id = lemma_id
-                with failed_lock:
-                    failed_attempts[old_id] = (
-                        list(attempt_notes)
-                        + list(overflow_feedback)
-                        + [
-                            f"Overflowed: {old_id} ran out of the prover's "
-                            f"context window; the reviser is instead trying "
-                            f"{new_id}."
-                        ]
-                    )
                 lemma_id = new_id
                 target = {"id": lemma_id, "statement": new_stmt}
                 attempt_notes = [
@@ -5200,18 +5235,12 @@ def run_proof_loop(
 
         if reject_just is None:
             # ---------------- Step 4: DAG update ----------------
-            # All three verifier checks accepted the same proof. The
-            # reject notes are cleared before the commit so that a commit
-            # renamed under a taken id (on_proof returns a different id)
-            # can still record its note under the original id afterwards
-            # without this pop wiping it.
+            # All three verifier checks accepted the same proof.
             log(
                 f"Lemma {lemma_id} passed all {len(VERIFIER_AGENTS)} "
                 f"verifier checks. Adding to DAG.",
                 verbose,
             )
-            with failed_lock:
-                failed_attempts.pop(lemma_id, None)
             proved_node = {
                 "statement": target["statement"],
                 "proof": proof,
@@ -5319,21 +5348,10 @@ def run_proof_loop(
             and new_id not in lemma_id_set(get_dag())
         ):
             # Decomposition: the target is too hard to prove as stated.
-            # Record the old lemma's history — and why it was set aside —
-            # under its own id, then restart the prover on the smaller
-            # lemma with a fresh attempt budget and no inherited verdict.
+            # Restart the prover on the smaller lemma with a fresh attempt
+            # budget and no inherited verdict; only the lemma the loop ends
+            # on can reach the reject list.
             old_id = lemma_id
-            # The current round's rejection is the old lemma's last word;
-            # fold it into its history before we set the lemma aside.
-            with failed_lock:
-                failed_attempts[old_id] = (
-                    list(attempt_notes)
-                    + list(feedback)
-                    + [
-                        f"Decomposed: {old_id} was judged too hard to prove "
-                        f"as stated; the reviser is instead trying {new_id}."
-                    ]
-                )
             lemma_id = new_id
             target = {"id": lemma_id, "statement": new_stmt}
             attempt_notes = [
@@ -5407,6 +5425,9 @@ def run_proof_loop(
 
     return {
         "proved": proved,
+        # The while condition is the only exit that leaves attempt past
+        # the budget: a proof, an overflow give-up, or a stop leaves it.
+        "exhausted": not proved and attempt > MAX_PROOF_ATTEMPTS,
         "lemma_id": lemma_id,
         "committed_id": committed_id,
         "claimed_id": claimed_id,
@@ -5571,7 +5592,7 @@ def _verify_operator_proof(
 
 def _serial_on_round(
     iteration: int,
-    failed_attempts: Dict[str, List[str]],
+    rejected_lemmas: List[Dict[str, str]],
     state: Dict[str, Any],
     verbose: bool,
 ) -> None:
@@ -5579,7 +5600,7 @@ def _serial_on_round(
     _LIVE_STATE (the SIGINT handler's source) and into the checkpoint, so a
     Ctrl-C mid-round re-runs exactly that round."""
     _LIVE_STATE["in_flight"] = state
-    save_checkpoint(iteration, failed_attempts, state, verbose)
+    save_checkpoint(iteration, rejected_lemmas, state, verbose)
 
 
 def _serial_on_proof(
@@ -5743,16 +5764,16 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         cp = None
     if cp is None:
         start_iteration = 1
-        failed_attempts: Dict[str, List[str]] = {}
+        rejected_lemmas: List[Dict[str, str]] = []
         in_flight: Optional[Dict[str, Any]] = None
     else:
         start_iteration = cp["iteration"]
-        failed_attempts = cp["failed_attempts"]
+        rejected_lemmas = cp["rejected_lemmas"]
         in_flight = cp["in_flight"]
         if in_flight is None:
             log(
                 f"Resuming at iteration {start_iteration}/{MAX_ITERATIONS} "
-                f"({len(failed_attempts)} rejected lemma(s) on record).",
+                f"({len(rejected_lemmas)} rejected lemma(s) on record).",
                 verbose,
             )
         else:
@@ -5776,8 +5797,12 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
     # Suspended lemmas already warned about this run: the warning is told
     # once per lemma, the way the dangling-citation warning is told.
     warned_suspended: Set[Tuple[str, str]] = set()
-    _LIVE_STATE["failed_attempts"] = failed_attempts
+    _LIVE_STATE["rejected_lemmas"] = rejected_lemmas
     _LIVE_STATE["in_flight"] = in_flight
+    # The operator's reason for rejecting the last shortlist ('replan' at
+    # the human menu), for the next planner call only: it is not a
+    # rejected lemma, and it is not checkpointed.
+    operator_note = ""
 
     for iteration in range(start_iteration, MAX_ITERATIONS + 1):
         log(f"\n--- Iteration {iteration}/{MAX_ITERATIONS} ---", verbose)
@@ -5839,7 +5864,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         # on Ctrl-C from _LIVE_STATE.
         _LIVE_STATE["iteration"] = iteration
         _LIVE_STATE["in_flight"] = in_flight
-        save_checkpoint(iteration, failed_attempts, in_flight, verbose)
+        save_checkpoint(iteration, rejected_lemmas, in_flight, verbose)
 
         resuming = (
             in_flight is not None
@@ -5874,9 +5899,10 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                 f"Conjecture:\n{conjecture}\n\n"
                 f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
                 f"{planner_ref_block}{comments_block}\n\n"
-                f"Previously rejected attempts (avoid or decompose these):\n"
-                f"{json.dumps(failed_attempts, indent=2)}"
+                f"{rejected_block(rejected_lemmas)}"
+                + (f"\n\n{operator_note}" if operator_note else "")
             )
+            operator_note = ""
             plan_text, plan_status, _partial = reason(
                 planner_sys, planner_user, "planner", THINK["planner"], verbose,
                 tools=agent_tools(dag, suspended),
@@ -5940,14 +5966,14 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                     if verified is not None:
                         lid, node, vh = verified
                         own_committed = _serial_on_proof(lid, node, vh, verbose)
-                        failed_attempts.pop(lid, None)
+                        drop_rejection(rejected_lemmas, lid)
                         break
                     choice = interaction.choose(
                         screened, lemma_id_set(dag, suspended), HOTKEY,
                         summary, check_citations=check,
                     )
                 if own_committed is not None:
-                    save_checkpoint(iteration + 1, failed_attempts, None, verbose)
+                    save_checkpoint(iteration + 1, rejected_lemmas, None, verbose)
                     continue
                 if choice.action == "quit":
                     log(
@@ -5961,12 +5987,12 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                     # pull).
                     return dag
                 if choice.action == "replan":
-                    # Recorded against every candidate shown, because the channel
-                    # the planner reads is keyed by lemma id and the point is that
-                    # it should not come back with this same shortlist.
-                    for cand, _ in screened:
-                        for note in choice.notes:
-                            failed_attempts.setdefault(cand["id"], []).append(note)
+                    # Told to the next planner call only: the shortlist was
+                    # turned down, not tried, so none of it goes on the
+                    # reject list.
+                    operator_note = replan_note(
+                        [cand for cand, _ in screened], choice.notes
+                    )
                     log("Shortlist rejected; asking the planner again.", verbose)
                     continue
                 if choice.action == "auto":
@@ -6002,7 +6028,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                         )
                 else:
                     next_lemma = select_lemma(
-                        usable, dag, conjecture, summary, failed_attempts, verbose,
+                        usable, dag, conjecture, summary, rejected_lemmas, verbose,
                         suspended=suspended,
                     )
 
@@ -6040,7 +6066,6 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         # checkpoint, and commit proved lemmas to the DAG. The lock is a
         # formality here — one thread — and the engine's contract does not
         # change between the two modes.
-        serial_failed_lock = threading.Lock()
         result = run_proof_loop(
             verbose=verbose,
             conjecture=conjecture,
@@ -6054,13 +6079,11 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             initial=in_flight if resuming else None,
             fresh_target=None if resuming else next_lemma,
             on_round=lambda state: _serial_on_round(
-                iteration, failed_attempts, state, verbose
+                iteration, rejected_lemmas, state, verbose
             ),
             on_proof=lambda lid, node, vh: _serial_on_proof(
                 lid, node, vh, verbose
             ),
-            failed_attempts=failed_attempts,
-            failed_lock=serial_failed_lock,
             get_dag=load_dag,
             toggle_hotkey=lambda: check_mode_toggle(verbose),
         )
@@ -6068,21 +6091,27 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         proved = result["proved"]
 
         # ---------------- Step 6: Record the outcome for the planner --------
-        if not proved:
-            if result["attempt_notes"]:
-                failed_attempts[lemma_id] = result["attempt_notes"]
+        if proved:
+            drop_rejection(rejected_lemmas, lemma_id)
+        elif result["exhausted"]:
+            note_rejection(
+                rejected_lemmas, lemma_id, result["target"]["statement"]
+            )
             log(
-                f"Lemma {lemma_id} left unproved after the proof loop; the "
-                f"planner will see the feedback.",
+                f"Lemma {lemma_id} left unproved after "
+                f"{MAX_PROOF_ATTEMPTS} prover rounds; the planner will see "
+                f"it as rejected.",
                 verbose,
             )
+        else:
+            log(f"Lemma {lemma_id} given up unproved.", verbose)
 
         # The lemma is settled one way or another: clear the in-flight state
         # and move the resumable position to the next iteration, with the
         # reject list as it now stands.
         in_flight = None
         _LIVE_STATE["in_flight"] = None
-        save_checkpoint(iteration + 1, failed_attempts, None, verbose)
+        save_checkpoint(iteration + 1, rejected_lemmas, None, verbose)
 
     # The last iteration's lemma may have been the one that settles it.
     dag = load_dag()
@@ -6284,11 +6313,11 @@ class ParallelState:
 
     One lock per concern, never held across an LLM call:
       state_lock    the per-loop slots, the plan, the DAG version
-      failed_lock   the shared reject list
+      rejected_lock the shared reject list
       DAG_LOCK      the DAG file itself (module global)
       CHECKPOINT_LOCK  the checkpoint's snapshot-then-replace (module global)
     The checkpoint is a whole-file rewrite taken under CHECKPOINT_LOCK —
-    the loop slots under state_lock, the reject list under failed_lock,
+    the loop slots under state_lock, the reject list under rejected_lock,
     then one atomic replace over a per-writer temp file — so the file is
     always a consistent, current state even though many threads poke at
     it.
@@ -6313,8 +6342,11 @@ class ParallelState:
         self.plan_stale = False
         self.plan_cond = threading.Condition()
         self.dag_version = 0
-        self.failed_attempts: Dict[str, List[str]] = {}
-        self.failed_lock = threading.Lock()
+        self.rejected_lemmas: List[Dict[str, str]] = []
+        self.rejected_lock = threading.Lock()
+        # The operator's last 'replan' reason, for the next plan only
+        # (under state_lock; not checkpointed).
+        self.operator_note = ""
         self.stop_event = threading.Event()
         self.resolution: Optional[str] = None
         self.state_lock = threading.Lock()
@@ -6497,7 +6529,7 @@ class ParallelState:
         certifies the lemma before it writes it (verified_hash, see
         commit_lemma_to_dag), so the planner this wakes, and any loop
         reloading the DAG, never finds it uncertified. Then bump the
-        version the planner watches, clear the lemma's reject notes, mark
+        version the planner watches, take the lemma off the reject list, mark
         the plan stale (the DAG changed, so the plan owes a re-read), and
         checkpoint. The version is visible only after the file is down, so
         a replan triggered by it always sees the new lemma. Returns the id
@@ -6508,8 +6540,8 @@ class ParallelState:
         )
         with self.state_lock:
             self.dag_version += 1
-        with self.failed_lock:
-            self.failed_attempts.pop(lemma_id, None)
+        with self.rejected_lock:
+            drop_rejection(self.rejected_lemmas, lemma_id)
         self.mark_plan_stale()
         self.write_checkpoint()
         return committed
@@ -6520,14 +6552,24 @@ class ParallelState:
 
     # -- the shared reject list -----------------------------------------------
 
-    def record_failure(self, lemma_id: str, notes: List[str]) -> None:
-        with self.failed_lock:
-            self.failed_attempts[lemma_id] = list(notes)
+    def record_rejection(self, lemma_id: str, statement: str) -> None:
+        with self.rejected_lock:
+            note_rejection(self.rejected_lemmas, lemma_id, statement)
         self.write_checkpoint()
 
-    def failed_snapshot(self) -> Dict[str, List[str]]:
-        with self.failed_lock:
-            return {k: list(v) for k, v in self.failed_attempts.items()}
+    def rejected_snapshot(self) -> List[Dict[str, str]]:
+        with self.rejected_lock:
+            return [dict(e) for e in self.rejected_lemmas]
+
+    def set_operator_note(self, note: str) -> None:
+        with self.state_lock:
+            self.operator_note = note
+        self.mark_plan_stale()
+
+    def take_operator_note(self) -> str:
+        with self.state_lock:
+            note, self.operator_note = self.operator_note, ""
+            return note
 
     # -- checkpoint -------------------------------------------------------------
 
@@ -6537,12 +6579,8 @@ class ParallelState:
                 entry = cp["loops"].get(lid) or {}
                 slot["in_flight"] = entry.get("in_flight")
                 slot["iterations_used"] = int(entry.get("iterations_used") or 0)
-        with self.failed_lock:
-            self.failed_attempts = {
-                str(k): [n for n in v if isinstance(n, str)]
-                for k, v in (cp.get("failed_attempts") or {}).items()
-                if isinstance(v, list)
-            }
+        with self.rejected_lock:
+            self.rejected_lemmas = clean_rejected(cp.get("rejected_lemmas"))
 
     def write_checkpoint(self) -> None:
         # CHECKPOINT_LOCK spans the snapshot and the replace: with the two
@@ -6557,9 +6595,9 @@ class ParallelState:
                     }
                     for lid, slot in self.loops.items()
                 }
-            failed = self.failed_snapshot()
+            rejected = self.rejected_snapshot()
             _atomic_write_checkpoint_file(
-                {"version": 2, "loops": loops, "failed_attempts": failed},
+                {"version": 2, "loops": loops, "rejected_lemmas": rejected},
                 verbose=False,
             )
 
@@ -6624,15 +6662,15 @@ def _parallel_planner(
             state.set_resolution(kind)
             return
         plan = state.plan_snapshot()
+        operator_note = state.take_operator_note()
         plan_user = (
             f"Conjecture:\n{conjecture}\n\n"
             f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, susp.suspended), indent=2)}"
             f"{ref_block}{comments_block}\n\n"
-            f"Rejected attempts so far, keyed by lemma id (feedback from the "
-            f"loops' prover, verifier and reviser rounds; routes already "
-            f"found wanting):\n{json.dumps(state.failed_snapshot(), indent=2)}\n\n"
-            f"Current plan, if any (revise it against the DAG: keep what "
-            f"still holds, drop what is done or dead, re-order what moved):\n"
+            f"{rejected_block(state.rejected_snapshot())}\n\n"
+            + (f"{operator_note}\n\n" if operator_note else "")
+            + "Current plan, if any (revise it against the DAG: keep what "
+            "still holds, drop what is done or dead, re-order what moved):\n"
             + (json.dumps(plan, indent=2) if plan else "(none yet)")
             + "\n"
         )
@@ -6706,7 +6744,7 @@ def _parallel_generator(
         # already rejected.
         known = lemma_id_set(dag, susp.suspended)
         known |= {e["lemma"]["id"] for e in buffer_snapshot}
-        known |= set(state.failed_snapshot().keys())
+        known |= {e["id"] for e in state.rejected_snapshot()}
         # A lemma a loop holds in flight is off-limits too: the run
         # resumed it, and it is not in this run's buffer.
         known |= state.in_flight_ids()
@@ -6719,9 +6757,7 @@ def _parallel_generator(
             f"Possible lemmas currently in the buffer (claimed_by marks the "
             f"loop that has picked one up; never duplicate any of "
             f"these):\n{json.dumps(buffer_snapshot, indent=2)}\n\n"
-            f"Rejected attempts so far, keyed by lemma id (statements and "
-            f"routes already found wanting):\n"
-            f"{json.dumps(state.failed_snapshot(), indent=2)}\n"
+            f"{rejected_block(state.rejected_snapshot())}\n"
         )
         text, _status, _partial = reason(
             generator_sys, gen_user, "parallel_lemma_generator",
@@ -6777,7 +6813,7 @@ def _auto_claim(
     def pick(usable: List[Dict[str, Any]]) -> Dict[str, Any]:
         dag = load_dag()
         plan = state.plan_snapshot() or {}
-        failed = state.failed_snapshot()
+        rejected = state.rejected_snapshot()
         susp = suspension.compute(
             dag["lemmas"], load_references(), CONJECTURE_ROOT
         )
@@ -6786,7 +6822,7 @@ def _auto_claim(
             dag,
             conjecture,
             str(plan.get("plan_summary") or ""),
-            failed,
+            rejected,
             verbose,
             proposer="the lemma generator",
             suspended=susp.suspended,
@@ -6843,14 +6879,11 @@ def _parallel_human_step(
             state.request_stop()
             return "quit", None
         if choice.action == "replan":
-            with state.failed_lock:
-                for cand, _problems in screened:
-                    for note in choice.notes:
-                        state.failed_attempts.setdefault(cand["id"], []).append(
-                            note
-                        )
-            state.mark_plan_stale()
-            state.write_checkpoint()
+            # For the next plan only: the buffer was turned down, not
+            # tried, so none of it goes on the reject list.
+            state.set_operator_note(
+                replan_note([cand for cand, _ in screened], choice.notes)
+            )
             log("Buffer rejected; the planner is asked again.", verbose)
             continue
         if choice.action == "auto":
@@ -6942,8 +6975,8 @@ def _parallel_proof_loop(
     the menu first (the buffer is the shortlist), and the hotkey still
     toggles it between the menu and automation. The engine's callbacks are
     the loop's share of the shared state: on_round publishes the resumable
-    position, on_proof commits a lemma to the DAG, and the loop's failure
-    notes join the shared reject list under its lock."""
+    position, on_proof commits a lemma to the DAG, and a lemma that spends
+    every prover round joins the shared reject list under its lock."""
     is_human = lambda: loop_index == 0 and MODE == "human"
     log(
         f"{loop_id} starts"
@@ -7054,10 +7087,8 @@ def _parallel_proof_loop(
             # a sibling that committed the same id in the meantime keeps
             # its proof under the id, and this one is committed under a
             # fresh non-colliding id rather than dropped or stacked on
-            # top of it. The rename goes on the shared reject list, under
-            # the id it happened under, where the planner and the other
-            # loops can see that the two proofs may state different
-            # things.
+            # top of it. The rename is logged; the planner sees both
+            # lemmas in the DAG.
             with _commit_section():
                 # All three verifier checks accepted this proof: add_lemma
                 # certifies it under the id it is committed under (a
@@ -7071,14 +7102,6 @@ def _parallel_proof_loop(
                         f"{committed} instead.",
                         verbose,
                     )
-                    with state.failed_lock:
-                        state.failed_attempts.setdefault(lid, []).append(
-                            f"Id collision: this loop's proof of {lid} was "
-                            f"committed under {committed} because the id was "
-                            f"already in the DAG; the two proofs may state "
-                            f"different things."
-                        )
-                    state.write_checkpoint()
             return committed
         result = run_proof_loop(
             verbose=verbose,
@@ -7096,8 +7119,6 @@ def _parallel_proof_loop(
                 loop_id, state_dict
             ),
             on_proof=on_proof,
-            failed_attempts=state.failed_attempts,
-            failed_lock=state.failed_lock,
             get_dag=load_dag,
             toggle_hotkey=lambda: check_mode_toggle(verbose),
             should_stop=lambda: not state.running(),
@@ -7114,14 +7135,15 @@ def _parallel_proof_loop(
         # claim id, not on the final target: a decomposition settles on a
         # lemma the buffer never held, so freeing by the final id would
         # leak the claim's slot and the generator would never be told the
-        # claimed id is free. The failure note, by contrast, belongs on
-        # the final target — that is the statement that was actually tried.
+        # claimed id is free. The rejection, by contrast, records the final
+        # target — that is the statement that was actually tried.
         state.set_in_flight(loop_id, None)
         state.buffer.consume(result["claimed_id"])
         state.finish_lemma(loop_id)
-        if not result["proved"]:
-            if result["attempt_notes"]:
-                state.record_failure(result["lemma_id"], result["attempt_notes"])
+        if result["exhausted"]:
+            state.record_rejection(
+                result["lemma_id"], result["target"]["statement"]
+            )
         # A proved lemma is already in the DAG (on_proof committed it, which
         # bumped the version and marked the plan stale): the loop simply
         # goes for its next lemma.
@@ -7424,7 +7446,7 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     global MAX_ITERATIONS, NUM_CTX, USER, LEMMAS_ALL, MY_LEMMAS, TOOL_MODE
     global LEMMAS_COMMON
     global BACKEND, PROFILE, PROMPT_PATHS, MODE, HOTKEY
-    global MAX_PROOF_ATTEMPTS, CHECKPOINT_FILE
+    global MAX_PROOF_ATTEMPTS, MAX_REJECTED_LEMMAS, CHECKPOINT_FILE
 
     parser = argparse.ArgumentParser(
         prog=prog, description="Run the multi-agent theorem prover."
@@ -7483,6 +7505,14 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
         ),
     )
     parser.add_argument(
+        "--max-rejected-lemmas", type=int, default=MAX_REJECTED_LEMMAS,
+        help=(
+            "How many of the most recently rejected lemmas (lemmas that "
+            "went through every prover round unproved) the planner is shown "
+            f"(default: {MAX_REJECTED_LEMMAS})"
+        ),
+    )
+    parser.add_argument(
         "--fresh",
         action="store_true",
         help=(
@@ -7538,6 +7568,7 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     MODEL_NAME = args.model
     MAX_ITERATIONS = args.max_iterations
     MAX_PROOF_ATTEMPTS = max(1, args.max_proof_attempts)
+    MAX_REJECTED_LEMMAS = max(0, args.max_rejected_lemmas)
     MODE = args.mode
 
     # Backend first: the probe tells us the real context ceiling, which an
