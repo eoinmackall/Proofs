@@ -268,7 +268,10 @@ PROMPT_PATHS: Dict[str, str] = {name: name for name in workspace.PROMPT_FILES}
 
 MAX_ITERATIONS = 10
 LLM_MAX_RETRIES = 3
-REQUEST_TIMEOUT = 36000      # 10 hours: thinking models are slow; give them room
+REQUEST_TIMEOUT = 5400       # 90 minutes: thinking models are slow, but a
+# request a server accepted and then dropped must not stall the run longer.
+# This is the longest gap between bytes received (requests' read timeout),
+# and on a non-streaming call that is the whole generation.
 
 # How many lemmas the planner shortlists per iteration. Raising this costs
 # planner tokens and, in human mode, attention; five is about as many
