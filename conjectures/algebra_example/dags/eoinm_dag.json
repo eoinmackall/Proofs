@@ -1,6 +1,6 @@
 {
   "user.id": "eoinm",
-  "user.name": "Eoin Mackall",
+  "user.name": "Eoin  Mackall",
   "user.email": "eoinmackall@gmail.com",
   "lemmas": {
     "lemma_split_regular_crossed": {
@@ -157,6 +157,26 @@
         "ref_14"
       ],
       "last_prover_id": "eoinm"
+    },
+    "lemma_24": {
+      "statement": "Let k be a field, let A be a central simple k-algebra, and let L/k be a finite Galois subfield of A with Galois group G. Let C be the centralizer of L in A. Then for every \u03c3 in G, the Brauer class \u03c3([C]) equals [C] in Br(L).",
+      "proof": "Let B = A \u2297_k L. By the double centralizer theorem (ref_1), C = C_A(L) is a central simple L-algebra and its Brauer class satisfies [C] = [B] in Br(L). For \u03c3 \u2208 G = Gal(L/k), the Galois action on Br(L) sends the class of a central simple L-algebra D to the class of the twist D^\u03c3, where D^\u03c3 has the same underlying ring as D and L-scalar multiplication l \u00b7_\u03c3 d = \u03c3(l)d. The same conclusion holds if the inverse twist is used, by applying the argument below to \u03c3^{-1}. We prove that B^\u03c3 is L-isomorphic to B. Define \u03c6: B \u2192 B^\u03c3 by \u03c6(a \u2297 x) = a \u2297 \u03c3(x) for a \u2208 A and x \u2208 L. This is well-defined because \u03c3 is k-linear. It is a ring isomorphism: \u03c6((a \u2297 x)(a' \u2297 x')) = \u03c6(aa' \u2297 xx') = aa' \u2297 \u03c3(xx') = (a \u2297 \u03c3(x))(a' \u2297 \u03c3(x')) = \u03c6(a \u2297 x)\u03c6(a' \u2297 x'), and the inverse is a \u2297 x \u21a6 a \u2297 \u03c3^{-1}(x). It is L-linear from B to B^\u03c3: for l \u2208 L, \u03c6(l(a \u2297 x)) = \u03c6(a \u2297 lx) = a \u2297 \u03c3(lx) = a \u2297 \u03c3(l)\u03c3(x) = \u03c3(l)(a \u2297 \u03c3(x)) = l \u00b7_\u03c3 \u03c6(a \u2297 x). Hence [B^\u03c3] = [B] in Br(L), so \u03c3([B]) = [B]. Therefore \u03c3([C]) = \u03c3([B]) = [B] = [C] in Br(L). Since \u03c3 was arbitrary, the lemma follows.",
+      "cited_lemmas": [],
+      "cited_references": [
+        "ref_1"
+      ],
+      "last_prover_id": "eoinm",
+      "proved_at": "2026-10-12T03:46:54Z"
+    },
+    "lemma_20": {
+      "statement": "Let k be a field of characteristic p>2, let D be a central division k-algebra of degree p^2, let K be a cyclic subfield of D of degree p over k, let sigma be a generator of Gal(K/k), and let C be the centralizer of K in D. Then sigma([C])=[C] in Br(K).",
+      "proof": "Let B = D tensor_k K, regarded as a K-algebra via the second factor. By the double centralizer theorem (ref_1), applied to the central simple k-algebra D and the subfield K, the centralizer C = C_D(K) is a central simple K-algebra of degree deg(D)/[K:k] = p^2/p = p, and [C] = [B] in Br(K). (The division property of C also follows directly: if 0 != x in C, then x^{-1} lies in D and commutes with every element of K because x commutes with K, so x^{-1} in C.)\n\nIt remains to show that sigma fixes [B]. Recall that for a central simple K-algebra B, the Galois action of sigma in Gal(K/k) on Br(K) is given by sigma([B]) = [B tensor_{K,sigma} K], where K acts on the second factor and the tensor relation is (b a) tensor x = b tensor sigma(a) x for a in K. We construct an explicit K-algebra isomorphism B tensor_{K,sigma} K -> B.\n\nDefine Phi((d tensor x) tensor y) = d tensor sigma(x) y. First, Phi is well defined: if a in K, then (d tensor x) tensor sigma(a) = ((d tensor x) a) tensor 1 = (d tensor x a) tensor 1, and both sides map to d tensor sigma(x) sigma(a). Second, Phi is multiplicative: Phi(((d tensor x) tensor y)((d' tensor x') tensor y')) = Phi((dd' tensor xx') tensor yy') = dd' tensor sigma(x) sigma(x') yy', while Phi((d tensor x) tensor y) Phi((d' tensor x') tensor y') = (d tensor sigma(x) y)(d' tensor sigma(x') y') = dd' tensor sigma(x) y sigma(x') y' = dd' tensor sigma(x) sigma(x') yy', since y and sigma(x') lie in the central K-factor. Third, Phi is K-linear: for z in K, z . ((d tensor x) tensor y) = (d tensor x) tensor z y, so Phi(z . ((d tensor x) tensor y)) = d tensor sigma(x) z y = z . (d tensor sigma(x) y) = z . Phi((d tensor x) tensor y), again using commutativity of K.\n\nThe inverse map is Psi: B -> B tensor_{K,sigma} K, Psi(d tensor t) = (d tensor sigma^{-1}(t)) tensor 1. Then Phi(Psi(d tensor t)) = d tensor t. Conversely, for (d tensor x) tensor y, we have (d tensor x) tensor y = (d tensor x) tensor sigma(sigma^{-1}(y)) = ((d tensor x) sigma^{-1}(y)) tensor 1 = (d tensor x sigma^{-1}(y)) tensor 1 = Psi(d tensor sigma(x) y) = Psi(Phi((d tensor x) tensor y)). Hence Phi is a K-algebra isomorphism.\n\nTherefore B tensor_{K,sigma} K is isomorphic to B as a K-algebra, so sigma([B]) = [B] in Br(K). Finally, sigma([C]) = sigma([B]) = [B] = [C] in Br(K), as required.",
+      "cited_lemmas": [],
+      "cited_references": [
+        "ref_1"
+      ],
+      "last_prover_id": "eoinm",
+      "proved_at": "2026-10-12T04:19:09Z"
     }
   }
 }

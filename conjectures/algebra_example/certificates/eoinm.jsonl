@@ -1,4 +1,4 @@
-{"user.id":"eoinm","user.name":"Eoin Mackall","user.email":"eoinmackall@gmail.com"}
+{"user.id":"eoinm","user.name":"Eoin  Mackall","user.email":"eoinmackall@gmail.com"}
 {"user_id":"eoinm","lemma_id":"lemma_split_regular_crossed","hash":"46de4a2dd6dba6981a463a56181359a04639eeb0f359e054002813c518158086","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-07T00:39:04Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_tensor_crossed","hash":"5ca605e0bc27f005fa2ace7aa4a337c1b5ebc0c21a942f9e8e12d79df20ae82a","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-07T00:59:56Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_crossed_p2_implies_artin_schreier","hash":"eba1765ed7aba48a837394e0e15c4dc7a34ecfc3bc952467c8b8d8953d2db339","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-07T01:04:59Z","count":1}
@@ -16,3 +16,5 @@
 {"user_id":"eoinm","lemma_id":"lemma_sigma_semilinear_AS_propagation","hash":"16fe859ac009dccbe340d36d0dc073146d8abfdeeea5bef6b2dc122912c56eda","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-07T03:09:18Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_AS_splitting_sigma_stable","hash":"7083b7570dafa998ba1a3043c66bb4f07467357407748822e49189ef920bf7c9","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-07T03:17:20Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_AS_galois_compatibility_field","hash":"140ff0c9bfade05ca06f71c764147a958680cb3f759d0620a85cf82136583b1c","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-07T03:31:55Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_24","hash":"21ee7b4895477d6f9f7286a3a03e7add4521456cecc5bd49ddda6f3ed60838bb","verifier":"eoinm","model":"Qwen/Qwen3.8-27B","date":"2026-10-12T03:46:54Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_20","hash":"0c28ea2a0ca044f2fae29b80a033642a4d3312e0ede3e1f15a8461a0aef53a02","verifier":"eoinm","model":"Qwen/Qwen3.8-27B","date":"2026-10-12T04:19:09Z","count":1}
