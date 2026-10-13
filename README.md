@@ -2,9 +2,10 @@
 
 A Python program that drives a small team of LLM agents to iteratively prove
 (or refute) a mathematical conjecture. The agents work in a loop —
-**planner → selector → prover → verifier → reviser** — and accumulate a proof
-as a DAG of lemmas. (In `--mode human`, the operator takes the selector's
-place at the menu.)
+**planner → prover → verifier → reviser** — and accumulate a proof
+as a DAG of lemmas. Which planned lemma is proved next is not an agent's
+call: in `--mode auto` it is picked at random (serial) or taken oldest-first
+from a queue (parallel); in `--mode human` the operator picks at the menu.
 
 The system is distributed and coordinated through git. Several people can
 work on one conjecture: each user's lemmas go in their own DAG file,
@@ -28,16 +29,13 @@ Each iteration:
 
 1. **Planner** (`planner.md`) reads the conjecture, the lemmas proved so far,
    and the most recently rejected lemmas, and proposes
-   `PLANNER_CANDIDATES` (5) candidate lemmas, best-first, working either
+   `PLANNER_CANDIDATES` (5) candidate lemmas, in no particular order, working either
    toward a proof of the conjecture or — where it looks false — toward a
    concrete counterexample to it.
 2. **Selection** picks exactly one candidate:
    - `--mode auto`: `screen_candidates()` filters out candidates whose ids are
-     already in the DAG, and when more than one survives, the **selector**
-     (`selector.md`) weighs them all and picks the one it judges most likely
-     to come through the prover and the verifiers. The planner's best-first
-     order is the fallback: it is taken when the selector fails or when only
-     one candidate survives.
+     already in the DAG, and one of the survivors is picked uniformly at
+     random.
    - `--mode human`: a menu appears. Type a number and Enter to prove that
      lemma yourself: paste or type your proof and its citations, and it
      goes through the same three verifiers as the prover's (see
@@ -85,8 +83,7 @@ conjecture by proposing a candidate under one of these ids. Its statement
 is always written by the code, not by the model: the verbatim text of
 `conjecture.md`, or that text after the fixed prefix "The following
 conjecture is false. Exhibit an explicit counterexample…". From there it is
-an ordinary candidate. The selector weighs it against the others with no
-priority, the prover assembles its proof from the DAG, and the three
+an ordinary candidate. It is picked like any other, with no priority, the prover assembles its proof from the DAG, and the three
 verifiers check it. The reviser may not revise a pinned statement, and may
 not decompose a lemma onto a reserved id.
 
@@ -500,8 +497,7 @@ A lemma is **suspended** (`proofs/suspension.py`) when any of these holds:
 - it cites a suspended lemma.
 
 Suspension is recomputed from the files every time the DAG is loaded and
-never stored. A suspended lemma is hidden from the planner, the selector
-and the prover, and the prover may not cite it; the run warns about each
+never stored. A suspended lemma is hidden from the planner and the prover, and the prover may not cite it; the run warns about each
 one once. `verify`, `repair` and `status` still load suspended lemmas,
 since verification is how they come back. A lemma whose run stopped
 between committing it and certifying it is reported as such; run `proofs
@@ -541,7 +537,7 @@ verify` on it to give it its certificate.
 ## Parallel mode
 
 `--parallel N` runs N proof loops concurrently. Each loop is the same engine
-the serial run uses — selector, prover, the three verifiers, reviser, one
+the serial run uses — prover, the three verifiers, reviser, one
 lemma at a time — and every loop reads and writes the same DAG. Two further
 threads steer them: a **planner** that keeps a shared strategy current, and a
 **lemma generator** that keeps the loops supplied with work.
@@ -569,9 +565,10 @@ ever claimed twice. The slots are also the flow control: a full buffer means
 the loops are behind, and the generator waits for a free slot instead of
 piling up work.
 
-Claiming is atomic. A loop's selector is shown the unclaimed lemmas and its
-pick is committed under lock; if another loop took the lemma in the meantime,
-the selector is re-run on what remains, so two loops never work on one id. A
+The buffer is a queue. An unattended loop claims the oldest unclaimed lemma —
+first in, first out, by arrival order — and the claim is made under lock, so
+two loops never work on one id. A claim released by a crashed loop keeps its
+place in the queue. A
 claimed lemma keeps its slot until it is settled — proved or given up after
 `MAX_PROOF_ATTEMPTS` rounds — or the operator proves it from the menu.
 
@@ -652,14 +649,14 @@ restarts the budgets from 1 and keeps the DAG.
 
 ```
 agents/
-  planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md   # default agent prompts (one reviser for rejects and overflows)
+  planner.md  prover.md  verifier_1/2/3.md  reviser.md   # default agent prompts (one reviser for rejects and overflows)
   parallel/                                    # parallel-mode prompts
     parallel_planner.md  parallel_lemma_generator.md
   parsing.md                               # references parser prompt
 proofs/
   cli.py               # the `proofs` command: subcommands and argument validation
   config.py            # the user's global config (~/.config/proofs/config): user.id, user.name, user.email
-  main.py              # the proof loop (planner → selector → prover → verifier → reviser) and the verify/repair/prune/status/export entries
+  main.py              # the proof loop (planner → prover → verifier → reviser) and the verify/repair/prune/status/export entries
   parsing.py           # standalone references/ → references.md parser
   merkle.py            # the Merkle hash of every lemma
   certificates.py      # certificate files: recording, validity, pruning

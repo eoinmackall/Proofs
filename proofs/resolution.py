@@ -12,7 +12,7 @@ model: whoever proposes one — the planner, the lemma generator, the
 operator at the menu — has the statement it gave replaced by the pinned
 text (pin()), the verbatim contents of conjecture.md, or that text
 wrapped in NEGATION_PREFIX. A reserved candidate is otherwise a candidate
-like any other: the selector weighs it against the rest, the prover
+like any other: it can be picked like the rest, the prover
 writes its proof from the lemmas in the DAG, and the three verifiers
 check it.
 

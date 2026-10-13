@@ -18,8 +18,8 @@ until a refutation is dismissed, or a fresh certificate is issued for the
 proof that is in the file now.
 
 Suspension is what keeps proofs run from building on a refuted or
-unverified lemma: a suspended lemma is hidden from the planner, the
-selector and the prover (the views and id sets that take the suspension do
+unverified lemma: a suspended lemma is hidden from the planner and
+the prover (the views and id sets that take the suspension do
 the hiding), but proofs verify, proofs repair and proofs status still load
 it — suspension hides a lemma from the construction, not from the
 verification that is the only way back to it.

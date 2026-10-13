@@ -1,4 +1,4 @@
-"""Multi-agent proof loop: planner -> selector -> prover -> verifier -> reviser -> DAG.
+"""Multi-agent proof loop: planner -> prover -> verifier -> reviser -> DAG.
 
 Design note on thinking vs. structured output
 ---------------------------------------------
@@ -17,7 +17,7 @@ two halves:
 The reasoning stage stays schema-free, because that is exactly where the
 model needs to think.
 
-All seven agent prompts (planner.md, selector.md, prover.md, verifier_1.md,
+All six agent prompts (planner.md, prover.md, verifier_1.md,
 verifier_2.md, verifier_3.md and reviser.md) instruct the model to emit
 strict JSON directly, so each
 response is first
@@ -56,14 +56,11 @@ without touching the DAG files.
 Planning is a shortlist, not a decision
 ---------------------------------------
 The planner proposes PLANNER_CANDIDATES (5) lemmas per iteration rather than
-one, ordered best-first, and something downstream picks exactly one. In
---mode auto that picker is the selector agent: screen_candidates() filters
-the shortlist against the DAG, and when more than one candidate survives,
-selector.md is asked to weigh them all and name the one it judges most
-likely to come through the prover and the verifiers. The planner's best-first
-order is the fallback, not the default — it is what gets taken when the
-selector fails, names a candidate it was not offered, or when only one
-candidate survives, where there is nothing left to choose. A candidate whose
+one, in no particular order, and something downstream picks exactly one. In
+--mode auto the pick is random: screen_candidates() filters the shortlist
+against the DAG, and one of the survivors is chosen uniformly at random
+(select_lemma). The parallel run's equivalent
+is the buffer, which the proof loops drain oldest-first. A candidate whose
 id is already in the DAG is dropped from the shortlist — the rest still go to
 selection — rather than stalling the whole iteration.
 
@@ -188,7 +185,7 @@ refutations/ (refutations.py). Both carry the lemma's Merkle hash
 (merkle.py), so either one lapses on its own when the lemma, or anything it
 cites, changes. A lemma without a valid certificate, with a refutation
 that still matches it, or citing such a lemma is suspended (suspension.py):
-hidden from the planner, the selector and the prover until proofs verify or
+hidden from the planner and the prover until proofs verify or
 proofs repair re-accepts it. The conjecture is settled by an unsuspended
 lemma stating it, or its negation, verbatim (resolution.py).
 """
@@ -432,7 +429,8 @@ LOOP_RESTART_DELAY = 10
 # with the round kept in the checkpoint.
 SERVER_WAIT_SECONDS = 60
 
-# "auto" runs unattended: the selector agent picks from the shortlist.
+# "auto" runs unattended: a lemma is picked from the shortlist at random
+# (serial) or taken oldest-first from the buffer (parallel).
 # "human" stops at every planning step. Set from --mode, then mutated by the
 # hotkey and the menu, so it is genuinely a run-time toggle rather than a
 # launch-time one.
@@ -471,7 +469,6 @@ NUM_CTX = 65536
 # only understands booleans is ignored silently, which is worse.
 THINK = {
     "planner": True,
-    "selector": True,
     "prover": True,
     "verifier_1": True,
     "verifier_2": True,
@@ -511,7 +508,6 @@ EXTRACT_OPTIONS: Dict[str, Any] = {
 # Per-role reasoning temperature overrides.
 TEMPERATURES = {
     "planner": 0.7,
-    "selector": 0.5,   # Comparing a shortlist, not generating one.
     "prover": 0.6,     # Slightly tighter: rigour over exploration.
     "verifier_1": 0.8,
     "verifier_2": 0.8,
@@ -635,18 +631,6 @@ PARALLEL_LEMMA_GENERATOR_SCHEMA: Dict[str, Any] = {
     "required": ["candidate_lemmas"],
 }
 
-# The selector picks by id, but "one of these particular ids" is not
-# something a grammar can enforce, so the offered ids are listed in the
-# prompt and the answer is checked against them in select_lemma(), which
-# falls back to the planner's first candidate when it does not check out.
-SELECTOR_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "selected_id": {"type": "string"},
-    },
-    "required": ["selected_id"],
-}
-
 VERIFIER_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -742,7 +726,7 @@ def _warn_suspended(
     """The run's warning for the suspended lemmas (see suspension.py): a
     lemma with a refutation whose hash matches it, or without a valid
     certificate, or citing a lemma that has either, is hidden from the
-    planner, the selector and the prover, and the operator is told so. With
+    planner and the prover, and the operator is told so. With
     a warned set, once per lemma per run, the way the dangling-citation
     warning is told; without one, about every suspended lemma now.
 
@@ -777,7 +761,7 @@ def _warn_suspended(
                 f"{u}:{lid} was committed but never certified — its "
                 f"certificate was not issued (see the log of the run that "
                 f"committed it). It is "
-                f"suspended (hidden from the planner, the selector and the "
+                f"suspended (hidden from the planner and the "
                 f"prover) until certified: run proofs verify {dag_path} "
                 f"{lid}.",
                 verbose,
@@ -785,7 +769,7 @@ def _warn_suspended(
             continue
         log(
             f"{u}:{lid} is suspended ({'; '.join(susp.reasons(u, lid))}); "
-            f"it is hidden from the planner, the selector and the prover, "
+            f"it is hidden from the planner and the prover, "
             f"and proofs run will not build on it. proofs verify and "
             f"proofs repair still load it: re-accepting it (and any "
             f"suspended lemma it cites) re-issues the certificate and "
@@ -3411,7 +3395,7 @@ def clean_json_text(raw: str) -> str:
 def parse_json_or_none(text: str) -> Optional[Dict[str, Any]]:
     """Parse an agent reply that already complies with its prompt file.
 
-    planner.md, selector.md, prover.md, the three verifier prompts
+    planner.md, prover.md, the three verifier prompts
     (verifier_1.md, verifier_2.md, verifier_3.md) and reviser.md all end
     with "Output strictly valid JSON ... no markdown fences and no extra
     text", so the reasoning stage's content is usually the JSON object itself. When it
@@ -4195,8 +4179,8 @@ def planner_dag_view(
     Given the suspension, the suspended lemmas are not in the view: a
     refuted or uncertified lemma is not a proved lemma, and the planner
     must not be told it is one (see suspension.py). (This view is
-    part of how a suspended lemma is hidden from the planner, the selector
-    and the prover: the selector sees it through planner_dag_view, the
+    part of how a suspended lemma is hidden from the planner
+    and the prover: the planner sees it through planner_dag_view, the
     prover through prover_context, and the screening's id test through
     lemma_id_set.)
 
@@ -4495,75 +4479,13 @@ def log_candidates(
     log(interaction.render(screened, plan_summary), verbose)
 
 
-def select_lemma(
-    usable: List[Dict[str, Any]],
-    dag: Dict[str, Any],
-    conjecture: str,
-    plan_summary: str,
-    rejected_lemmas: List[Dict[str, str]],
-    verbose: bool,
-    proposer: str = "the planner",
-    suspended: Optional[Set[Tuple[str, str]]] = None,
-) -> Dict[str, Any]:
-    """Ask the selector agent to pick, from the candidates that survived
-    screening, the one it judges most likely to come through the prover and
-    the verifiers.
-
-    The planner's best-first order is the fallback, not the default: if the
-    selector fails, runs out of room, or names a lemma it was not offered, the
-    first offered candidate is taken — which is what automation did before the
-    selector existed, and which keeps --mode auto able to make progress even
-    when this extra call goes wrong.
-    """
-    selector_sys = load_file(PROMPT_PATHS["selector.md"])
-    selector_user = (
-        f"Conjecture:\n{conjecture}\n\n"
-        f"Planner's strategy summary:\n{plan_summary or '(none)'}\n\n"
-        f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}\n\n"
-        f"{rejected_block(rejected_lemmas)}\n\n"
-        f"Candidate lemmas, in the order {proposer} offered them. Exactly "
-        f"one will be sent to the prover; choose from these only:\n"
-        f"{json.dumps(usable, indent=2)}"
-    )
-    text, _status, _partial = reason(selector_sys, selector_user, "selector",
-                           THINK["selector"], verbose,
-                           tools=agent_tools(dag, suspended))
-    check_mode_toggle(verbose)
-
-    res: Optional[Dict[str, Any]] = None
-    if text:
-        # selector.md demands raw JSON output; extraction is the fallback.
-        res = parse_json_or_none(text)
-        if res is None:
-            res = extract(
-                "Extract the selector's decision. selected_id must be one of "
-                "the offered candidate ids, copied verbatim.",
-                text,
-                SELECTOR_SCHEMA,
-                "selector",
-                verbose,
-            )
-    res = res or {}
-    selected_id = str(res.get("selected_id") or "").strip()
-    for cand in usable:
-        if cand["id"] == selected_id:
-            log(f"Selector picked {cand['id']}.", verbose)
-            return cand
-
-    if not text or not selected_id:
-        log(
-            f"Selector gave no usable choice; taking the first candidate "
-            f"instead ({usable[0]['id']}).",
-            verbose,
-        )
-    else:
-        log(
-            f"Selector chose {selected_id!r}, which was not among the "
-            f"candidates offered; taking the first candidate instead "
-            f"({usable[0]['id']}).",
-            verbose,
-        )
-    return usable[0]
+def select_lemma(usable: List[Dict[str, Any]], verbose: bool) -> Dict[str, Any]:
+    """Pick, uniformly at random, one of the candidates that survived
+    screening (screen_candidates: an id already in the DAG is out)."""
+    chosen = random.choice(usable)
+    if len(usable) > 1:
+        log(f"Picked {chosen['id']} at random from {len(usable)} candidates.", verbose)
+    return chosen
 
 
 def check_mode_toggle(verbose: bool = True) -> None:
@@ -5762,7 +5684,6 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         return load_dag()
 
     planner_sys = load_file(PROMPT_PATHS["planner.md"])
-    selector_sys = load_file(PROMPT_PATHS["selector.md"])
     prover_sys = load_file(PROMPT_PATHS["prover.md"])
     # One prompt per verification step; VERIFIER_AGENTS names the three.
     verifier_sys = {name: load_file(PROMPT_PATHS[name]) for name in VERIFIER_AGENTS}
@@ -5773,8 +5694,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
     reviser_sys = load_file(PROMPT_PATHS["reviser.md"])
 
     empty = [name for name, text in (
-        ("planner.md", planner_sys), ("selector.md", selector_sys),
-        ("prover.md", prover_sys), *verifier_sys.items(),
+        ("planner.md", planner_sys), ("prover.md", prover_sys), *verifier_sys.items(),
         ("reviser.md", reviser_sys),
     ) if not text]
     if empty:
@@ -5849,7 +5769,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 
         # The suspension, recomputed from the hashes, the certificates and
         # the refutations as they stand now (see suspension.py): the
-        # lemmas this iteration's planner, selector and prover are hidden
+        # lemmas this iteration's planner and prover are hidden
         # from. It is never stored in the DAG — this recomputation is the
         # only record of it — so a lemma re-proved and certified since the
         # last iteration is simply no longer in it.
@@ -5958,8 +5878,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             if planner_res is None:
                 planner_res = extract(
                     "Extract the plan. Copy every candidate lemma the text proposes "
-                    "into candidate_lemmas, preserving the order it presents them "
-                    "in.",
+                    "into candidate_lemmas.",
                     plan_text,
                     PLANNER_SCHEMA,
                     "planner",
@@ -5983,7 +5902,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             # ---------------- Step 1b: Selection ----------------
             # The one place the two modes differ, and so the one place MODE is
             # read. Everything after this block runs identically whether the lemma
-            # was chosen by a person or by the selector, which is what keeps
+            # was chosen by a person or at random, which is what keeps
             # --mode auto honest as a control.
             next_lemma: Optional[Dict[str, Any]] = None
             if MODE == "human":
@@ -6042,12 +5961,8 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
 
             if next_lemma is None:
                 # Automatic selection. Screening removes the candidates whose ids
-                # are already in the DAG; of what survives, the selector agent
-                # weighs each one and names the one it judges most likely to
-                # succeed.
-                # The planner's best-first order is only the fallback: with
-                # exactly one candidate surviving there is nothing to choose, and
-                # select_lemma() itself falls back when the selector fails.
+                # are already in the DAG; of what survives, one is picked
+                # uniformly at random.
                 log_candidates(screened, summary, verbose)
                 usable = [cand for cand, problems in screened if not problems]
                 if not usable:
@@ -6056,19 +5971,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
                     # per iteration only grew the planner's prompt.
                     log("No candidate is currently provable; re-planning.", verbose)
                     continue
-                if len(usable) == 1:
-                    next_lemma = usable[0]
-                    if next_lemma is not screened[0][0]:
-                        log(
-                            f"Skipped {screened[0][0]['id']} "
-                            f"({'; '.join(screened[0][1])}); took {next_lemma['id']}.",
-                            verbose,
-                        )
-                else:
-                    next_lemma = select_lemma(
-                        usable, dag, conjecture, summary, rejected_lemmas, verbose,
-                        suspended=suspended,
-                    )
+                next_lemma = select_lemma(usable, verbose)
 
         if resuming:
             lemma_id = in_flight["lemma_id"]
@@ -6197,15 +6100,19 @@ class LemmaBuffer:
 
     The generator fills the empty slots; the proof loops claim them. The
     slots are the flow control — a full buffer means the loops are behind,
-    and the generator waits for a slot instead of piling up work. Claiming
-    is atomic: a selector that picked a lemma another loop has taken in the
-    meantime is re-run on what remains, so two loops never work on one id.
+    and the generator waits for a slot instead of piling up work. The
+    unattended claim treats the buffer as a queue: the oldest unclaimed
+    lemma goes first, by arrival order rather than slot position (a freed
+    slot is refilled by whatever arrives next). Claiming is atomic, so two
+    loops never work on one id.
     """
 
     def __init__(self, size: int) -> None:
-        # Each slot is {"lemma": candidate, "claimed_by": loop id or None},
-        # or None while the slot is empty.
+        # Each slot is {"lemma": candidate, "claimed_by": loop id or None,
+        # "seq": arrival number}, or None while the slot is empty. seq is
+        # what makes the buffer a queue; a released claim keeps its place.
         self.slots: List[Optional[Dict[str, Any]]] = [None] * size
+        self._next_seq = 0
         self.cond = threading.Condition()
 
     def __len__(self) -> int:
@@ -6255,42 +6162,35 @@ class LemmaBuffer:
                     continue
                 for i, e in enumerate(self.slots):
                     if e is None:
-                        self.slots[i] = {"lemma": cand, "claimed_by": None}
+                        self.slots[i] = {
+                            "lemma": cand, "claimed_by": None,
+                            "seq": self._next_seq,
+                        }
+                        self._next_seq += 1
                         added += 1
                         break
             if added:
                 self.cond.notify_all()
         return added
 
-    def claim(self, loop_id: str, selector) -> Optional[Dict[str, Any]]:
-        """The atomic pick: snapshot the unclaimed lemmas, let the selector
-        choose outside the lock (its LLM call is never made under it), then
-        commit under the lock — and if the choice was claimed in the
-        meantime, re-run the selector on what remains. Returns the claimed
-        candidate, or None when the buffer runs out under the feet."""
-        while True:
-            with self.cond:
-                usable = self._unclaimed_locked()
-                if not usable:
-                    return None
-            chosen = selector(usable)
-            if chosen is None:
+    def claim_oldest(self, loop_id: str) -> Optional[Dict[str, Any]]:
+        """The unattended pick: claim the unclaimed lemma that entered the
+        buffer first. None when nothing is unclaimed."""
+        with self.cond:
+            waiting = [
+                e for e in self.slots
+                if e is not None and e["claimed_by"] is None
+            ]
+            if not waiting:
                 return None
-            with self.cond:
-                for e in self.slots:
-                    if (
-                        e is not None
-                        and e["lemma"]["id"] == chosen["id"]
-                        and e["claimed_by"] is None
-                    ):
-                        e["claimed_by"] = loop_id
-                        self.cond.notify_all()
-                        return e["lemma"]
-                # Stolen between snapshot and commit: go around again.
+            oldest = min(waiting, key=lambda e: e["seq"])
+            oldest["claimed_by"] = loop_id
+            self.cond.notify_all()
+            return oldest["lemma"]
 
     def claim_id(self, loop_id: str, lemma_id: str) -> Optional[Dict[str, Any]]:
         """Claim a named lemma — the human loop's pick. Same atomicity as
-        claim(): None when the id is not in the buffer unclaimed."""
+        claim_oldest(): None when the id is not in the buffer unclaimed."""
         with self.cond:
             for e in self.slots:
                 if (
@@ -6699,18 +6599,15 @@ def _parallel_planner(
             log("The loops are being stopped.", verbose)
             state.set_resolution(kind)
             return
-        plan = state.plan_snapshot()
+        # Each pass plans from scratch: the previous plan is not shown, so
+        # the new one is written from the DAG alone.
         operator_note = state.take_operator_note()
         plan_user = (
             f"Conjecture:\n{conjecture}\n\n"
             f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, susp.suspended), indent=2)}"
             f"{ref_block}{comments_block}\n\n"
-            f"{rejected_block(state.rejected_snapshot())}\n\n"
-            + (f"{operator_note}\n\n" if operator_note else "")
-            + "Current plan, if any (revise it against the DAG: keep what "
-            "still holds, drop what is done or dead, re-order what moved):\n"
-            + (json.dumps(plan, indent=2) if plan else "(none yet)")
-            + "\n"
+            f"{rejected_block(state.rejected_snapshot())}\n"
+            + (f"\n{operator_note}\n" if operator_note else "")
         )
         text, _status, _partial = reason(
             planner_sys, plan_user, "parallel_planner",
@@ -6838,35 +6735,14 @@ def _parallel_generator(
                 return
 
 
-def _auto_claim(
-    state: ParallelState,
-    loop_id: str,
-    verbose: bool,
-    conjecture: str,
-) -> Optional[Dict[str, Any]]:
-    """The unattended claim: snapshot the unclaimed buffer, let the
-    selector agent weigh them, commit atomically. None when the buffer
-    holds nothing the loops have not already taken."""
-
-    def pick(usable: List[Dict[str, Any]]) -> Dict[str, Any]:
-        dag = load_dag()
-        plan = state.plan_snapshot() or {}
-        rejected = state.rejected_snapshot()
-        susp = suspension.compute(
-            dag["lemmas"], load_references(), CONJECTURE_ROOT
-        )
-        return select_lemma(
-            usable,
-            dag,
-            conjecture,
-            str(plan.get("plan_summary") or ""),
-            rejected,
-            verbose,
-            proposer="the lemma generator",
-            suspended=susp.suspended,
-        )
-
-    return state.buffer.claim(loop_id, pick)
+def _auto_claim(state: ParallelState, loop_id: str, verbose: bool) -> Optional[Dict[str, Any]]:
+    """The unattended claim: the oldest unclaimed lemma in the buffer,
+    first in, first out. None when the buffer holds nothing the loops have
+    not already taken."""
+    claimed = state.buffer.claim_oldest(loop_id)
+    if claimed is not None:
+        log(f"[{loop_id}] Took {claimed['id']}, the oldest in the buffer.", verbose)
+    return claimed
 
 
 def _parallel_human_step(
@@ -7097,13 +6973,9 @@ def _parallel_proof_loop(
                 if action == "prove":
                     fresh_target = lemma
                 else:  # 'auto': the operator delegated the pick.
-                    fresh_target = _auto_claim(
-                        state, loop_id, verbose, conjecture
-                    )
+                    fresh_target = _auto_claim(state, loop_id, verbose)
             else:
-                fresh_target = _auto_claim(
-                    state, loop_id, verbose, conjecture
-                )
+                fresh_target = _auto_claim(state, loop_id, verbose)
             if fresh_target is None:
                 # Nothing unclaimed in the buffer: the generator is behind.
                 # Wait for it to fill a slot (or the run to stop).

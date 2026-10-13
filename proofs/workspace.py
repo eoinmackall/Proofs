@@ -17,7 +17,7 @@ Layout:
         conjecture.md
 
     agents/
-      planner.md  selector.md  prover.md  verifier_1/2/3.md  reviser.md  <- project-wide defaults
+      planner.md  prover.md  verifier_1/2/3.md  reviser.md  <- project-wide defaults
 
 Three decisions worth flagging, all changeable:
 
@@ -102,7 +102,6 @@ AGENTS_DIR = "agents"
 # "drop a file next to conjecture.md" whatever the agent is.
 PROMPT_FILES: Dict[str, str] = {
     "planner.md": "planner.md",
-    "selector.md": "selector.md",
     "prover.md": "prover.md",
     "verifier_1.md": "verifier_1.md",
     "verifier_2.md": "verifier_2.md",
