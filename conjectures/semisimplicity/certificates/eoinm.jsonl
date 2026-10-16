@@ -83,3 +83,8 @@
 {"user_id":"eoinm","lemma_id":"lemma_123","hash":"5721cc10d039548f5505fda1ef554a95a99f17e3f34842d8f54376219081981b","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-15T15:43:25Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_120","hash":"0486fc2e75ef248ed2876f9ca4ab4fea392d298594e899fb2d4eb1123ef37f9f","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-15T16:06:22Z","count":1}
 {"user_id":"eoinm","lemma_id":"lemma_126","hash":"a8b237de16ffabc138be1d3a215e8358f77fe91963e1c8424baa5194a92f123f","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-16T02:36:17Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_invariants_components","hash":"17cc602381b1c8803ee1ab956d90e405cf7001d7ff59ccb9ae3bbcc3fe0bd3a6","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-16T06:50:48Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_long_exact_comparison","hash":"c97a636d820d281aeb637ad2afa832aba8f7eb7bec6448d1070f79c92c815b7b","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-16T10:37:43Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_129","hash":"56004b9b6047b2b9438787116b12a2d3cb89c316c572743b92a620d4deac621a","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-16T13:01:09Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_frob_lefschetz_stable","hash":"e18f1c8bfbeeec7f29d660eb8c338eb916f7b05b5f9ea02e9bd5bdfa961eaaa6","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-16T13:02:44Z","count":1}
+{"user_id":"eoinm","lemma_id":"lemma_abjac_frob","hash":"b52bb30938a21a3341f351d304811f5d27829cbbe106c5bac8144994169736d2","verifier":"eoinm","model":"Qwen/Qwen3.8-Flash-Next-FP8","date":"2026-10-16T14:33:28Z","count":1}
