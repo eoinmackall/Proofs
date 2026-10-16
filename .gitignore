@@ -1,5 +1,6 @@
 __pycache__/
 *.egg-info/
+.venv/
 build/
 result
 # Reference input material is the conjecture maintainer's local working
