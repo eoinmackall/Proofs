@@ -16,3 +16,7 @@ proofs = "proofs.cli:main"
 
 [tool.setuptools]
 packages = ["proofs"]
+
+# The default agent prompts, installed beside the code (workspace.agents_dir).
+[tool.setuptools.package-data]
+proofs = ["agents/*.md", "agents/parallel/*.md"]

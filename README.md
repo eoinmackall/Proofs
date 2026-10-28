@@ -558,7 +558,7 @@ finish.
 The loops do not take lemmas from the planner directly. Between them sits a
 fixed buffer of **N+5 slots** — the possible-lemma list. The generator is its
 only writer: each round it proposes five candidate lemmas
-(`agents/parallel/parallel_lemma_generator.md`) and the new ones go into the
+(`proofs/agents/parallel/parallel_lemma_generator.md`) and the new ones go into the
 empty slots. An id already in the DAG, already in the buffer, already on the
 reject list, or currently held in flight by a loop is dropped, so no id is
 ever claimed twice. The slots are also the flow control: a full buffer means
@@ -583,7 +583,7 @@ lemmas in the DAG.
 
 ### The planner and the generator
 
-- **Planner** (`agents/parallel/parallel_planner.md`) sets direction, not
+- **Planner** (`proofs/agents/parallel/parallel_planner.md`) sets direction, not
   lemmas: a strategy summary and an ordered list of priorities — which gaps
   in the DAG to close next, and why. It runs once at start, and then whenever
   the DAG changes: a lemma added by *any* loop bumps the DAG version and
@@ -591,7 +591,7 @@ lemmas in the DAG.
   the plan is installed already marked stale and the planner goes straight
   back around — no DAG change is lost, and the plan the loops are steering
   by was always written for the DAG as it stood.
-- **Generator** (`agents/parallel/parallel_lemma_generator.md`) turns the
+- **Generator** (`proofs/agents/parallel/parallel_lemma_generator.md`) turns the
   plan into five concrete candidate lemmas per round. It sees the conjecture,
   the plan, the DAG, the buffer's current contents, and the reject list, so
   it never restates a lemma the loops already have, hold, or failed.
@@ -648,12 +648,12 @@ restarts the budgets from 1 and keeps the DAG.
 ## Project layout
 
 ```
-agents/
-  planner.md  prover.md  verifier_1/2/3.md  reviser.md   # default agent prompts (one reviser for rejects and overflows)
-  parallel/                                    # parallel-mode prompts
-    parallel_planner.md  parallel_lemma_generator.md
-  parsing.md                               # references parser prompt
 proofs/
+  agents/              # default agent prompts, installed with the package
+    planner.md  prover.md  verifier_1/2/3.md  reviser.md   # one reviser for rejects and overflows
+    parallel/                                    # parallel-mode prompts
+      parallel_planner.md  parallel_lemma_generator.md
+    parsing.md                                   # references parser prompt
   cli.py               # the `proofs` command: subcommands and argument validation
   config.py            # the user's global config (~/.config/proofs/config): user.id, user.name, user.email
   main.py              # the proof loop (planner → prover → verifier → reviser) and the verify/repair/prune/status/export entries
@@ -717,9 +717,10 @@ A lemma's owner is never stored inside the node: it is the file's name,
 `<owner>_dag.json`. Its id is the node's key. Only `statement`, `proof` and
 the cited statements go into the [Merkle hash](#certificates-and-the-merkle-hash).
 
-Prompt files are looked up in the conjecture directory first, then in
-`agents/`, so a conjecture that needs a special prompt (e.g. a prover primed
-for Brauer groups) can carry one without forking the defaults.
+Prompt files are looked up in the conjecture directory first, then in the
+defaults shipped with the package (`proofs/agents/`), so a conjecture that
+needs a special prompt (e.g. a prover primed for Brauer groups) can carry
+one without forking the defaults.
 
 ### Cancelling a run (Ctrl-C) and resuming
 
@@ -771,7 +772,7 @@ of that directory have different owners:
   ```
 
   It reads every parsable file in `references/`, asks the model (via
-  `agents/parsing.md`) for the theorem-level results, and writes them to
+  `proofs/agents/parsing.md`) for the theorem-level results, and writes them to
   `references.md` beside the DAG as a **strict JSON array** — one object per
   result with `id`, `slogan`, `formal statement` and `reference` (where it
   appears in the file). The maintainer then commits and pushes the file
@@ -836,7 +837,7 @@ A conjecture directory may hold a `comments.md` beside its
 counterexample — routes to try, objects or theorems worth using, or dead
 ends to avoid. No tooling touches it; you just edit it. On every planning
 step the loop hands the file's contents to the planner verbatim as a
-**Human comments** section, and `agents/planner.md` tells the planner how
+**Human comments** section, and `proofs/agents/planner.md` tells the planner how
 to read it: weigh the suggestions — when a comment points at a viable route
 the state of the proof allows, one of the five candidates should be a
 concrete version of it — but treat them as suggestions, not instructions,

@@ -16,8 +16,8 @@ Layout:
       some_other_problem/
         conjecture.md
 
-    agents/
-      planner.md  prover.md  verifier_1/2/3.md  reviser.md  <- project-wide defaults
+    proofs/agents/                 <- inside the package, installed with it
+      planner.md  prover.md  verifier_1/2/3.md  reviser.md  <- default prompts
 
 Three decisions worth flagging, all changeable:
 
@@ -39,7 +39,7 @@ Three decisions worth flagging, all changeable:
     lemma.
 
   * Prompt files are looked up in the conjecture directory first, then in
-    agents/. Nothing changes unless you drop a file in; it just means a
+    the package's agents/. Nothing changes unless you drop a file in; it just means a
     conjecture that needs, say, a prover primed for Brauer groups can have one
     without forking the defaults.
 
@@ -96,10 +96,10 @@ AGENTS_DIR = "agents"
 # (VERIFIER_AGENTS in main.py).
 #
 # Each entry maps the lookup name (what PROMPT_PATHS is keyed by, and what a
-# per-conjecture override file is called) to the path the project-wide default
-# lives at, relative to agents/. The parallel-mode agents keep their own
-# subdirectory on disk but stay flat in the map, so an override is always just
-# "drop a file next to conjecture.md" whatever the agent is.
+# per-conjecture override file is called) to the path the default lives at,
+# relative to the package's agents/. The parallel-mode agents keep their own
+# subdirectory on disk but stay flat in the map, so an override is always
+# just "drop a file next to conjecture.md" whatever the agent is.
 PROMPT_FILES: Dict[str, str] = {
     "planner.md": "planner.md",
     "prover.md": "prover.md",
@@ -176,23 +176,14 @@ def available(project_root: Path = Path(".")) -> List[str]:
     )
 
 
-def agents_dir_for(conjecture_root: Path, project_root: Path = Path(".")) -> Path:
-    """The agents/ directory whose prompts a conjecture runs with.
+def agents_dir() -> Path:
+    """The agents/ directory of default prompts shipped inside this package.
 
-    The nearest agents/ above the conjecture directory — the repository the
-    conjecture lives in, conjectures/NAME being two levels below it — so a
-    command run from anywhere finds the same prompts a command run from the
-    repository root does. A conjecture kept outside any repository falls
-    back to the agents/ beside this package (an editable install, or a
-    checkout on PYTHONPATH), then to project_root's.
+    The prompts are package data (pyproject.toml's package-data), installed
+    beside the code that parses their output, so every install — pip, Nix,
+    or a checkout — runs with the prompts its own version expects.
     """
-    for d in [conjecture_root, *conjecture_root.parents]:
-        if (d / AGENTS_DIR).is_dir():
-            return d / AGENTS_DIR
-    beside_package = Path(__file__).resolve().parent.parent / AGENTS_DIR
-    if beside_package.is_dir():
-        return beside_package
-    return (project_root / AGENTS_DIR).resolve()
+    return Path(__file__).resolve().parent / AGENTS_DIR
 
 
 def resolve(
@@ -217,10 +208,9 @@ def resolve(
     the user's share of the conjecture's proof. The run reads every file in
     dags/ (the complete DAG) and writes this file alone.
 
-    The project-wide prompts are found from the conjecture, not from the
-    current directory: agents/ in the nearest directory above the conjecture
-    that has one (the repository the conjecture lives in), else beside this
-    package, else under project_root — see agents_dir_for().
+    A prompt is taken from the conjecture directory when a file of that
+    name is there, else from the defaults shipped in the package — see
+    agents_dir().
     """
     if not user_id:
         raise ValueError("resolve() needs a user_id to name the run's DAG file")
@@ -248,7 +238,7 @@ def resolve(
     dags_dir = root / DAGS_DIRNAME
     dag = dags_dir / (user_id + USER_DAG_SUFFIX)
 
-    agents = agents_dir_for(root, project_root)
+    agents = agents_dir()
     prompts: Dict[str, Path] = {}
     overridden: List[str] = []
     for name, rel in PROMPT_FILES.items():

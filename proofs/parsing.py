@@ -1,7 +1,7 @@
 """Standalone references parser.
 
 Scans a conjecture's references/ directory for .tex/.md/plain-text files,
-reads each one with the LLM (agents/parsing.md), extracts the theorem-level
+reads each one with the LLM (proofs/agents/parsing.md), extracts the theorem-level
 results, and writes them to references.md as a strict JSON array:
 
     [
