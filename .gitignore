@@ -3,6 +3,11 @@ __pycache__/
 .venv/
 build/
 result
+
+# >>> proofs >>>
+# Managed by proofs init: re-running it replaces everything between these
+# markers, so put your own rules outside them.
+#
 # Reference input material is the conjecture maintainer's local working
 # copy: the maintainer points `proofs parse` at it, and the parsed output
 # (references.md, beside the directory) is what gets committed with the
@@ -29,3 +34,4 @@ conjectures/*/references.md.*.tmp
 # Never commit API keys (README "Backend": --api-key / $LLM_API_KEY).
 .env
 .env.*
+# <<< proofs <<<

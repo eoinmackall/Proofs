@@ -22,7 +22,7 @@ of preference:
     DeepSeek, ...) serves it at its base URL. The same transport covers both.
     The only difference is that a hosted API wants an
     `Authorization: Bearer <key>` header, which this module sends whenever an
-    API key is supplied (--api-key or $LLM_API_KEY).
+    API key is supplied (--api-key).
 
 The dialect of that endpoint — which sampling fields it accepts, and whether
 schema calls must have thinking suppressed — is a probe decision by default
@@ -82,10 +82,6 @@ class Profile:
     is_llama_cpp: bool = False
     key_verified: bool = False
     auth_error: Optional[str] = None
-    # Per-model sampler values, empty by default: no model table ships with
-    # this code, so this stays {} unless something fills it. REASONING_OPTIONS
-    # in main.py (num_predict etc.) are layered on top of these by the backend.
-    sampling: Dict[str, Any] = field(default_factory=dict)
     # Calibration seed, not capability: how many characters of prompt text
     # one token of context roughly buys. probe() uses it to seed the running
     # estimate (_RUNNING_CHARS_PER_TOKEN), which note_usage() revises from
@@ -108,8 +104,8 @@ class Profile:
 # There is deliberately no per-model sampling table here. The sampler values
 # a model's card recommends (top_k, top_p, ...) cannot be probed off the
 # server, but rather than hardcode a handful we let a model run on its own
-# card and defaults: profile.sampling above stays empty by default, and the
-# per-call options in main.py layer on top of it. num_predict is the same idea
+# card and defaults, and only the per-call options in main.py are sent on top
+# of the server's own. num_predict is the same idea
 # — a per-call budget in main.py, sized by the workload, not a model property.
 
 
@@ -262,7 +258,7 @@ class OpenAICompatibleBackend:
         "seed": "seed",
     }
 
-    def __init__(self, model: str, host: str = "http://localhost:8081",
+    def __init__(self, model: str, host: str,
                  timeout: int = 1800, api_key: Optional[str] = None,
                  backend: str = "auto") -> None:
         if backend not in ("auto", "llamacpp", "openai"):
@@ -388,8 +384,8 @@ class OpenAICompatibleBackend:
                 if rm.status_code in (401, 403) and self.api_key:
                     prof.auth_error = (
                         f"API key rejected by {self.host}/v1/models "
-                        f"(HTTP {rm.status_code}). Check --api-key / "
-                        f"$LLM_API_KEY and that it matches {self.host}."
+                        f"(HTTP {rm.status_code}). Check --api-key "
+                        f"and that it matches {self.host}."
                     )
                 elif rm.status_code == 200:
                     prof.key_verified = True
@@ -418,8 +414,7 @@ class OpenAICompatibleBackend:
         model answer rather than call, with the tools still declared for the
         tool messages already in the conversation). A server that refuses
         tools raises ToolsUnsupported."""
-        merged = dict(self.profile.sampling if self.profile else {})
-        merged.update(options or {})
+        merged = dict(options or {})
 
         payload: Dict[str, Any] = {"model": self.model, "messages": messages,
                                    "stream": False}
@@ -528,31 +523,14 @@ class OpenAICompatibleBackend:
         )
 
 
-# 8080 is llama-server's own default, but it is also open-webui's, so the
-# project defaults to 8081: launch llama-server with --port 8081 to match,
-# or point $LLAMA_HOST / --host at wherever it listens. For a hosted API,
-# pass its base URL as --host (e.g. https://api.openai.com, without the /v1
-# suffix) — it does not use this default at all.
-# The probe makes a wrong guess loud rather than silent: a service with no
-# /props route (open-webui, say) 404s, and you get
-# default_generation_settings=None instead of a confusing half-working
-# session against the wrong service.
-_DEFAULT_HOST = os.environ.get("LLAMA_HOST", "http://localhost:8081")
-# Where an API key comes from when --api-key is not given. One name on
-# purpose: the key belongs to whatever --host points at, so a per-provider env
-# var (OPENAI_API_KEY, ...) would be a guess about the host. Set LLM_API_KEY
-# for the host you pass.
-_DEFAULT_API_KEY_ENV = "LLM_API_KEY"
-
-
-def make_backend(model: str, host: Optional[str] = None,
+def make_backend(model: str, host: str,
                  timeout: int = 1800,
                  api_key: Optional[str] = None,
                  backend: str = "auto") -> OpenAICompatibleBackend:
-    if not api_key:
-        api_key = os.environ.get(_DEFAULT_API_KEY_ENV)
-    return OpenAICompatibleBackend(model, host or _DEFAULT_HOST, timeout,
-                                   api_key, backend)
+    # No fallbacks: the model and host are always the caller's (--model,
+    # --host), and a key is sent only when one is passed (--api-key).
+    return OpenAICompatibleBackend(model, host, timeout, api_key or None,
+                                   backend)
 
 
 def note_usage(usage: Dict[str, Any], prompt_chars: int) -> None:

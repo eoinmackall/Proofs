@@ -167,7 +167,7 @@ backends:
   thinking, so reasoning is disabled for schema calls.
 - **a hosted API** — any OpenAI-compatible provider (OpenAI, OpenRouter,
   DeepSeek, ...), pointed at by `--host` with its base URL and authenticated
-  with `--api-key` (or `$LLM_API_KEY`). A supplied key is checked against the
+  with `--api-key`. A supplied key is checked against the
   provider's `/v1/models` at startup, so a wrong key fails loudly instead of
   401-ing every call in a run.
 
@@ -222,16 +222,31 @@ so `nix run . -- --help` works without cloning. Outside Nix, `pip install .`
 installs the `proofs` command; otherwise any Python 3 install with
 `requests` works, run from the repository root as `python -m proofs ...`.
 
+Then make a workspace — the directory your conjectures live in — set your
+identity once, and start a conjecture:
+
+```sh
+proofs init ~/my-proofs        # or `proofs init` in the current directory
+cd ~/my-proofs
+git init                       # if it is not already in a repository
+proofs config --global user.id eoin
+proofs new standard_d          # then write the statement into conjectures/standard_d/conjecture.md
+proofs run standard_d
+```
+
+See [Workspaces](#workspaces).
+
 ## Usage
 
 ### The `proofs` command
 
-One command, nine subcommands:
+One command, ten subcommands:
 
 | Subcommand | Takes | Does |
 | --- | --- | --- |
 | `proofs config KEY [VALUE]` | a config key, an optional value | Gets or sets the user's config, git-style: `user.id`, `user.name`, `user.email`. |
-| `proofs new NAME` | a directory name | Lays out a blank conjecture, `conjectures/NAME/`: empty `references/`, `dags/` and `certificates/` directories, an empty `conjecture.md` and `comments.md`, and a `references.md` holding the empty collection `[]`. Refuses a `NAME` that already exists. |
+| `proofs init [DIR]` | a directory (default `.`) | Makes `DIR` a proofs workspace: creates `DIR/conjectures/`, writes the `.proofs` marker (`format = 1`), and writes or updates the proofs block of `DIR/.gitignore` (between `# >>> proofs >>>` and `# <<< proofs <<<`; lines outside it are never touched). Safe to re-run; refuses a `DIR` inside another workspace. |
+| `proofs new NAME` | a directory name | Lays out a blank conjecture, `conjectures/NAME/` under the workspace root: empty `references/`, `dags/` and `certificates/` directories, an empty `conjecture.md` and `comments.md`, and a `references.md` holding the empty collection `[]`. Refuses a `NAME` that already exists. |
 | `proofs run DIR` | `DIR`, then the loop's options | Runs the proof loop on the conjecture. |
 | `proofs parse DIR` | `DIR`, then the parser's options | The maintainer's tool: parses `DIR`'s `references/` into the committed `references.md`. |
 | `proofs verify PATH lemma_id [--full]` | a user's DAG file, a lemma | Verifies the lemma; with `--full`, what it cites too, cited lemmas first. |
@@ -240,7 +255,14 @@ One command, nine subcommands:
 | `proofs status PATH lemma_id` | a user's DAG file, a lemma | Lists the valid certificates in the lemma's citation closure, then whether the conjecture is settled. |
 | `proofs export PATH [lemma_id] -o OUT_DIR` | a DAG file or a conjecture directory, an optional lemma, the output directory | Writes a LaTeX document of the DAG, in dependency order, into OUT_DIR. |
 
-`DIR` is a conjecture directory. `PATH` is a user's DAG file,
+Every command works inside a **workspace**, the directory `proofs init`
+marks with a `.proofs` file. A bare `NAME` always means `conjectures/NAME`
+under the workspace root, wherever in the workspace the command is run; a
+path is taken relative to the current directory, as usual. See
+[Workspaces](#workspaces).
+
+`DIR` is a conjecture directory: a bare `NAME`, looked up in the
+workspace's `conjectures/`, or a path to one. `PATH` is a user's DAG file,
 `conjectures/NAME/dags/<user_id>_dag.json`, whose name supplies the lemma's
 `user_id` — a lemma is addressed as `(user_id, lemma_id)`; for `export`,
 `PATH` may be the conjecture directory itself, in which case the complete DAG
@@ -287,28 +309,34 @@ checkout. To move your own files to a new email, set the new one and edit
 the stamp at the top of both files to match.
 
 ```sh
-proofs run conjectures/algebra_example
-proofs run conjectures/algebra_example --model Qwen3.5-122B-Q4_K_M
-proofs run conjectures/algebra_example --no-verbose --max-iterations 25
-proofs run conjectures/algebra_example --mode human
-proofs run conjectures/algebra_example --parallel 2
-proofs run conjectures/algebra_example --parallel 3 --mode human
+# once per workspace: conjectures/, the .proofs marker, the .gitignore block
+proofs init
+
+# a bare name is looked up in the workspace's conjectures/, from anywhere
+# inside the workspace; a path (conjectures/algebra_example, /abs/path)
+# works too, and outside a workspace only a path does
+# --host and --model are required on every run, parse, verify and repair
+proofs run algebra_example --host http://localhost:8081 --model qwen3.8-27b
+proofs run algebra_example --host http://localhost:8081 --model qwen3.8-27b --mode human
+proofs run algebra_example --host http://localhost:8081 --model qwen3.8-27b --parallel 2
+proofs run conjectures/algebra_example --host http://localhost:8081 --model qwen3.8-27b
 
 # or against a hosted API instead of a local llama-server
-LLM_API_KEY=sk-... proofs run conjectures/algebra_example \
-    --host https://api.openai.com --model gpt-4o
+proofs run algebra_example \
+    --host https://api.openai.com --model gpt-4o --api-key sk-...
 
 # once, before proving: parse the conjecture's reference collection
-proofs parse conjectures/algebra_example
+proofs parse algebra_example
 
 # the DAG as a LaTeX document, in dependency order: the complete DAG, or
 # one user's lemmas, or a single lemma with everything it cites, written
 # into the directory -o names (created if it is not there yet)
-proofs export conjectures/algebra_example -o ~/tex
+proofs export algebra_example -o ~/tex
 proofs export conjectures/algebra_example/dags/alice_dag.json -o ~/tex
 proofs export conjectures/algebra_example/dags/alice_dag.json lemma_42 -o ~/tex
 
-# start a new conjecture, then write its statement into conjecture.md
+# start a new conjecture (conjectures/standard_d/ under the workspace
+# root), then write its statement into conjecture.md
 proofs new standard_d
 
 # on a fresh machine, set the identity once, git-style
@@ -318,7 +346,7 @@ proofs config --global user.email eoin@example.com
 ```
 
 `run` and `parse` both take one argument, the conjecture directory: a name
-under `conjectures/` or a path to it — anything after it is passed through
+under the workspace root's `conjectures/` or a path to it — anything after it is passed through
 to the tool unchanged. `parse` shares `run`'s server options (`--host`,
 `--api-key`, `--backend`, `--model`, `--num-ctx`) and its DIR / `--verbose`
 pair; it has no proving options, because it has no loop. `verify` and
@@ -332,10 +360,10 @@ server options.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `DIR` | — | The conjecture directory: a name under `conjectures/` holding a `conjecture.md`, or a path to it. Taken by `run` and `parse`. |
-| `--model NAME` | `qwen3.8-27b` | Sent as the `model` field of every request. On a hosted API, the model to use (e.g. `gpt-4o`); a llama-server ignores it and serves the model it loaded. Not what certificates record — see [Backend](#backend). |
-| `--host URL` | `http://localhost:8081` | OpenAI-compatible base URL — a local llama-server, or a hosted API's base (e.g. `https://api.openai.com`, without the `/v1` suffix — it is added automatically). `$LLAMA_HOST` overrides the default. The default is 8081 rather than llama-server's own 8080, which other local services (open-webui, for one) often hold. |
-| `--api-key KEY` | `$LLM_API_KEY` | Sent as `Authorization: Bearer <key>`. Needed for a hosted API; leave unset for a plain local llama-server. |
+| `DIR` | — | The conjecture directory: a name under the workspace root's `conjectures/` holding a `conjecture.md`, or a path to it. Taken by `run` and `parse`. |
+| `--model NAME` | required | Sent as the `model` field of every request. On a hosted API, the model to use (e.g. `gpt-4o`); a llama-server ignores it and serves the model it loaded. Not what certificates record — see [Backend](#backend). |
+| `--host URL` | required | OpenAI-compatible base URL — a local llama-server, or a hosted API's base (e.g. `https://api.openai.com`, without the `/v1` suffix — it is added automatically). |
+| `--api-key KEY` | none | Sent as `Authorization: Bearer <key>`. Needed for a hosted API; leave unset for a plain local llama-server. |
 | `--backend {auto,llamacpp,openai}` | `auto` | Which dialect of the OpenAI-compatible endpoint to speak: the full llama.cpp option set (with thinking suppressed for schema calls), or the standard OpenAI set. `auto` takes the probe's answer; the other two force it, for when the probe can't see the real server. |
 | `--max-iterations N` | 10 | Loop iterations before giving up. |
 | `--max-proof-attempts N` | 3 | Prover rounds per lemma before it is given up. |
@@ -422,15 +450,20 @@ supply the proof:
 
 ## Sharing a conjecture
 
-A conjecture is shared by putting its directory in a git repository that
-everyone pulls from and pushes to. `proofs` never runs git itself: you pull
-before a session and commit and push afterwards. The files are laid out so
-that two users' work almost never lands in the same file.
+A conjecture is shared by putting its [workspace](#workspaces) in a git
+repository that everyone pulls from and pushes to: `proofs init`, `git
+init`, and commit `.proofs`, `.gitignore` and `conjectures/`. Anyone who
+clones the repository has the workspace — the marker is committed — and
+needs only their own `proofs config --global user.id`. `proofs` never runs
+git itself: you pull before a session and commit and push afterwards. The
+files are laid out so that two users' work almost never lands in the same
+file.
 
 ### Who writes what
 
 | File | Written by | Committed |
 | --- | --- | --- |
+| `.proofs`, the proofs block of `.gitignore` | `proofs init` | yes |
 | `conjecture.md`, `references.md` | the conjecture's maintainer | yes |
 | `dags/<user_id>_dag.json` | that user's runs (and `proofs repair`, see below) | yes |
 | `certificates/<user_id>.jsonl` | that user's runs, `verify` and `repair` | yes |
@@ -445,7 +478,7 @@ proofs cite lemmas as `{"user_id", "lemma_id"}` pairs. The typical cycle:
 
 ```sh
 git pull
-proofs run conjectures/NAME            # prove; commits to your files only
+proofs run NAME                        # prove; commits to your files only
 proofs verify conjectures/NAME/dags/alice_dag.json lemma_7 --full   # check someone else's work
 git add conjectures/NAME && git commit -m "..." && git push
 ```
@@ -647,7 +680,12 @@ restarts the budgets from 1 and keeps the DAG.
 
 ## Project layout
 
+This repository is itself a workspace, holding the example conjectures
+beside the program:
+
 ```
+.proofs                # the workspace marker (format = 1)
+.gitignore             # the program's own rules, then the proofs block proofs init writes
 proofs/
   agents/              # default agent prompts, installed with the package
     planner.md  prover.md  verifier_1/2/3.md  reviser.md   # one reviser for rejects and overflows
@@ -667,7 +705,7 @@ proofs/
   tools.py             # agent tools (lookup_lemmas) and the two tool-calling protocols
   llm_backend.py       # OpenAI-compatible transport (llama.cpp or a hosted API) + model profiles
   interaction.py       # human-in-the-loop menu + hotkey
-  workspace.py         # per-conjecture directories and prompt resolution
+  workspace.py         # the workspace (init, root discovery, the .gitignore block), per-conjecture directories, prompt resolution
 conjectures/
   algebra_example/
     conjecture.md          # required: the statement
@@ -685,9 +723,47 @@ pyproject.toml             # the package and the `proofs` console script
 flake.nix                  # Nix dev shell, package and app (`nix run .`)
 ```
 
+### Workspaces
+
+A workspace is a directory holding a `.proofs` marker and a `conjectures/`
+directory. `proofs init [DIR]` makes one (`DIR` defaults to the current
+directory, and is created if it is not there):
+
+- it creates `DIR/conjectures/`;
+- it writes `DIR/.proofs`, which records the layout version, `format = 1`;
+- it writes the proofs block of `DIR/.gitignore`: the rules that keep each
+  user's local files — `references/`, `comments.md`, checkpoints, lock and
+  temp files, `.env` — out of git. The block sits between
+  `# >>> proofs >>>` and `# <<< proofs <<<`; an existing block is replaced
+  in place, a `.gitignore` without one has it appended, and lines outside
+  it are never touched, so keep your own rules outside the markers. The
+  rules live in one place, `GITIGNORE_RULES` in `workspace.py`, so
+  re-running `proofs init` brings a workspace's block up to date.
+
+Re-running `proofs init` is safe: an existing marker and existing
+conjectures are left alone, and only the block is rewritten. Run inside an
+existing workspace — in a subfolder, or in its `conjectures/` — it refuses,
+since a nested workspace is almost certainly a mistake. Outside a git
+repository it says so, with a hint to run `git init` to share the
+workspace.
+
+Every other command finds the workspace by walking up from the current
+directory to the first folder with a `.proofs`, as git finds `.git`, so a
+bare conjecture name works from anywhere inside it. Outside a workspace:
+
+- `proofs new` stops with `not in a proofs workspace; run proofs init`;
+- `run`, `parse`, `prune`, `verify`, `repair`, `status` and `export` keep
+  working given an explicit path to a conjecture, DAG file or refutation,
+  and give the same error for a bare name;
+- `proofs config` is unaffected: the config is per user, not per workspace.
+
+A directory laid out before workspaces — a `./conjectures/` with no
+`.proofs` above it — is still used as the root when commands are run from
+it, with a warning to run `proofs init` there.
+
 ### Conjectures and the shared DAG
 
-`DIR` names a conjecture directory: a name under `conjectures/`, or a path
+`DIR` names a conjecture directory: a name under the workspace root's `conjectures/`, or a path
 to one, holding a `conjecture.md`. Every user's lemmas live in their own
 `dags/<user_id>_dag.json`, and every command merges all the files in `dags/`
 into the complete DAG. Point a second user, or a second model, at a

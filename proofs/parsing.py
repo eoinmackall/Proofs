@@ -197,7 +197,7 @@ def parse_file(
     # reason() returns (content, status, partial); the partial work is
     # unused here — a file too long for one pass is skipped, not rescued.
     content, status, _ = main.reason(
-        system_prompt, user, "parser", main.THINK["parser"], verbose
+        system_prompt, user, "parser", verbose
     )
     if status == "ceiling" and not content:
         main.log(
@@ -260,7 +260,14 @@ def make_entry(
 # Entry point, named run() because this module imports main and a function
 # called main would shadow it: every main.reason / main.log call below would
 # then resolve against the function instead of the module.
-def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
+#
+# root is the workspace root a bare --conjecture NAME is looked up under
+# (workspace.resolve), None outside a workspace; proofs parse passes it in.
+def run(
+    argv: Optional[List[str]] = None,
+    prog: Optional[str] = None,
+    root: Optional[Path] = None,
+) -> None:
     ap = argparse.ArgumentParser(
         prog=prog,
         description="Parse a conjecture's references/ directory into references.md.",
@@ -272,22 +279,21 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
         help="Enable or disable console logging (default: --verbose)",
     )
     ap.add_argument(
-        "--host", default=None,
+        "--host", required=True,
         help="OpenAI-compatible base URL: a local llama-server, or a hosted "
              "API's base (e.g. https://api.openai.com, without the /v1 "
-             "suffix — it is added automatically). Defaults to "
-             "$LLAMA_HOST or localhost:8081 (8080 is taken by open-webui).",
+             "suffix — it is added automatically). Required.",
     )
     ap.add_argument(
         "--api-key", default=None,
         help="API key sent as 'Authorization: Bearer <key>'. Needed for a "
-             "hosted API; defaults to $LLM_API_KEY. Leave unset for a plain "
-             "local llama-server (or one launched without --api-key).",
+             "hosted API; with none given, no key is sent. Leave unset for a "
+             "plain local llama-server (or one launched without --api-key).",
     )
     ap.add_argument(
-        "--model", default=main.MODEL_NAME,
+        "--model", required=True,
         help="Model name: the --alias llama-server was launched with, or the "
-             "provider's model id (e.g. gpt-4o).",
+             "provider's model id (e.g. gpt-4o). Required.",
     )
     ap.add_argument(
         "--backend", choices=("auto", "llamacpp", "openai"), default="auto",
@@ -301,9 +307,11 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
         ),
     )
     ap.add_argument(
-        "--conjecture", default=main.DEFAULT_CONJECTURE,
-        help=f"Directory under {workspace.CONJECTURES_ROOT}/ containing "
-             f"{workspace.CONJECTURE_FILENAME} (default: {main.DEFAULT_CONJECTURE})",
+        "--conjecture", required=True,
+        help=f"A conjecture directory containing "
+             f"{workspace.CONJECTURE_FILENAME}: a name under the workspace "
+             f"root's {workspace.CONJECTURES_ROOT}/, or a path to it "
+             "(required)",
     )
     ap.add_argument(
         "--num-ctx", type=int, default=None,
@@ -350,7 +358,7 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     # are the same shape a run would use.
     try:
         user_id = config.ensure_user_id()
-        paths = workspace.resolve(args.conjecture, user_id)
+        paths = workspace.resolve(args.conjecture, user_id, root)
     except config.UserConfigError as e:
         ap.error(str(e))
         return
@@ -527,4 +535,4 @@ def run(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
 
 
 if __name__ == "__main__":
-    run()
+    run(root=workspace.find_root())

@@ -1,7 +1,14 @@
-"""Per-conjecture run directories.
+"""The proofs workspace and its per-conjecture run directories.
+
+A workspace is a directory holding a .proofs marker file, laid out by
+proofs init (init()); every command finds it by walking up from the current
+directory to the first one with the marker (find_root()), the way git finds
+.git. Conjecture paths below are relative to that root.
 
 Layout:
 
+    .proofs                        <- the marker: "format = 1"
+    .gitignore                     <- holds the proofs block (GITIGNORE_RULES)
     conjectures/
       algebra_example/
         conjecture.md              <- required, the only mandatory file
@@ -59,7 +66,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:  # inside the proofs package (installed, or `python -m proofs`)
     from . import certificates
@@ -67,6 +74,9 @@ except ImportError:  # top-level modules (`python proofs/workspace.py`)
     import certificates
 
 CONJECTURES_ROOT = "conjectures"
+# The marker file at a workspace's root, and the layout version it records.
+MARKER_FILENAME = ".proofs"
+WORKSPACE_FORMAT = 1
 CONJECTURE_FILENAME = "conjecture.md"
 # Per-user DAG files live in dags/, named <user_id>_dag.json (see the module
 # docstring). dag.json at the conjecture root is the pre-per-user shared DAG:
@@ -117,6 +127,127 @@ class ConjectureNotFound(Exception):
     """Raised with the list of what *does* exist, so the fix is obvious."""
 
 
+class NotInWorkspace(ConjectureNotFound):
+    """A bare conjecture name, or proofs new, with no workspace to look in."""
+
+    def __init__(self) -> None:
+        super().__init__("not in a proofs workspace; run proofs init")
+
+
+# ----------------------------------------------------------------------------
+# The workspace: its marker, its root, and proofs init.
+# ----------------------------------------------------------------------------
+GITIGNORE_BEGIN = "# >>> proofs >>>"
+GITIGNORE_END = "# <<< proofs <<<"
+# The one source of truth for what a workspace keeps out of git: proofs init
+# writes these lines between GITIGNORE_BEGIN and GITIGNORE_END in the
+# workspace's .gitignore, and a re-run replaces them, so a workspace picks up
+# a change here by running proofs init again. The patterns are anchored at
+# the workspace root, where the .gitignore lives.
+GITIGNORE_RULES = """\
+# Managed by proofs init: re-running it replaces everything between these
+# markers, so put your own rules outside them.
+#
+# Reference input material is the conjecture maintainer's local working
+# copy: the maintainer points `proofs parse` at it, and the parsed output
+# (references.md, beside the directory) is what gets committed with the
+# conjecture. Other users pull references.md; they never see the inputs.
+conjectures/*/references/
+# Each user's private notes for the planner: never committed or shared,
+# so every user keeps their own (README, "Comments").
+conjectures/*/comments.md
+.comments
+*.checkpoint.json
+# Per-writer temp files a crashed checkpoint write can leave behind
+# (named <checkpoint>.<pid>.<thread>.tmp).
+*.checkpoint.json.*.tmp
+# Cross-process lock sidecars beside the DAG and certificate files
+# (locking.py), and the temp files a crashed write can leave behind: every
+# writer of a committed file writes <file>...tmp beside it, then
+# os.replace (or os.link, for a refutation).
+conjectures/*/dags/*.lock
+conjectures/*/certificates/*.lock
+conjectures/*/dags/*.tmp
+conjectures/*/certificates/*.tmp
+conjectures/*/refutations/.*.tmp
+conjectures/*/references.md.*.tmp
+# Never commit API keys (README "Backend": --api-key).
+.env
+.env.*
+"""
+
+
+class NestedWorkspace(Exception):
+    """Raised by init() for a directory inside an existing workspace."""
+
+
+def find_root(start: Optional[Path] = None) -> Optional[Path]:
+    """The workspace root: the first of start (default: the current
+    directory) and its parents that holds a .proofs marker, or None."""
+    start = (start or Path.cwd()).resolve()
+    for d in (start, *start.parents):
+        if (d / MARKER_FILENAME).is_file():
+            return d
+    return None
+
+
+def _in_git_repo(path: Path) -> bool:
+    """Whether path is inside a git work tree: a .git (directory, or the
+    file a worktree or submodule has) in it or a parent. git is not run."""
+    return any((d / ".git").exists() for d in (path, *path.parents))
+
+
+def gitignore_block() -> str:
+    """The proofs block, markers included, as init() writes it."""
+    return f"{GITIGNORE_BEGIN}\n{GITIGNORE_RULES}{GITIGNORE_END}\n"
+
+
+def update_gitignore(text: str) -> str:
+    """text, a .gitignore's contents, with its proofs block replaced in place
+    by gitignore_block(), or the block appended when it has none. Lines
+    outside the block are never touched."""
+    lines = text.splitlines(keepends=True)
+    stripped = [l.rstrip("\r\n").strip() for l in lines]
+    try:
+        begin = stripped.index(GITIGNORE_BEGIN)
+        end = stripped.index(GITIGNORE_END, begin + 1)
+    except ValueError:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        sep = "\n" if text.strip() else ""
+        return (text if text.strip() else "") + sep + gitignore_block()
+    return "".join(lines[:begin]) + gitignore_block() + "".join(lines[end + 1:])
+
+
+def init(directory: Path) -> Tuple[Path, bool]:
+    """Lay out a proofs workspace at directory, for proofs init.
+
+    Creates directory and its conjectures/, writes the .proofs marker when
+    it is missing, and writes or updates the proofs block of its
+    .gitignore. Safe to re-run: an existing marker and existing conjectures
+    are left alone, and only the block is rewritten. A directory inside
+    another workspace is refused — a nested workspace is almost certainly a
+    mistake. Returns the root and whether it is inside a git repository.
+    """
+    root = directory.resolve()
+    outer = find_root(root)
+    if outer is not None and outer != root:
+        raise NestedWorkspace(
+            f"{root} is inside the proofs workspace at {outer}; "
+            f"a workspace cannot be nested in another."
+        )
+    (root / CONJECTURES_ROOT).mkdir(parents=True, exist_ok=True)
+    marker = root / MARKER_FILENAME
+    if not marker.is_file():
+        marker.write_text(f"format = {WORKSPACE_FORMAT}\n", encoding="utf-8")
+    gitignore = root / ".gitignore"
+    old = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
+    new = update_gitignore(old)
+    if new != old:
+        gitignore.write_text(new, encoding="utf-8")
+    return root, _in_git_repo(root)
+
+
 @dataclass
 class RunPaths:
     root: Path                  # conjectures/algebra_example
@@ -139,8 +270,10 @@ class ConjectureExists(Exception):
     """Raised by create() rather than touch a directory that is already there."""
 
 
-def create(name: str, project_root: Path = Path(".")) -> Path:
-    """Lay out a blank conjecture, conjectures/<name>/, for proofs new.
+def create(name: str, project_root: Optional[Path]) -> Path:
+    """Lay out a blank conjecture, <project_root>/conjectures/<name>/, for
+    proofs new. project_root is the workspace root (find_root()); None, no
+    workspace, raises NotInWorkspace.
 
     The directories every tool expects (references/, dags/, certificates/)
     and the files: conjecture.md and comments.md empty, references.md the
@@ -154,6 +287,8 @@ def create(name: str, project_root: Path = Path(".")) -> Path:
             f"{name!r} is not a conjecture name: start with a letter or "
             f"digit, then letters, digits, dots, underscores or hyphens."
         )
+    if project_root is None:
+        raise NotInWorkspace()
     root = project_root / CONJECTURES_ROOT / name
     if root.exists():
         raise ConjectureExists(f"{root} already exists.")
@@ -166,13 +301,29 @@ def create(name: str, project_root: Path = Path(".")) -> Path:
     return root
 
 
-def available(project_root: Path = Path(".")) -> List[str]:
+def available(project_root: Optional[Path]) -> List[str]:
+    """The conjectures under the workspace root's conjectures/; none when
+    project_root is None (no workspace)."""
+    if project_root is None:
+        return []
     root = project_root / CONJECTURES_ROOT
     if not root.is_dir():
         return []
     return sorted(
         d.name for d in root.iterdir()
         if d.is_dir() and (d / CONJECTURE_FILENAME).is_file()
+    )
+
+
+def is_bare_name(name: str) -> bool:
+    """Whether name is a bare conjecture name (looked up under the
+    workspace's conjectures/) rather than a path: a single component, a
+    trailing separator aside, that is not . or .."""
+    stripped = name.rstrip("/\\")
+    return (
+        bool(stripped)
+        and "/" not in stripped and "\\" not in stripped
+        and stripped not in (".", "..")
     )
 
 
@@ -189,7 +340,7 @@ def agents_dir() -> Path:
 def resolve(
     name: str,
     user_id: str,
-    project_root: Path = Path("."),
+    project_root: Optional[Path] = None,
 ) -> RunPaths:
     """Turn a conjecture name and the run's user into every path the run needs.
 
@@ -199,10 +350,12 @@ def resolve(
         conjectures/algebra_example/          (trailing slash, from tab-completion)
         /abs/path/to/algebra_example
 
-    A path is taken relative to the current directory, or as given when
-    absolute; a bare name is looked up under ./conjectures/. The paths
-    returned are absolute, so nothing downstream depends on the directory
-    the command was run from.
+    A path — anything with a directory separator, or . or .. — is taken
+    relative to the current directory, or as given when absolute. A bare
+    name is looked up under <project_root>/conjectures/, project_root being
+    the workspace root (find_root()); with no workspace (None), a bare name
+    raises NotInWorkspace. The paths returned are absolute, so nothing
+    downstream depends on the directory the command was run from.
 
     The run's DAG file is dags/<user_id>_dag.json in the conjecture directory:
     the user's share of the conjecture's proof. The run reads every file in
@@ -214,11 +367,15 @@ def resolve(
     """
     if not user_id:
         raise ValueError("resolve() needs a user_id to name the run's DAG file")
-    candidate = Path(name.rstrip("/\\"))
-    for guess in (candidate, project_root / CONJECTURES_ROOT / candidate.name):
-        if guess.is_dir():
-            root = guess.resolve()
-            break
+    stripped = name.rstrip("/\\") or name
+    if is_bare_name(name):
+        if project_root is None:
+            raise NotInWorkspace()
+        guess = project_root / CONJECTURES_ROOT / stripped
+    else:
+        guess = Path(stripped)
+    if guess.is_dir():
+        root = guess.resolve()
     else:
         raise ConjectureNotFound(
             f"No conjecture directory {name!r}. "

@@ -130,11 +130,8 @@ for why one of these is a keystroke and the other is a line of input.
 
 Usage
 -----
-    proofs run conjectures/algebra_example
-    proofs run conjectures/algebra_example --model Qwen3.5-122B-Q4_K_M
-    proofs run conjectures/algebra_example --model qwen3.8-27b
-    proofs run conjectures/algebra_example --no-verbose --max-iterations 25
-    proofs run conjectures/algebra_example --mode human
+    proofs run conjectures/algebra_example --host http://localhost:8081 --model qwen3.8-27b
+    proofs run conjectures/algebra_example --host http://localhost:8081 --model qwen3.8-27b --mode human
     proofs parse conjectures/algebra_example
     proofs verify conjectures/algebra_example/dags/alice_dag.json lemma_42 --full
     proofs repair conjectures/algebra_example/refutations/alice--lemma_42--bob--20250102T030405Z.json
@@ -226,8 +223,7 @@ except ImportError:  # top-level modules (`python proofs/main.py`)
 # API serves the model it names; a llama-server ignores it and answers with
 # whatever it loaded. Certificates and refutations do not record it but
 # _recorded_model(), the model that actually did the work.
-MODEL_NAME = "qwen3.8-27b"
-DEFAULT_CONJECTURE = "algebra_example"
+MODEL_NAME = ""               # set from the required --model
 
 # Set in main(). BACKEND owns the HTTP conversation; PROFILE is what the
 # capability probe found (context ceiling, thinking support, tokenizer ratio).
@@ -457,28 +453,6 @@ NUM_CTX = 65536
 # reports "ceiling" — the lemma is too big for the context — instead of
 # quietly undersizing the answer.
 
-# Thinking level: True, or "low"/"medium"/"high"/"max" on models that support
-# levels. Set to None to omit the field entirely (the model's default).
-# Never set this to False: reason() turns a False into None, because
-# turning thinking off is the backend's job, for schema calls only — see
-# the module docstring.
-#
-# These are requests, not guarantees. The backend checks them against the
-# probed capabilities and drops or downgrades: asking a non-thinking model to
-# think is a 400 from the server, and a level string sent to a model that
-# only understands booleans is ignored silently, which is worse.
-THINK = {
-    "planner": True,
-    "prover": True,
-    "verifier_1": True,
-    "verifier_2": True,
-    "verifier_3": True,
-    "reviser": True,
-    "parser": True,   # parsing.py: reading mathematics, then extracting it
-    "parallel_planner": True,
-    "parallel_lemma_generator": True,
-}
-
 # Sampling. The presence penalty is the delicate one: it pushes the model off
 # tokens it has already used, which suppresses repetition loops in agentic
 # coding but is actively harmful here — mathematics *requires* hammering the
@@ -489,8 +463,8 @@ THINK = {
 # this codebase: a model runs on its own card's default, and whatever is set
 # in these option dicts wins. Keep the dicts minimal for that reason.
 REASONING_OPTIONS: Dict[str, Any] = {
-    "temperature": 0.7,          # Greedy decoding degrades thinking models.
     "num_ctx": NUM_CTX,
+    # temperature: per role, from TEMPERATURES below.
     # presence_penalty: deliberately absent — the server's default applies.
     # num_predict is set per call by reason(); see the NUM_CTX comment.
 }
@@ -505,7 +479,9 @@ EXTRACT_OPTIONS: Dict[str, Any] = {
     # num_predict is set per call by extract(); see the NUM_CTX comment.
 }
 
-# Per-role reasoning temperature overrides.
+# Per-role reasoning temperatures, sent with every call. Every role reason()
+# is called with must be listed: there is no fallback. Greedy decoding
+# degrades thinking models, so none of these is 0.
 TEMPERATURES = {
     "planner": 0.7,
     "prover": 0.6,     # Slightly tighter: rigour over exploration.
@@ -3560,7 +3536,6 @@ def _resume_compacted(
     user_prompt: str,
     thinking: str,
     content: str,
-    think: Any,
     verbose: bool,
     max_passes: int = MAX_COMPACTION_PASSES,
 ) -> Tuple[str, Optional[Dict[str, str]]]:
@@ -3586,7 +3561,6 @@ def _resume_compacted(
     """
     answer = content
     summary = ""
-    want_think = think if (think is not None and think is not False) else None
 
     def _partial() -> Dict[str, str]:
         # The work-so-far for a caller to hand on: the running summary, the
@@ -3645,11 +3619,11 @@ def _resume_compacted(
             return "", _partial()
         options = {
             **REASONING_OPTIONS,
-            "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
+            "temperature": TEMPERATURES[role],
             "num_predict": room,
         }
         try:
-            reply = BACKEND.chat(messages, think=want_think, schema=None,
+            reply = BACKEND.chat(messages, think=True, schema=None,
                                  options=options)
         except (requests.RequestException, ValueError, KeyError) as e:
             log(f"  {role} continuation transport error: {e}", verbose)
@@ -3760,7 +3734,6 @@ def reason(
     system_prompt: str,
     user_prompt: str,
     role: str,
-    think: Any = True,
     verbose: bool = True,
     tools: Optional["tools_mod.ToolSet"] = None,
 ) -> Tuple[str, str, Optional[Dict[str, str]]]:
@@ -3807,11 +3780,8 @@ def reason(
     ]
     options: Dict[str, Any] = {
         **REASONING_OPTIONS,
-        "temperature": TEMPERATURES.get(role, REASONING_OPTIONS["temperature"]),
+        "temperature": TEMPERATURES[role],
     }
-    # `think` is passed through as a request. The backend reconciles it with
-    # the probed capabilities and never sends False, whatever we ask for.
-    want_think = think if (think is not None and think is not False) else None
     # The tool calls made and their results, as text: what a compaction
     # rescue folds into the task it re-sends.
     tool_notes: List[str] = []
@@ -3836,12 +3806,12 @@ def reason(
         try:
             if native:
                 reply = BACKEND.chat(
-                    messages, think=want_think, schema=None, options=options,
+                    messages, think=True, schema=None, options=options,
                     tools=tools.specs(),
                     tool_choice=None if offer else "none",
                 )
             else:
-                reply = BACKEND.chat(messages, think=want_think, schema=None,
+                reply = BACKEND.chat(messages, think=True, schema=None,
                                      options=options)
         except llm_backend.ToolsUnsupported as e:
             # The server takes no native tools: the JSON protocol from here
@@ -3942,8 +3912,7 @@ def reason(
                         + "\n\n".join(tool_notes)
                     )
                 resumed, partial = _resume_compacted(
-                    role, base_system, task, thinking, content,
-                    want_think, verbose,
+                    role, base_system, task, thinking, content, verbose,
                 )
                 if resumed:
                     log(f"  {role} completed after compaction + "
@@ -4540,7 +4509,7 @@ def _run_verifier(
     verdict is not one.
     """
     review, review_status, _partial = reason(
-        system_prompt, user_prompt, role, THINK[role], verbose,
+        system_prompt, user_prompt, role, verbose,
     )
     check_mode_toggle(verbose)
     if review_status == "unavailable":
@@ -4818,7 +4787,7 @@ def run_proof_loop(
         # re-runs from the top (where a stop is noticed) once it answers.
         answer = _reason_until_answered(
             should_stop, verbose,
-            prover_sys, prover_user, "prover", THINK["prover"],
+            prover_sys, prover_user, "prover",
             tools=agent_tools(dag, suspended),
         )
         if answer is None:
@@ -4867,7 +4836,7 @@ def run_proof_loop(
             )
             answer = _reason_until_answered(
                 should_stop, verbose,
-                reviser_sys, overflow_user, "reviser", THINK["reviser"],
+                reviser_sys, overflow_user, "reviser",
                 tools=agent_tools(dag, suspended),
             )
             if answer is None:
@@ -5223,7 +5192,7 @@ def run_proof_loop(
         )
         answer = _reason_until_answered(
             should_stop, verbose,
-            reviser_sys, reviser_user, "reviser", THINK["reviser"],
+            reviser_sys, reviser_user, "reviser",
             tools=agent_tools(dag, suspended),
         )
         if answer is None:
@@ -5862,7 +5831,7 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
             )
             operator_note = ""
             plan_text, plan_status, _partial = reason(
-                planner_sys, planner_user, "planner", THINK["planner"], verbose,
+                planner_sys, planner_user, "planner", verbose,
                 tools=agent_tools(dag, suspended),
             )
             check_mode_toggle(verbose)
@@ -6610,8 +6579,7 @@ def _parallel_planner(
             + (f"\n{operator_note}\n" if operator_note else "")
         )
         text, _status, _partial = reason(
-            planner_sys, plan_user, "parallel_planner",
-            THINK["parallel_planner"], verbose,
+            planner_sys, plan_user, "parallel_planner", verbose,
             tools=agent_tools(dag, susp.suspended),
         )
         check_mode_toggle(verbose)
@@ -6695,8 +6663,7 @@ def _parallel_generator(
             f"{rejected_block(state.rejected_snapshot())}\n"
         )
         text, _status, _partial = reason(
-            generator_sys, gen_user, "parallel_lemma_generator",
-            THINK["parallel_lemma_generator"], verbose,
+            generator_sys, gen_user, "parallel_lemma_generator", verbose,
             tools=agent_tools(dag, susp.suspended),
         )
         check_mode_toggle(verbose)
@@ -7342,14 +7309,20 @@ def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
-def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
+def main(
+    argv: Optional[List[str]] = None,
+    prog: Optional[str] = None,
+    root: Optional[Path] = None,
+) -> None:
     """Run the main proof loop.
 
     argv is the argument list (defaults to sys.argv[1:]); prog is the name
-    usage lines show. The proofs command calls this as
-    main(argv=["--conjecture", DIR, ...], prog="proofs run"); running the
-    file directly (python proofs/main.py --conjecture NAME) parses
-    sys.argv the same way.
+    usage lines show; root is the workspace root a bare --conjecture NAME
+    is looked up under (workspace.resolve), None outside a workspace. The
+    proofs command calls this as main(argv=["--conjecture", DIR, ...],
+    prog="proofs run", root=...); running the file directly
+    (python proofs/main.py --conjecture NAME) parses sys.argv the same
+    way, with the workspace found from the current directory.
     """
     global MODEL_NAME, CONJECTURE_FILE, CONJECTURE_ROOT, DAGS_DIR, DAG_FILE
     global REFERENCES_FILE, COMMENTS_FILE
@@ -7369,22 +7342,21 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
         help="Enable or disable console logging (default: --verbose)",
     )
     parser.add_argument(
-        "--host", default=None,
+        "--host", required=True,
         help="OpenAI-compatible base URL: a local llama-server, or a hosted "
              "API's base (e.g. https://api.openai.com, without the /v1 "
-             "suffix — it is added automatically). Defaults to "
-             "$LLAMA_HOST or http://localhost:8081.",
+             "suffix — it is added automatically). Required.",
     )
     parser.add_argument(
         "--api-key", default=None,
         help="API key sent as 'Authorization: Bearer <key>'. Needed for a "
-             "hosted API; defaults to $LLM_API_KEY. Leave unset for a plain "
-             "local llama-server (or one launched without --api-key).",
+             "hosted API; with none given, no key is sent. Leave unset for a "
+             "plain local llama-server (or one launched without --api-key).",
     )
     parser.add_argument(
-        "--model", default=MODEL_NAME,
+        "--model", required=True,
         help="Model name: the --alias llama-server was launched with, or the "
-             "provider's model id (e.g. gpt-4o).",
+             "provider's model id (e.g. gpt-4o). Required.",
     )
     parser.add_argument(
         "--backend", choices=("auto", "llamacpp", "openai"), default="auto",
@@ -7399,9 +7371,11 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
         ),
     )
     parser.add_argument(
-        "--conjecture", default=DEFAULT_CONJECTURE,
-        help=f"Directory under {workspace.CONJECTURES_ROOT}/ containing "
-             f"{workspace.CONJECTURE_FILENAME} (default: {DEFAULT_CONJECTURE})",
+        "--conjecture", required=True,
+        help=f"A conjecture directory containing "
+             f"{workspace.CONJECTURE_FILENAME}: a name under the workspace "
+             f"root's {workspace.CONJECTURES_ROOT}/, or a path to it "
+             "(required)",
     )
     parser.add_argument(
         "--max-iterations", type=int, default=MAX_ITERATIONS,
@@ -7518,7 +7492,7 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
     # emits a user_id; this is the one that goes in (see config.py).
     try:
         USER = config.ensure_user_id()
-        paths = workspace.resolve(args.conjecture, USER)
+        paths = workspace.resolve(args.conjecture, USER, root)
     except config.UserConfigError as e:
         parser.error(str(e))
         return  # unreachable; parser.error exits, but keeps type checkers calm
@@ -7580,4 +7554,4 @@ def main(argv: Optional[List[str]] = None, prog: Optional[str] = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(root=workspace.find_root())

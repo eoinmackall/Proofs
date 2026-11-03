@@ -1,6 +1,7 @@
 """The `proofs` command: one entry point for every proofs tool.
 
     proofs config KEY [VALUE]         get or set the user's config, git-style
+    proofs init [DIR]                 make DIR (default: .) a proofs workspace
     proofs new NAME                   lay out a blank conjecture, conjectures/NAME/
     proofs parse DIR                  parse DIR's references/ into references.md
     proofs run DIR                    run the proof loop on DIR
@@ -11,11 +12,19 @@
     proofs export PATH [lemma_id] -o OUT_DIR
                                     write a LaTeX document of the DAG
 
-DIR is a conjecture directory: a directory holding a conjecture.md. PATH is
-the path to a user's DAG file — conjectures/NAME/dags/<user_id>_dag.json —
-which supplies the lemma's user_id, so a lemma is identified by the pair
-(user_id, lemma_id). For export, PATH may also be the conjecture directory
-itself, in which case the complete DAG is written.
+A workspace is the directory proofs init marks with a .proofs file, found
+by walking up from the current directory (workspace.find_root); main()
+finds it once and hands it to every command that needs it, as
+args.workspace_root. conjectures/NAME below is relative to that root.
+
+DIR is a conjecture directory: a directory holding a conjecture.md, given
+as a bare NAME (looked up in the workspace's conjectures/) or as a path,
+relative to the current directory or absolute. PATH is the path to a
+user's DAG file — conjectures/NAME/dags/<user_id>_dag.json — which supplies
+the lemma's user_id, so a lemma is identified by the pair (user_id,
+lemma_id). For export, PATH may also be the conjecture directory itself, in
+which case the complete DAG is written. A path works outside a workspace; a
+bare NAME, and proofs new, need one.
 
 This module validates the arguments and hands each command to its entry
 point, where the command's own docstring says what it does:
@@ -51,10 +60,13 @@ point, where the command's own docstring says what it does:
     directory -o/--out names, created if it is not there yet. -o/--out is
     required: the document is the user's artifact, not the project's
     data, so it never lands in the project on its own.
-  * new creates conjectures/NAME/ with empty references/, dags/ and
-    certificates/ directories, an empty conjecture.md and comments.md,
-    and a references.md holding the empty collection []. It refuses a
-    NAME that is already there.
+  * init (workspace.init) creates DIR/conjectures/, writes the .proofs
+    marker and writes or updates the proofs block of DIR/.gitignore. It
+    is safe to re-run, and refuses a DIR inside another workspace.
+  * new creates conjectures/NAME/ under the workspace root with empty
+    references/, dags/ and certificates/ directories, an empty
+    conjecture.md and comments.md, and a references.md holding the empty
+    collection []. It refuses a NAME that is already there.
 
 None of the commands run git: users share a conjecture's files by
 committing, pushing and pulling them by hand. Every file a command writes
@@ -64,7 +76,7 @@ file. The exceptions are verify and repair: an acceptance deletes the
 lemma's refutations whoever wrote them, and repair rewrites the repaired
 lemma in its owner's DAG file.
 
-Every command except `config` and `new` acts as the user the config's
+Every command except `config`, `init` and `new` acts as the user the config's
 user.id names (see config.py): the id is read from the config, and a
 run without one fails and names the command that sets it — proofs does not
 ask, as git does not. The config lives in ~/.config/proofs/config, outside
@@ -109,19 +121,17 @@ def _add_backend_flags(sp: argparse.ArgumentParser, help_for: str) -> None:
     work runs, and the context ceiling. help_for names the work in the
     --verbose help ("the verification", "the re-verification")."""
     sp.add_argument(
-        "--model",
-        default=main_mod.MODEL_NAME,
-        help=f"the model the work runs under (default: {main_mod.MODEL_NAME})",
+        "--model", required=True,
+        help="the model the work runs under (required)",
     )
     sp.add_argument(
-        "--host", default=None,
-        help="OpenAI-compatible base URL (default: $LLAMA_HOST or "
-             "http://localhost:8081)",
+        "--host", required=True,
+        help="OpenAI-compatible base URL (required)",
     )
     sp.add_argument(
         "--api-key",
         default=None,
-        help="the backend's API key (default: $LLM_API_KEY)",
+        help="the backend's API key (default: none sent)",
     )
     sp.add_argument(
         "--backend",
@@ -143,14 +153,22 @@ def _add_backend_flags(sp: argparse.ArgumentParser, help_for: str) -> None:
     )
 
 
+_DIR_HELP = (
+    "The conjecture directory: a NAME under the workspace root's "
+    "conjectures/, or a path to it."
+)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="proofs",
         description=(
             "Distributed proof construction, coordinated through git. "
-            "DIR is a conjecture directory; PATH is the path to a user's "
-            "DAG file, which supplies the lemma's user_id (for export it "
-            "may also be a conjecture directory)."
+            "DIR is a conjecture directory: a NAME under the workspace "
+            "root's conjectures/, or a path to it. PATH is the path to a "
+            "user's DAG file, which supplies the lemma's user_id (for "
+            "export it may also be a conjecture directory). Run proofs "
+            "init to make a workspace."
         ),
     )
     sub = parser.add_subparsers(dest="command", metavar="command")
@@ -194,10 +212,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=_cmd_config, parser=p)
 
     p = sub.add_parser(
-        "new",
-        help="Lay out a blank conjecture, conjectures/NAME/.",
+        "init",
+        help="Make DIR (default: the current directory) a proofs workspace.",
         description=(
-            "Create conjectures/NAME/ with empty references/, dags/ and "
+            "Make DIR a proofs workspace: create DIR/conjectures/, write "
+            "the .proofs marker, and write or update the proofs block of "
+            "DIR/.gitignore (lines outside the block are left alone). Safe "
+            "to re-run. A DIR inside another workspace is refused."
+        ),
+    )
+    p.add_argument(
+        "dir", nargs="?", default=".", metavar="DIR",
+        help="The workspace directory, created if it is not there yet "
+             "(default: the current directory).",
+    )
+    p.set_defaults(func=_cmd_init, parser=p)
+
+    p = sub.add_parser(
+        "new",
+        help="Lay out a blank conjecture, conjectures/NAME/ under the "
+             "workspace root.",
+        description=(
+            "Create conjectures/NAME/, relative to the workspace root, with "
+            "empty references/, dags/ and "
             "certificates/ directories, an empty conjecture.md and "
             "comments.md, and a references.md holding the empty collection "
             "[]. An existing NAME is refused. Write the statement into "
@@ -219,7 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
             "unchanged (--model, --host, --num-ctx, ...)."
         ),
     )
-    p.add_argument("dir", metavar="DIR", help="The conjecture directory.")
+    p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
     # Everything after DIR: the parser's own flags, validated by its own
     # parser (so their help and errors are the parser's, not ours).
     p.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
@@ -234,7 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--max-iterations, --parallel, ...)."
         ),
     )
-    p.add_argument("dir", metavar="DIR", help="The conjecture directory.")
+    p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
     p.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     p.set_defaults(func=_cmd_run, parser=p)
 
@@ -269,7 +306,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "path",
         metavar="path_to_refutation",
-        help="A file in conjectures/NAME/refutations/.",
+        help="A file in conjectures/NAME/refutations/ (under the "
+             "workspace root).",
     )
     _add_backend_flags(p, help_for="the re-verification")
     main_mod.add_lemma_window_flags(p)
@@ -285,7 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
             "are never touched."
         ),
     )
-    p.add_argument("dir", metavar="DIR", help="The conjecture directory.")
+    p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
     p.set_defaults(func=_cmd_prune, parser=p)
 
     p = sub.add_parser(
@@ -338,15 +376,18 @@ def build_parser() -> argparse.ArgumentParser:
 # can do anything with them.
 # ----------------------------------------------------------------------------
 def _require_conjecture_dir(
-    dir_arg: str, user_id: str, parser: argparse.ArgumentParser
+    dir_arg: str, user_id: str, root: Optional[Path],
+    parser: argparse.ArgumentParser,
 ) -> Path:
     """DIR must be a conjecture directory; resolve it for its root path.
 
     Accepted in whatever form is convenient (algebra_example,
-    conjectures/algebra_example, /abs/path), as workspace.resolve() does.
+    conjectures/algebra_example, /abs/path), as workspace.resolve() does;
+    a bare name is looked up under the workspace root, and is an error
+    without one.
     """
     try:
-        return workspace.resolve(dir_arg, user_id).root
+        return workspace.resolve(dir_arg, user_id, root).root
     except workspace.ConjectureNotFound as e:
         parser.error(str(e))
 
@@ -360,7 +401,8 @@ def _load_user_dag(
     if not p.is_file():
         parser.error(
             f"{path} is not a file; PATH must be a user's DAG file "
-            f"(conjectures/NAME/dags/<user_id>_dag.json)"
+            f"(conjectures/NAME/dags/<user_id>_dag.json, under the "
+            f"workspace root)"
         )
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -427,17 +469,18 @@ def _config_command(
         config.set(args.key, args.value)  # an empty value unsets
     except ValueError as e:
         parser.error(str(e))
-    _warn_owner_conflicts()
+    _warn_owner_conflicts(_workspace_root(warn=False))
 
 
-def _warn_owner_conflicts(project_root: Path = Path(".")) -> None:
-    """After an identity key is set, warn about every conjecture under
-    project_root whose files under the config's user.id carry another
-    person's name and email (workspace.owner_conflict). A warning, not an
-    error: the config is global and this checkout is only one place the id
-    is used; the commands that write the files refuse on their own."""
+def _warn_owner_conflicts(project_root: Optional[Path]) -> None:
+    """After an identity key is set, warn about every conjecture in the
+    workspace at project_root whose files under the config's user.id carry
+    another person's name and email (workspace.owner_conflict). A warning,
+    not an error: the config is global and this workspace is only one place
+    the id is used; the commands that write the files refuse on their own.
+    Outside a workspace (None) there is nothing to check."""
     uid = config.get(config.USER_ID_KEY)
-    if uid is None:
+    if uid is None or project_root is None:
         return
     name = config.get(config.USER_NAME_KEY) or ""
     email = config.get(config.USER_EMAIL_KEY) or ""
@@ -448,10 +491,52 @@ def _warn_owner_conflicts(project_root: Path = Path(".")) -> None:
             print(f"proofs: warning: {reason}", file=sys.stderr)
 
 
+def _workspace_root(warn: bool = True) -> Optional[Path]:
+    """The workspace root for this invocation: workspace.find_root() from
+    the current directory, or None outside a workspace.
+
+    During the transition to marked workspaces, a directory with no marker
+    above it but a ./conjectures/ of its own is taken as the root, with a
+    warning (when warn) that proofs init should be run there. main() calls
+    this once, so the warning is printed once.
+    """
+    root = workspace.find_root()
+    if root is not None:
+        return root
+    cwd = Path.cwd()
+    if (cwd / workspace.CONJECTURES_ROOT).is_dir():
+        if warn:
+            print(
+                f"proofs: warning: no {workspace.MARKER_FILENAME} marker "
+                f"found; using ./{workspace.CONJECTURES_ROOT}/ in the current "
+                f"directory. Run proofs init here to make it a workspace.",
+                file=sys.stderr,
+            )
+        return cwd.resolve()
+    return None
+
+
+def _cmd_init(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    try:
+        root, in_git = workspace.init(Path(args.dir))
+    except workspace.NestedWorkspace as e:
+        parser.error(str(e))
+    except OSError as e:
+        print(f"proofs: {e}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Initialized proofs workspace in {root}")
+    if not in_git:
+        print(
+            "Hint: Not inside a git repository. To share this workspace, "
+            "run `git init`"
+        )
+
+
 def _cmd_new(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     try:
-        root = workspace.create(args.name)
-    except (ValueError, workspace.ConjectureExists) as e:
+        root = workspace.create(args.name, args.workspace_root)
+    except (ValueError, workspace.ConjectureExists,
+            workspace.NotInWorkspace) as e:
         parser.error(str(e))
     print(
         f"Created {root}/: conjecture.md, comments.md, references.md, "
@@ -461,15 +546,28 @@ def _cmd_new(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _require_workspace_for_name(
+    dir_arg: str, root: Optional[Path], parser: argparse.ArgumentParser
+) -> None:
+    """A bare NAME needs a workspace to look in. Checked before run and
+    parse hand off, so the error comes before their backend probe."""
+    if root is None and workspace.is_bare_name(dir_arg):
+        parser.error(str(workspace.NotInWorkspace()))
+
+
 def _cmd_parse(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    _require_workspace_for_name(args.dir, args.workspace_root, parser)
     parsing_mod.run(
-        argv=["--conjecture", args.dir, *args.rest], prog="proofs parse"
+        argv=["--conjecture", args.dir, *args.rest], prog="proofs parse",
+        root=args.workspace_root,
     )
 
 
 def _cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    _require_workspace_for_name(args.dir, args.workspace_root, parser)
     main_mod.main(
-        argv=["--conjecture", args.dir, *args.rest], prog="proofs run"
+        argv=["--conjecture", args.dir, *args.rest], prog="proofs run",
+        root=args.workspace_root,
     )
 
 
@@ -555,9 +653,13 @@ def _cmd_repair(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
 
 
 def _cmd_prune(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    _require_conjecture_dir(args.dir, args.user_id, parser)
+    # Forwarded resolved: prune_entry resolves its dir again, and an
+    # absolute path needs no workspace root to do it.
+    root = _require_conjecture_dir(
+        args.dir, args.user_id, args.workspace_root, parser
+    )
     rc = main_mod.prune_entry(
-        dir=args.dir,
+        dir=str(root),
         user_id=args.user_id,
         parser=parser,
     )
@@ -602,13 +704,19 @@ def _cmd_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
             f"{args.out} exists and is not a directory; -o/--out names the "
             f"directory the document is written to"
         )
-    if p.is_dir():
+    # A bare NAME is a conjecture in the workspace, unless it names a file
+    # here (a DAG file, run from inside dags/).
+    if p.is_dir() or (
+        workspace.is_bare_name(args.path) and not Path(args.path).is_file()
+    ):
         if args.lemma_id is not None:
             parser.error(
                 "PATH is the conjecture directory, so the complete DAG is "
                 "written; lemma_id applies to a user's DAG file"
             )
-        root = _require_conjecture_dir(args.path, args.user_id, parser)
+        root = _require_conjecture_dir(
+            args.path, args.user_id, args.workspace_root, parser
+        )
         owner = None
     else:
         dag = _load_user_dag(args.path, parser)
@@ -642,14 +750,20 @@ def main(argv: Optional[List[str]] = None) -> None:
     # The run's user, resolved before any subcommand (see config.py):
     # the config's user.id, and a run without one fails
     # and names the command that sets it. The config subcommand acts on
-    # the config itself, and new only lays out files, so both run without
-    # a resolved user.
-    if args.command not in ("config", "new"):
+    # the config itself, and init and new only lay out files, so they run
+    # without a resolved user.
+    if args.command not in ("config", "init", "new"):
         try:
             args.user_id = config.ensure_user_id()
         except config.UserConfigError as e:
             print(f"proofs: {e}", file=sys.stderr)
             sys.exit(1)
+
+    # The workspace root, found once here and handed to the commands, so
+    # the transition warning is printed once. config is per-user and init
+    # makes the workspace, so neither looks for one.
+    if args.command not in ("config", "init"):
+        args.workspace_root = _workspace_root()
 
     args.func(args, args.parser)
 
