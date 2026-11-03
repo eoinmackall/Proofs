@@ -220,7 +220,15 @@ It gives you a Python 3 environment with `requests` installed and puts the
 `proofs` command on your PATH. The command is also exposed as a flake app,
 so `nix run . -- --help` works without cloning. Outside Nix, `pip install .`
 installs the `proofs` command; otherwise any Python 3 install with
-`requests` works, run from the repository root as `python -m proofs ...`.
+`requests` works, with this repository on `PYTHONPATH`:
+`PYTHONPATH=/path/to/Proofs python -m proofs ...`, run from inside your
+workspace.
+
+The program and your conjectures live apart: this repository holds only
+the code and the default prompts, and a workspace — anywhere on disk,
+usually its own git repository — holds the conjectures. Every command
+finds its workspace from the directory it is run in, so the same install
+serves every workspace you have.
 
 Then make a workspace — the directory your conjectures live in — set your
 identity once, and start a conjecture:
@@ -680,12 +688,11 @@ restarts the budgets from 1 and keeps the DAG.
 
 ## Project layout
 
-This repository is itself a workspace, holding the example conjectures
-beside the program:
+This repository holds the program only; conjectures live in a
+[workspace](#workspaces), a separate directory that `proofs init` lays
+out wherever you choose. The repository:
 
 ```
-.proofs                # the workspace marker (format = 1)
-.gitignore             # the program's own rules, then the proofs block proofs init writes
 proofs/
   agents/              # default agent prompts, installed with the package
     planner.md  prover.md  verifier_1/2/3.md  reviser.md   # one reviser for rejects and overflows
@@ -706,6 +713,15 @@ proofs/
   llm_backend.py       # OpenAI-compatible transport (llama.cpp or a hosted API) + model profiles
   interaction.py       # human-in-the-loop menu + hotkey
   workspace.py         # the workspace (init, root discovery, the .gitignore block), per-conjecture directories, prompt resolution
+pyproject.toml             # the package and the `proofs` console script
+flake.nix                  # Nix dev shell, package and app (`nix run .`)
+```
+
+A workspace, as `proofs init` and `proofs new` lay it out:
+
+```
+.proofs                # the workspace marker (format = 1)
+.gitignore             # your own rules, plus the proofs block proofs init writes
 conjectures/
   algebra_example/
     conjecture.md          # required: the statement
@@ -719,8 +735,6 @@ conjectures/
     references.md          # committed: parsed theorem-level results (strict JSON array)
     comments.md            # optional, gitignored: this user's private notes for the planner
     prover.md              # optional per-conjecture prompt override
-pyproject.toml             # the package and the `proofs` console script
-flake.nix                  # Nix dev shell, package and app (`nix run .`)
 ```
 
 ### Workspaces
