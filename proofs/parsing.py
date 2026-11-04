@@ -206,6 +206,14 @@ def parse_file(
             verbose,
         )
         return []
+    if status == "too_large":
+        main.log(
+            f"  {filename}: the file leaves no room in the context window "
+            f"for the parser's reply, so it was not sent. Split it into "
+            f"chapters and re-run.",
+            verbose,
+        )
+        return []
     if not content:
         main.log(f"  {filename}: the parser returned nothing.", verbose)
         return []

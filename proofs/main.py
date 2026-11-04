@@ -111,6 +111,22 @@ reviser (the overflow case of reviser.md) to pick a smaller lemma or revise
 the statement; only when there is nothing to build on, or the reviser has
 nothing usable, does the planner decompose.
 
+Room for the reply
+------------------
+The window is shared by the prompt and the reply, and the server is told
+only the max_tokens reason() asks for, so the room for thinking and
+answering is kept here. Every agent prompt that shows the lemma window is
+fitted before it is sent (_fit_prompt): one that would leave less than the
+reply's reserve (RESERVE_TOKENS) plus room for lookups (LOOKUP_ROOM) is
+rebuilt with a smaller window — the lemmas moved out of it are listed by
+id, one lookup away. Inside a call, the prompt is sized from the server's
+own count of the last one plus what was appended since; lookups close once
+the prompt reaches the reserve, a result that would cut into it is trimmed
+to fit, and each result tells the model how much room is left. A prompt
+that leaves less than COMPACT_MIN_ROOM even so is never sent: reason()
+returns "too_large", and each caller does something other than send it
+again.
+
 In --mode human the picker is a person, and picking is two decisions rather
 than one: which lemma, and who proves it. A number and Enter means you prove
 that candidate yourself: you paste or type your proof and its citations, and
@@ -189,6 +205,7 @@ lemma stating it, or its negation, verbatim (resolution.py).
 
 import argparse
 import contextlib
+import contextvars
 import glob
 import hashlib
 import json
@@ -297,6 +314,25 @@ MY_LEMMAS = 25
 # call to call. A lemma nothing shown cites does not rank.
 LEMMAS_COMMON = 10
 _TIEBREAK_SEED = random.getrandbits(64)
+
+# A per-call override of the three window sizes above, as (LEMMAS_ALL,
+# MY_LEMMAS, LEMMAS_COMMON): _fit_prompt sets it while it rebuilds a prompt
+# too large for the context window with a smaller window, and lemma_window
+# reads it before the module values. A ContextVar rather than a global,
+# because parallel mode builds prompts on several threads at once, and one
+# thread's shrunken window must never reach another thread's prompt.
+_WINDOW_OVERRIDE: "contextvars.ContextVar[Optional[Tuple[int, int, int]]]" = (
+    contextvars.ContextVar("window_override", default=None)
+)
+
+
+def _window_sizes() -> Tuple[int, int, int]:
+    """(LEMMAS_ALL, MY_LEMMAS, LEMMAS_COMMON) as this call should see them:
+    _fit_prompt's override when it is rebuilding a prompt, else the
+    module's (the flags')."""
+    override = _WINDOW_OVERRIDE.get()
+    return override if override is not None else (
+        LEMMAS_ALL, MY_LEMMAS, LEMMAS_COMMON)
 
 
 def _window_size(text: str) -> int:
@@ -519,6 +555,34 @@ COMPACT_THRESHOLD = 0.99
 COMPACT_CHUNK_TOKENS = 24000
 COMPACT_TAIL_CHARS = 2000
 COMPACT_MIN_ROOM = 2048
+
+# Room kept for the reply. num_ctx is enforced only through the max_tokens
+# reason() asks for — the server never sees it — so nothing but this keeps a
+# prompt that grows with tool results from leaving a thinking model too
+# little room to think and then answer. RESERVE_TOKENS (Pi's default
+# reserveTokens) is the room no lookup may use: once the prompt reaches it,
+# reason() closes the tools and the model answers, and a result that would
+# cut into it is trimmed to fit (tools.ToolSet.run). LOOKUP_ROOM is room for
+# a round or two of lookups on top of that: _fit_prompt shrinks the lemma
+# window until a prompt leaves both. Each is clamped to a quarter of a small
+# window, so the prompt keeps at least half of it (_reserve, _lookup_room).
+RESERVE_TOKENS = 16384
+LOOKUP_ROOM = 16384
+# What a tool result's framing costs beyond its own text: the tool message
+# around it, the room line it ends with, the JSON protocol's instruction.
+_RESULT_FRAME_TOKENS = 128
+# The least room before the reserve worth offering another lookup for —
+# about one lemma statement. Below it, a call could only come back as
+# tools.NO_ROOM, so the lookups close a little before the reserve itself.
+_MIN_RESULT_TOKENS = 256
+
+
+def _reserve(num_ctx: int) -> int:
+    return min(RESERVE_TOKENS, num_ctx // 4)
+
+
+def _lookup_room(num_ctx: int) -> int:
+    return min(LOOKUP_ROOM, num_ctx // 4)
 
 # How many compaction-and-resume passes a single prover call may get before
 # the partial work is handed to the reviser. Two: the first pass usually
@@ -3419,6 +3483,12 @@ def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
     COMPACT_THRESHOLD * num_ctx: the model may think and write until the window
     is COMPACT_THRESHOLD full, and only then is it cut off for compaction.
     """
+    return _room(_estimate_tokens(messages), num_ctx)
+
+
+def _estimate_tokens(messages: List[Dict[str, Any]]) -> int:
+    """The size in tokens of a list of messages, estimated from their
+    characters and the running chars/token ratio (see _headroom)."""
     # A tool-call turn carries its calls beside an often-empty content, and
     # sometimes its reasoning trace (reason()'s _ECHO_REASONING).
     chars = sum(
@@ -3427,7 +3497,12 @@ def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
         for m in messages
     )
     ratio = llm_backend.chars_per_token()
-    used = int(chars / max(ratio, 1.0)) + 1
+    return int(chars / max(ratio, 1.0)) + 1
+
+
+def _room(used: int, num_ctx: int) -> int:
+    """The generation budget a prompt of `used` tokens leaves: up to
+    COMPACT_THRESHOLD of the window, floored at 0 (see _headroom)."""
     return max(int(num_ctx * COMPACT_THRESHOLD) - used, 0)
 
 
@@ -3758,7 +3833,11 @@ def reason(
     that the task is too large, not that the call failed — or "unavailable"
     when every attempt failed to reach the server (a transport error, never
     a reply): an outage, not the model's failure, which the proof loop
-    waits out instead of counting against the lemma. A model that replied
+    waits out instead of counting against the lemma, or "too_large" when
+    the prompt itself leaves less than COMPACT_MIN_ROOM of the window for
+    the reply, so it was never sent (a request for max_tokens 0 is one a
+    server refuses): the same prompt can never succeed, and the caller must
+    not send it again unchanged. A model that replied
     with nothing, every attempt, is "" with empty content. `partial` is None on
     success; on "ceiling" after a bounded compaction rescue it carries the
     partial work ({"summary", "thinking", "answer"}) for the caller to hand
@@ -3780,9 +3859,24 @@ def reason(
     (tools.py): natively, through the request's `tools` field, or — on a
     server that refuses that, or under --tool-mode json — through the JSON
     protocol the system prompt then describes. Each round's results stay in
-    the conversation, up to tools.MAX_TOOL_ROUNDS rounds; then the agent is
-    told to answer. A compaction rescue re-sends the task with the results
+    the conversation, up to tools.MAX_TOOL_ROUNDS rounds; then a native
+    conversation is folded (below) into one plain message with the results
+    written in, and a JSON-protocol one is told to answer. A native request
+    never declares tools it does not offer: with tool_choice "none" a model
+    that still wants a lookup writes the call anyway, a vLLM server drops
+    it, and the reply comes back empty. A compaction rescue re-sends the task with the results
     folded into it as text, so what the agent looked up survives the cut.
+
+    Lookups never use the reply's reserve (_reserve: RESERVE_TOKENS, or a
+    quarter of a small window). The prompt's size is the server's own count
+    of the last prompt sent (usage.prompt_tokens) plus an estimate of what
+    was appended since, or the character estimate alone before any count
+    came back. Once the prompt reaches the reserve the lookups close: a
+    native call is folded (below) into one plain message that declares no
+    tools, and under the JSON protocol the last result says it was the
+    last; a prompt that starts there is offered no tools at all. A result that would cut into the reserve is
+    trimmed to the room left (tools.ToolSet.run), and every result ends
+    with a line telling the model how much room remains.
 
     The tool conversation is the one part of a call whose shape servers and
     models disagree on, so when it fails after a tool round (an empty
@@ -3793,11 +3887,14 @@ def reason(
     dropped, if they were being sent. Then it is folded into one plain
     request: the task with the tool results written into it and no tools
     offered, the form every chat server and model takes. A reply that keeps
-    calling closed tools is folded at once. A call whose tool conversation
+    calling closed tools is folded at once (a safety net: native lookups
+    are folded as they close). A call whose tool conversation
     works is sent exactly as it would be without the rescue.
     """
     global _ECHO_REASONING
     base_system = system_prompt
+    num_ctx = REASONING_OPTIONS["num_ctx"]
+    reserve = _reserve(num_ctx)
     native = bool(tools) and _native_tools()
     if tools and not native:
         system_prompt = base_system + "\n\n" + tools.json_protocol()
@@ -3805,6 +3902,28 @@ def reason(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
+    # closed: lookups have been closed for lack of room, and said so (once
+    # per call).
+    closed = False
+
+    def _no_lookup_room(room: int) -> bool:
+        """Whether a prompt leaving `room` for the reply has no room for
+        another lookup result before the reserve."""
+        return room - reserve - _RESULT_FRAME_TOKENS < _MIN_RESULT_TOKENS
+
+    if tools and _no_lookup_room(_room(_estimate_tokens(messages), num_ctx)):
+        # The task alone already reaches into the reply's reserve: no
+        # lookup could fit, so none is offered — not the tools field, not
+        # the protocol in the system prompt.
+        closed = True
+        tools = None
+        native = False
+        system_prompt = base_system
+        messages[0] = {"role": "system", "content": system_prompt}
+        room = _room(_estimate_tokens(messages), num_ctx)
+        if room >= COMPACT_MIN_ROOM:   # else the loop's too_large says it
+            log(f"  {role}: closing lookups, ~{room:,} tokens left for the "
+                f"answer.", verbose)
     options: Dict[str, Any] = {
         **REASONING_OPTIONS,
         "temperature": TEMPERATURES[role],
@@ -3821,6 +3940,41 @@ def reason(
     # rescue's first step; probing: switched on, and not yet shown to help.
     # folded: the tool conversation has been folded, its second.
     switched = probing = folded = False
+    # The server's count of the last prompt it was sent, and how many
+    # messages that prompt held: the next prompt in this call is that count
+    # plus an estimate of only what was appended since (_used). None before
+    # any count came back, and again whenever the conversation is reshaped
+    # rather than appended to (a fold, the traces switched, the JSON
+    # protocol taking over), since the count no longer describes a prefix.
+    measured: Optional[Tuple[int, int]] = None
+
+    def _used(outgoing: List[Dict[str, Any]]) -> int:
+        if measured is None:
+            return _estimate_tokens(outgoing)
+        tokens, sent = measured
+        return tokens + (_estimate_tokens(outgoing[sent:])
+                         if len(outgoing) > sent else 0)
+
+    def _spare() -> int:
+        """Tokens the prompt as it now stands has left before the reserve."""
+        return _room(_used(_outgoing() if native else messages),
+                     num_ctx) - reserve
+
+    def _result_budget() -> int:
+        """The characters the next tool result may take: the room left
+        before the reserve, less the result's framing."""
+        return int((_spare() - _RESULT_FRAME_TOKENS)
+                   * llm_backend.chars_per_token())
+
+    def _room_line() -> str:
+        """The line every tool result ends with: the room the prompt has
+        left before lookups close, once this result is in it."""
+        left = _spare() - _RESULT_FRAME_TOKENS
+        if left < _MIN_RESULT_TOKENS:
+            return ("[No room remains for more lookups: give your answer "
+                    "now, with what you have.]")
+        return (f"[About {left // 100 * 100:,} tokens of room remain before "
+                f"lookups close.]")
 
     def _outgoing() -> List[Dict[str, Any]]:
         if not (echo and traces):
@@ -3829,7 +3983,7 @@ def reason(
                 for i, m in enumerate(messages)]
 
     def _fold(why: str) -> None:
-        nonlocal native, folded, probing
+        nonlocal native, folded, probing, measured
         task = user_prompt
         if tool_notes:
             task += (
@@ -3846,18 +4000,20 @@ def reason(
         native = False
         folded = True
         probing = False
-        log(f"  {role} {why}; asking again in one plain message with its "
+        measured = None
+        log(f"  {role} {why}; asking in one plain message with its "
             f"{len(tool_notes)} tool result(s) written in.", verbose)
 
     def _rescue(why: str) -> bool:
         """Take the rescue's next step for a failed tool conversation.
         False when there is none left, or no tool round to blame."""
-        nonlocal echo, switched, probing
+        nonlocal echo, switched, probing, measured
         if folded or not tool_notes:
             return False
         if traces and not switched:
             switched = True
             echo = probing = not echo
+            measured = None
             log(f"  {role} {why}; sending its tool conversation again "
                 f"{'with' if echo else 'without'} its reasoning traces.",
                 verbose)
@@ -3882,13 +4038,51 @@ def reason(
         # the prompt differs every iteration and every role — and grows
         # with each tool round — and there is no point asking for more than
         # the window holds or less than it does.
-        options["num_predict"] = _headroom(outgoing, REASONING_OPTIONS["num_ctx"])
+        room = _room(_used(outgoing), num_ctx)
+        if native and not offer:
+            # The last round of lookups is spent. Never a request that
+            # declares tools with tool_choice "none": a model that still
+            # wants a lookup writes the call anyway, a server (vLLM) drops
+            # it, and the reply comes back empty. One plain message with
+            # the results written in declares no tools at all.
+            _fold(f"has used its {tools_mod.MAX_TOOL_ROUNDS} rounds of "
+                  f"lookups")
+            continue
+        if native and _no_lookup_room(room):
+            # The prompt has reached the reply's reserve: lookups close the
+            # same way, by folding, and the model answers with what it
+            # has looked up.
+            _fold(f"has reached the reply's reserve (~{room:,} tokens left)")
+            continue
+        if room < COMPACT_MIN_ROOM:
+            if tool_notes and not folded:
+                # The tool conversation's own weight (its turns, any traces
+                # sent back) is what is left to drop.
+                _fold(f"left only ~{room:,} tokens for its answer")
+                continue
+            # Never a request for (next to) nothing: a server refuses
+            # max_tokens 0, and a thinking model cannot answer in less.
+            log(f"  {role}: the prompt leaves only ~{room:,} tokens of the "
+                f"{num_ctx:,}-token window for the reply; not sending it.",
+                verbose)
+            return "", "too_large", None
+        if offer and _no_lookup_room(room):
+            # The JSON protocol at the reply's reserve: no call is served
+            # from here, and the last result already said so (its "last
+            # tool call" line). There is no tool_choice to get wrong here.
+            offer = False
+            if not closed:
+                closed = True
+                log(f"  {role}: closing lookups, ~{room:,} tokens left for "
+                    f"the answer.", verbose)
+        options["num_predict"] = room
         try:
             if native:
+                # Always offering: a native call whose lookups are closed
+                # has been folded above, and sends no tools.
                 reply = BACKEND.chat(
                     outgoing, think=True, schema=None, options=options,
                     tools=tools.specs(),
-                    tool_choice=None if offer else "none",
                 )
             else:
                 reply = BACKEND.chat(messages, think=True, schema=None,
@@ -3898,6 +4092,7 @@ def reason(
             # on, for this call and every later one. Not an attempt spent.
             _disable_native_tools(str(e), verbose)
             native = False
+            measured = None
             system_prompt = base_system + "\n\n" + tools.json_protocol()
             messages[0] = {"role": "system", "content": system_prompt}
             continue
@@ -3918,6 +4113,9 @@ def reason(
             continue
 
         answered = True
+        prompt_tokens = reply.usage.get("prompt_tokens")
+        if isinstance(prompt_tokens, int) and prompt_tokens > 0:
+            measured = (prompt_tokens, len(outgoing))
         content = reply.content or ""
         thinking = reply.thinking or ""
         content, thinking = _split_inline_thinking(content, thinking)
@@ -3944,14 +4142,21 @@ def reason(
                     ],
                 })
                 for c in reply.tool_calls:
-                    result = tools.run(c.name, c.arguments)
+                    # Each result is held to the room left once the ones
+                    # before it in this round are in.
+                    result = tools.run(c.name, c.arguments,
+                                       budget=_result_budget())
                     _record(c.name, c.arguments, result)
                     messages.append({"role": "tool", "tool_call_id": c.id,
                                      "content": result})
+                    messages[-1]["content"] = result + "\n\n" + _room_line()
                 continue
             if not content.strip():
                 # Still calling with the tools closed and nothing written:
                 # re-sending the same conversation tends to get the same.
+                # A safety net only: a native request is folded once its
+                # lookups close, so no request reaches here with tools
+                # declared and not offered.
                 attempt += 1
                 _fold(f"kept calling tools after its last round "
                       f"(attempt {attempt})")
@@ -3964,17 +4169,24 @@ def reason(
                 if offer:
                     rounds += 1
                     name, arguments = call
-                    result = tools.run(name, arguments)
+                    result = tools.run(name, arguments,
+                                       budget=_result_budget())
                     _record(name, arguments, result)
-                    last = rounds >= tools_mod.MAX_TOOL_ROUNDS
-                    messages.append({"role": "user", "content": (
-                        f"Result of {name}:\n{result}\n\n"
+                    messages.append({"role": "user", "content": result})
+                    # The room line and the last-call test both read the
+                    # prompt with this result in it.
+                    line = _room_line()
+                    last = (rounds >= tools_mod.MAX_TOOL_ROUNDS
+                            or _spare() - _RESULT_FRAME_TOKENS
+                            < _MIN_RESULT_TOKENS)
+                    messages[-1]["content"] = (
+                        f"Result of {name}:\n{result}\n\n{line}\n\n"
                         + ("That was your last tool call: give your answer "
                            "now, in the format asked for."
                            if last else
                            "Call another tool, or give your answer in the "
                            "format asked for.")
-                    )})
+                    )
                 else:
                     attempt += 1
                     messages.append({"role": "user", "content": (
@@ -4193,8 +4405,11 @@ def lemma_window(
     def take(pairs: List[Tuple[str, str]], n: int) -> List[Tuple[str, str]]:
         return pairs if n < 0 else pairs[:n]
 
-    chosen = set(take(newest, LEMMAS_ALL))
-    chosen.update(take([p for p in newest if p[0] == USER], MY_LEMMAS))
+    # The flags' sizes, or _fit_prompt's smaller ones while it rebuilds a
+    # prompt to fit the window (_WINDOW_OVERRIDE).
+    lemmas_all, my_lemmas, lemmas_common = _window_sizes()
+    chosen = set(take(newest, lemmas_all))
+    chosen.update(take([p for p in newest if p[0] == USER], my_lemmas))
     shown = [pair for pair in reversed(newest) if pair in chosen]
 
     eligible_set = set(eligible)
@@ -4205,7 +4420,7 @@ def lemma_window(
                 counts[dep] = counts.get(dep, 0) + 1
     common = take(
         sorted(counts, key=lambda p: (-counts[p], _tiebreak(p))),
-        LEMMAS_COMMON,
+        lemmas_common,
     )
     chosen.update(common)
 
@@ -4385,6 +4600,106 @@ def verifier_context(
                 "statement": str(ref.get("formal statement", ""))
             }
     return {"cited_results": statements}
+
+
+def _fit_prompt(
+    role: str,
+    system_prompt: str,
+    build: Callable[[], Tuple[str, Optional["tools_mod.ToolSet"]]],
+    verbose: bool,
+    dag: Dict[str, Any],
+    suspended: Optional[Set[Tuple[str, str]]] = None,
+    parts: Optional[Dict[str, str]] = None,
+) -> Tuple[str, Optional["tools_mod.ToolSet"]]:
+    """An agent's (user prompt, tools), fitted to the context window.
+
+    build() makes the prompt and the tools for the window sizes in effect:
+    it calls planner_dag_view or prover_context, and agent_tools, so the
+    prompt and the tools always see the same window (agent_tools offers
+    lookup_lemmas once anything is left out of it). The lemma window is the
+    part of a prompt that can give way without losing anything: a lemma
+    moved from the full listing into the id index is one lookup away.
+
+    The configured sizes are tried first, and a prompt that fits is
+    returned exactly as built. One whose estimate leaves less than the
+    reply's reserve plus LOOKUP_ROOM is rebuilt with all three sizes
+    halved (15 -> 7 -> 3 -> 1 -> 0; -1, no limit, halves from the DAG's
+    size) under _WINDOW_OVERRIDE, which is per thread, until one fits; the
+    last build is kept when none does — reason() then closes the tools if
+    the prompt leaves only the reserve, and returns "too_large", unsent,
+    if it leaves less than COMPACT_MIN_ROOM. In that case the parts of the
+    prompt are logged by size (`parts` names the call site's fixed pieces
+    — the conjecture, the references block, the lemma or proof being
+    worked on), since then something other than the window is too large.
+    """
+    num_ctx = REASONING_OPTIONS["num_ctx"]
+    limit = num_ctx - _reserve(num_ctx) - _lookup_room(num_ctx)
+
+    def estimate(user_prompt: str, tools: Optional["tools_mod.ToolSet"]) -> int:
+        extra = ""
+        if tools:
+            extra = (json.dumps(tools.specs()) if _native_tools()
+                     else tools.json_protocol())
+        return _estimate_tokens([
+            {"content": system_prompt}, {"content": user_prompt},
+            {"content": extra},
+        ])
+
+    def build_with(sizes: Tuple[int, int, int]):
+        token = _WINDOW_OVERRIDE.set(sizes)
+        try:
+            return build()
+        finally:
+            _WINDOW_OVERRIDE.reset(token)
+
+    configured = _window_sizes()
+    sizes = configured
+    user_prompt, tools = build()
+    used = estimate(user_prompt, tools)
+    total = len(dag["lemmas"])
+    while used > limit and any(sizes):
+        sizes = tuple((total if n < 0 else n) // 2 for n in sizes)
+        user_prompt, tools = build_with(sizes)
+        used = estimate(user_prompt, tools)
+
+    def shown(n: int) -> str:
+        return "all" if n < 0 else str(n)
+
+    if sizes != configured:
+        log(
+            f"  {role}: showing {shown(sizes[0])}+{shown(sizes[1])} lemmas "
+            f"in full and {shown(sizes[2])} common instead of "
+            f"{shown(configured[0])}+{shown(configured[1])} and "
+            f"{shown(configured[2])} to fit the {num_ctx:,}-token window "
+            f"(the rest stay available by lookup).",
+            verbose,
+        )
+    if _room(used, num_ctx) < COMPACT_MIN_ROOM:
+        # Only reached with every size at 0: the room limit is below
+        # half the window, so the loop above ran to the end.
+        token = _WINDOW_OVERRIDE.set(sizes)
+        try:
+            _shown, _common, index = lemma_window(dag, suspended)
+        finally:
+            _WINDOW_OVERRIDE.reset(token)
+        sized = {"the system prompt": system_prompt, **(parts or {})}
+        if index:
+            sized["the id index"] = json.dumps(index, indent=2)
+        ratio = max(llm_backend.chars_per_token(), 1.0)
+        largest = sorted(
+            ((label, int(len(text) / ratio)) for label, text in sized.items()
+             if len(text) >= ratio),
+            key=lambda item: -item[1],
+        )
+        log(
+            f"  {role}: the prompt (~{used:,} tokens) does not fit the "
+            f"{num_ctx:,}-token window even with no lemmas in full; its "
+            f"largest parts: "
+            + ", ".join(f"{label} ~{n:,}" for label, n in largest)
+            + ".",
+            verbose,
+        )
+    return user_prompt, tools
 
 
 def scan_citations(
@@ -4625,6 +4940,13 @@ def _run_verifier(
             f"{role} exhausted its token budget without reaching a verdict; "
             "the proof is likely too long to review in one pass.",
         )
+    if review_status == "too_large":
+        return (
+            "",
+            f"{role}'s prompt does not fit the context window, so it was "
+            "never sent: the proof and the results it cites are too long "
+            "to review in one pass.",
+        )
     # The verifier prompts demand raw JSON output; extraction is the fallback.
     res = parse_json_or_none(review) if review else None
     if res is None and review:
@@ -4674,7 +4996,9 @@ def _wait_for_server(role: str, should_stop, verbose: bool) -> bool:
 
 def _reason_until_answered(should_stop, verbose: bool, *args, **kwargs):
     """reason(), retried while the server is unreachable: its result once
-    the server answers, or None when should_stop fired while waiting."""
+    the server answers, or None when should_stop fired while waiting. A
+    "too_large" result is returned at once: it was never sent, so there is
+    no outage to wait out."""
     role = args[2]
     while True:
         result = reason(*args, verbose=verbose, **kwargs)
@@ -4864,37 +5188,69 @@ def run_proof_loop(
         # rather than via a second model call, so the proof text can never
         # be abridged or paraphrased; if the model ignored the format, its
         # content is taken verbatim as the proof.
-        prover_user = (
-            f"Conjecture:\n{conjecture}\n\n"
-            f"Available proved lemmas:\n"
-            f"{json.dumps(prover_context(dag, suspended), indent=2)}"
-            f"{reference_block}\n\n"
-            f"Lemma to prove:\n{json.dumps(target, indent=2)}\n"
-            + (
-                f"\nReviser's guidance for this statement (it holds for "
-                f"every attempt at it):\n{guidance}\n"
-                if guidance
-                else ""
+        def build_prover() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
+            return (
+                f"Conjecture:\n{conjecture}\n\n"
+                f"Available proved lemmas:\n"
+                f"{json.dumps(prover_context(dag, suspended), indent=2)}"
+                f"{reference_block}\n\n"
+                f"Lemma to prove:\n{json.dumps(target, indent=2)}\n"
+                + (
+                    f"\nReviser's guidance for this statement (it holds for "
+                    f"every attempt at it):\n{guidance}\n"
+                    if guidance
+                    else ""
+                )
+                + (
+                    f"\nFeedback from the previous attempt "
+                    f"(the most recent rejection only):\n"
+                    f"{json.dumps(feedback, indent=2)}"
+                    if feedback
+                    else ""
+                ),
+                agent_tools(dag, suspended),
             )
-            + (
-                f"\nFeedback from the previous attempt "
-                f"(the most recent rejection only):\n"
-                f"{json.dumps(feedback, indent=2)}"
-                if feedback
-                else ""
-            )
+        prover_user, prover_tools = _fit_prompt(
+            "prover", prover_sys, build_prover, verbose, dag, suspended,
+            parts={
+                "the conjecture": conjecture,
+                "the references block": reference_block,
+                "the lemma": json.dumps(target, indent=2),
+                "the reviser's guidance": guidance,
+                "the feedback": json.dumps(feedback, indent=2) if feedback else "",
+            },
         )
         # An unreachable server is waited out, not counted: the round
         # re-runs from the top (where a stop is noticed) once it answers.
         answer = _reason_until_answered(
             should_stop, verbose,
             prover_sys, prover_user, "prover",
-            tools=agent_tools(dag, suspended),
+            tools=prover_tools,
         )
         if answer is None:
             continue
         proof_text, prover_status, prover_partial = answer
         toggle_hotkey()
+
+        if prover_status == "too_large":
+            # The prompt, not the lemma, is what does not fit: the lemma
+            # was never attempted, so it is neither decomposed nor put on
+            # the reject list, and re-sending the same prompt would fail
+            # the same way. Given up for this pass, with a note that says
+            # why.
+            log(
+                f"The prover's prompt for {lemma_id} does not fit the "
+                f"context window even with no lemmas shown in full (its "
+                f"largest parts are logged above); giving the lemma up for "
+                f"now, unattempted.",
+                verbose,
+            )
+            attempt_notes.append(
+                f"Prover attempt {attempt}: not attempted — the prover's "
+                f"prompt did not fit the context window. This says nothing "
+                f"about the lemma itself."
+            )
+            break
 
         if prover_status == "ceiling":
             # The prover exhausted the window and the compaction rescue
@@ -4928,22 +5284,44 @@ def run_proof_loop(
                 f"from the partial proof.",
                 verbose,
             )
-            overflow_user = (
-                f"Conjecture:\n{conjecture}\n\n"
-                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
-                f"{reviser_ref_block}\n\n"
-                f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
-                f"{report}"
+            def build_overflow() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
+                return (
+                    f"Conjecture:\n{conjecture}\n\n"
+                    f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
+                    f"{reviser_ref_block}\n\n"
+                    f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
+                    f"{report}",
+                    agent_tools(dag, suspended),
+                )
+            overflow_user, overflow_tools = _fit_prompt(
+                "reviser", reviser_sys, build_overflow, verbose, dag,
+                suspended,
+                parts={
+                    "the conjecture": conjecture,
+                    "the references block": reviser_ref_block,
+                    "the lemma": json.dumps(target, indent=2),
+                    "the partial proof": report,
+                },
             )
             answer = _reason_until_answered(
                 should_stop, verbose,
                 reviser_sys, overflow_user, "reviser",
-                tools=agent_tools(dag, suspended),
+                tools=overflow_tools,
             )
             if answer is None:
                 continue
             revision_text, _revision_status, _revision_partial = answer
             toggle_hotkey()
+            if _revision_status == "too_large":
+                # Not re-sent: it would not fit any better. With no
+                # decision the lemma is given up below, the way an
+                # overflow the reviser cannot rescue always is.
+                log(
+                    "The reviser's prompt for the overflow does not fit the "
+                    "context window even with no lemmas shown in full (its "
+                    "largest parts are logged above).",
+                    verbose,
+                )
             revision_res = _parse_reviser_decision(revision_text, verbose)
             action = str(revision_res.get("action") or "").strip().lower()
             diagnosis = str(revision_res.get("diagnosis") or "").strip()
@@ -5282,19 +5660,31 @@ def run_proof_loop(
             f"verdict to the reviser.",
             verbose,
         )
-        reviser_user = (
-            f"Conjecture:\n{conjecture}\n\n"
-            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
-            f"{reviser_ref_block}\n\n"
-            f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
-            f"The last proof of this lemma (the one just rejected; judge "
-            f"the lemma's difficulty from it):\n{proof}\n\n"
-            f"Verifier's reasoning (why the proof failed):\n{reject_just}"
+        def build_reviser() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
+            return (
+                f"Conjecture:\n{conjecture}\n\n"
+                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
+                f"{reviser_ref_block}\n\n"
+                f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
+                f"The last proof of this lemma (the one just rejected; judge "
+                f"the lemma's difficulty from it):\n{proof}\n\n"
+                f"Verifier's reasoning (why the proof failed):\n{reject_just}",
+                agent_tools(dag, suspended),
+            )
+        reviser_user, reviser_tools = _fit_prompt(
+            "reviser", reviser_sys, build_reviser, verbose, dag, suspended,
+            parts={
+                "the conjecture": conjecture,
+                "the references block": reviser_ref_block,
+                "the lemma": json.dumps(target, indent=2),
+                "the proof": proof,
+                "the verifier's reasoning": reject_just or "",
+            },
         )
         answer = _reason_until_answered(
             should_stop, verbose,
             reviser_sys, reviser_user, "reviser",
-            tools=agent_tools(dag, suspended),
+            tools=reviser_tools,
         )
         if answer is None:
             continue
@@ -5324,6 +5714,15 @@ def run_proof_loop(
                     "reviser",
                     verbose,
                 )
+        elif _revision_status == "too_large":
+            # Not re-sent: the same prompt would not fit any better. The
+            # prover's next round, a different prompt, goes ahead.
+            log(
+                "The reviser's prompt does not fit the context window even "
+                "with no lemmas shown in full (its largest parts are logged "
+                "above); the verdict alone goes back to the prover.",
+                verbose,
+            )
         else:
             log(
                 "Reviser returned nothing; the verdict alone goes back "
@@ -5923,19 +6322,45 @@ def run_loop(verbose: bool = True) -> Dict[str, Any]:
         if not resuming:
 
             # ---------------- Step 1: Planner ----------------
-            planner_user = (
-                f"Conjecture:\n{conjecture}\n\n"
-                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
-                f"{planner_ref_block}{comments_block}\n\n"
-                f"{rejected_block(rejected_lemmas)}"
-                + (f"\n\n{operator_note}" if operator_note else "")
+            def build_planner() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
+                return (
+                    f"Conjecture:\n{conjecture}\n\n"
+                    f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, suspended), indent=2)}"
+                    f"{planner_ref_block}{comments_block}\n\n"
+                    f"{rejected_block(rejected_lemmas)}"
+                    + (f"\n\n{operator_note}" if operator_note else ""),
+                    agent_tools(dag, suspended),
+                )
+            planner_user, planner_tools = _fit_prompt(
+                "planner", planner_sys, build_planner, verbose, dag,
+                suspended,
+                parts={
+                    "the conjecture": conjecture,
+                    "the references block": planner_ref_block,
+                    "the comments": comments_block,
+                    "the rejected lemmas": rejected_block(rejected_lemmas),
+                },
             )
             operator_note = ""
             plan_text, plan_status, _partial = reason(
                 planner_sys, planner_user, "planner", verbose,
-                tools=agent_tools(dag, suspended),
+                tools=planner_tools,
             )
             check_mode_toggle(verbose)
+            if plan_status == "too_large":
+                # Nothing left to shrink, and in a serial run nothing but
+                # this planner moves the DAG: every later iteration would
+                # build the same prompt. Stop, with the checkpoint at this
+                # iteration, rather than spend the budget on unsent calls.
+                log(
+                    "The planner's prompt does not fit the context window "
+                    "even with no lemmas shown in full (its largest parts "
+                    "are logged above). Stopping the run: re-run with a "
+                    "larger window (--num-ctx, and the server's own) or a "
+                    "smaller part; the checkpoint keeps this iteration.",
+                    verbose,
+                )
+                return load_dag()
             if plan_status == "ceiling" and not plan_text:
                 log("Planner exhausted its token budget. Re-planning.", verbose)
                 continue
@@ -6626,6 +7051,28 @@ def _clean_candidate(raw: Any, conjecture: str) -> Optional[Dict[str, Any]]:
     return resolution.pin({"id": lemma_id, "statement": statement}, conjecture)
 
 
+def _steering_inputs(state: ParallelState) -> Tuple[Any, ...]:
+    """What the steering prompts are built from, in a comparable form: the
+    DAG's version, the plan, the reject list and the buffer."""
+    return (
+        state.dag_version_snapshot(),
+        json.dumps(state.plan_snapshot(), sort_keys=True, default=str),
+        json.dumps(state.rejected_snapshot(), sort_keys=True, default=str),
+        json.dumps(state.buffer.snapshot(), sort_keys=True, default=str),
+    )
+
+
+def _wait_for_steering_change(state: ParallelState) -> bool:
+    """Wait for a steering prompt's inputs to change after one was too
+    large to send (reason()'s "too_large"): the same inputs would build the
+    same prompt. True once they have changed, False on a stop."""
+    before = _steering_inputs(state)
+    while not state.stop_event.wait(10):
+        if _steering_inputs(state) != before:
+            return True
+    return False
+
+
 def _parallel_planner(
     state: ParallelState,
     verbose: bool,
@@ -6672,18 +7119,57 @@ def _parallel_planner(
         # Each pass plans from scratch: the previous plan is not shown, so
         # the new one is written from the DAG alone.
         operator_note = state.take_operator_note()
-        plan_user = (
-            f"Conjecture:\n{conjecture}\n\n"
-            f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, susp.suspended), indent=2)}"
-            f"{ref_block}{comments_block}\n\n"
-            f"{rejected_block(state.rejected_snapshot())}\n"
-            + (f"\n{operator_note}\n" if operator_note else "")
+        rejected = rejected_block(state.rejected_snapshot())
+
+        def build_plan() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
+            return (
+                f"Conjecture:\n{conjecture}\n\n"
+                f"Proved lemmas so far:\n{json.dumps(planner_dag_view(dag, susp.suspended), indent=2)}"
+                f"{ref_block}{comments_block}\n\n"
+                f"{rejected}\n"
+                + (f"\n{operator_note}\n" if operator_note else ""),
+                agent_tools(dag, susp.suspended),
+            )
+        plan_user, plan_tools = _fit_prompt(
+            "parallel_planner", planner_sys, build_plan, verbose, dag,
+            susp.suspended,
+            parts={
+                "the conjecture": conjecture,
+                "the references block": ref_block,
+                "the comments": comments_block,
+                "the rejected lemmas": rejected,
+            },
         )
         text, _status, _partial = reason(
             planner_sys, plan_user, "parallel_planner", verbose,
-            tools=agent_tools(dag, susp.suspended),
+            tools=plan_tools,
         )
         check_mode_toggle(verbose)
+        if _status == "too_large":
+            # The same prompt would not fit any better: wait for what it is
+            # built from to change. With no plan yet and no loop in flight,
+            # nothing can — the generator waits for a plan, the loops for
+            # the generator — so the run stops instead of hanging.
+            if state.plan_snapshot() is None and not state.in_flight_ids():
+                log(
+                    "The parallel planner's prompt does not fit the context "
+                    "window even with no lemmas shown in full (its largest "
+                    "parts are logged above), and there is no plan to steer "
+                    "by. Stopping the run: re-run with a larger window "
+                    "(--num-ctx, and the server's own) or a smaller part.",
+                    verbose,
+                )
+                state.request_stop()
+                return
+            log(
+                "The parallel planner's prompt does not fit the context "
+                "window even with no lemmas shown in full; planning again "
+                "once the DAG, the reject list or the buffer changes.",
+                verbose,
+            )
+            if not _wait_for_steering_change(state):
+                return
+            continue
         plan_res = parse_json_or_none(text) if text else None
         if plan_res is None and text:
             plan_res = extract(
@@ -6752,22 +7238,61 @@ def _parallel_generator(
         # A lemma a loop holds in flight is off-limits too: the run
         # resumed it, and it is not in this run's buffer.
         known |= state.in_flight_ids()
-        gen_user = (
-            f"Conjecture:\n{conjecture}\n\n"
-            f"Current plan (follow its priorities; these are the lemmas the "
-            f"loops are working toward):\n{json.dumps(plan, indent=2)}\n\n"
-            f"Proved lemmas so far (already in the DAG; never restate "
-            f"them):\n{json.dumps(planner_dag_view(dag, susp.suspended), indent=2)}\n\n"
-            f"Possible lemmas currently in the buffer (claimed_by marks the "
-            f"loop that has picked one up; never duplicate any of "
-            f"these):\n{json.dumps(buffer_snapshot, indent=2)}\n\n"
-            f"{rejected_block(state.rejected_snapshot())}\n"
+        rejected = rejected_block(state.rejected_snapshot())
+
+        def build_gen() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
+            return (
+                f"Conjecture:\n{conjecture}\n\n"
+                f"Current plan (follow its priorities; these are the lemmas the "
+                f"loops are working toward):\n{json.dumps(plan, indent=2)}\n\n"
+                f"Proved lemmas so far (already in the DAG; never restate "
+                f"them):\n{json.dumps(planner_dag_view(dag, susp.suspended), indent=2)}\n\n"
+                f"Possible lemmas currently in the buffer (claimed_by marks the "
+                f"loop that has picked one up; never duplicate any of "
+                f"these):\n{json.dumps(buffer_snapshot, indent=2)}\n\n"
+                f"{rejected}\n",
+                agent_tools(dag, susp.suspended),
+            )
+        gen_user, gen_tools = _fit_prompt(
+            "parallel_lemma_generator", generator_sys, build_gen, verbose,
+            dag, susp.suspended,
+            parts={
+                "the conjecture": conjecture,
+                "the plan": json.dumps(plan, indent=2),
+                "the buffer": json.dumps(buffer_snapshot, indent=2),
+                "the rejected lemmas": rejected,
+            },
         )
         text, _status, _partial = reason(
             generator_sys, gen_user, "parallel_lemma_generator", verbose,
-            tools=agent_tools(dag, susp.suspended),
+            tools=gen_tools,
         )
         check_mode_toggle(verbose)
+        if _status == "too_large":
+            # As for the planner: wait for the prompt's inputs to change
+            # rather than re-send it — and stop when nothing can change
+            # them, with the buffer empty and no loop in flight.
+            if not buffer_snapshot and not state.in_flight_ids():
+                log(
+                    "The lemma generator's prompt does not fit the context "
+                    "window even with no lemmas shown in full (its largest "
+                    "parts are logged above), and no loop has work. "
+                    "Stopping the run: re-run with a larger window "
+                    "(--num-ctx, and the server's own) or a smaller part.",
+                    verbose,
+                )
+                state.request_stop()
+                return
+            log(
+                "The lemma generator's prompt does not fit the context "
+                "window even with no lemmas shown in full; generating again "
+                "once the DAG, the plan, the reject list or the buffer "
+                "changes.",
+                verbose,
+            )
+            if not _wait_for_steering_change(state):
+                return
+            continue
         batch = parse_json_or_none(text) if text else None
         if batch is None and text:
             batch = extract(

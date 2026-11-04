@@ -24,6 +24,13 @@ There are two ways a model asks, and the loop speaks both:
 The first tool is lookup_lemmas: the lemma window (main.lemma_window)
 shows the agents the most recently proved lemmas in full and lists the
 rest by id only; this is how an agent reads one of the rest.
+
+Every result lands in a prompt that shares one context window with the
+answer still to come, so run() takes the room left for it, in characters
+(reason() works it out before each call, keeping its reply reserve out of
+it). A tool that knows its own structure trims to whole entries
+(lookup_lemmas returns whole statements); any other result is cut at a line
+boundary, with a marker saying so.
 """
 
 from __future__ import annotations
@@ -42,12 +49,41 @@ MAX_TOOL_ROUNDS = 3
 MAX_LOOKUP = 10
 
 
+# What a call gets when not even one entry of its result fits the room left:
+# an instruction the model can act on, rather than a fragment it cannot.
+NO_ROOM = (
+    "error: there is no room left in the context window for this result. "
+    "Make no more tool calls: give your answer now, with what you have."
+)
+
+
 @dataclass
 class Tool:
     name: str
     description: str
     parameters: Dict[str, Any]           # a JSON Schema object
-    handler: Callable[[Dict[str, Any]], str]
+    # handler(arguments) — or handler(arguments, budget) when takes_budget,
+    # for a tool that trims its own result to whole entries.
+    handler: Callable[..., str]
+    takes_budget: bool = False
+
+
+def cut_to_budget(text: str, budget: Optional[int]) -> str:
+    """text, cut at a line boundary to at most budget characters with a
+    marker saying how much was left out — the generic trim, for a result
+    whose tool does not trim itself. Unchanged when it fits or there is no
+    budget; NO_ROOM when not even one line fits."""
+    if budget is None or len(text) <= budget:
+        return text
+    marker = (
+        f"\n[... cut here: the full result is {len(text):,} characters and "
+        "the context window has room for only part of it. Room is running "
+        "out: answer with what you have.]"
+    )
+    end = text.rfind("\n", 0, max(budget - len(marker), 0))
+    if end <= 0:
+        return NO_ROOM
+    return text[:end] + marker
 
 
 @dataclass
@@ -74,12 +110,21 @@ class ToolSet:
             for t in self.tools
         ]
 
-    def run(self, name: str, arguments: Any) -> str:
+    def run(self, name: str, arguments: Any,
+            budget: Optional[int] = None) -> str:
         """The result of one call, as the text the model reads. A bad call
         (unknown tool, arguments that are not an object, a handler that
         raises) is answered with an error the model can act on, never
         raised: a tool call is the model's move, and a wrong one is its
-        to correct."""
+        to correct.
+
+        budget, when given, is the most characters the result may take: the
+        room the prompt has left before it would cut into the reply's
+        reserve. A tool that takes_budget trims itself to whole entries;
+        every result is then held to the budget by cut_to_budget, which
+        leaves one that fits untouched."""
+        if budget is not None and budget <= 0:
+            return NO_ROOM
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments) if arguments.strip() else {}
@@ -90,9 +135,11 @@ class ToolSet:
         for t in self.tools:
             if t.name == name:
                 try:
-                    return t.handler(arguments)
+                    result = (t.handler(arguments, budget) if t.takes_budget
+                              else t.handler(arguments))
                 except Exception as e:  # the model's call, the model's error
-                    return f"error: {name} failed: {e}"
+                    result = f"error: {name} failed: {e}"
+                return cut_to_budget(result, budget)
         return f"error: there is no tool {name!r}; the tools are {self.names()}"
 
     def json_protocol(self) -> str:
@@ -150,7 +197,7 @@ def lemma_lookup(
     file)."""
     suspended = suspended or set()
 
-    def handler(args: Dict[str, Any]) -> str:
+    def handler(args: Dict[str, Any], budget: Optional[int] = None) -> str:
         wanted = args.get("lemmas")
         if not isinstance(wanted, list) or not wanted:
             return 'error: pass "lemmas", a non-empty list of {"user_id", "lemma_id"} objects'
@@ -198,7 +245,29 @@ def lemma_lookup(
             f" (only the first {MAX_LOOKUP} were looked up)"
             if len(wanted) > MAX_LOOKUP else ""
         )
-        return json.dumps({"lemmas": found}, indent=2) + note
+        text = json.dumps({"lemmas": found}, indent=2) + note
+        if budget is None or len(text) <= budget:
+            return text
+        # Not all of it fits the room left: whole statements, as many as
+        # fit, in the order asked for, and a line saying what was left out.
+        # Half a statement is worse than none — the model would build on a
+        # hypothesis list cut short.
+        def left_out(n: int) -> str:
+            return (
+                f"\n({n} of the {len(found)} lemmas found were left out: "
+                "room in the context window is running out. Look up fewer "
+                "at a time, or answer with what you have.)"
+            )
+        kept: List[Dict[str, Any]] = []
+        for entry in found:
+            trial = json.dumps({"lemmas": kept + [entry]}, indent=2)
+            if len(trial) + len(note) + len(left_out(len(found))) > budget:
+                break
+            kept.append(entry)
+        if not kept:
+            return NO_ROOM
+        return (json.dumps({"lemmas": kept}, indent=2) + note
+                + left_out(len(found) - len(kept)))
 
     return Tool(
         name="lookup_lemmas",
@@ -226,4 +295,5 @@ def lemma_lookup(
             "required": ["lemmas"],
         },
         handler=handler,
+        takes_budget=True,
     )

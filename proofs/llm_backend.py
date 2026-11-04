@@ -415,10 +415,11 @@ class OpenAICompatibleBackend:
              tools: Optional[List[Dict[str, Any]]] = None,
              tool_choice: Optional[str] = None) -> Reply:
         """One completion. tools is the OpenAI-style `tools` field (a
-        ToolSet's specs()), and tool_choice its companion ("none" makes the
-        model answer rather than call, with the tools still declared for the
-        tool messages already in the conversation). A server that refuses
-        tools raises ToolsUnsupported."""
+        ToolSet's specs()), and tool_choice its companion. main.reason never
+        sends "none": a vLLM server drops the call a model writes anyway
+        and returns an empty reply, so a conversation whose tools are
+        closed is sent without them instead. A server that refuses tools
+        raises ToolsUnsupported."""
         merged = dict(options or {})
 
         payload: Dict[str, Any] = {"model": self.model, "messages": messages,
