@@ -422,7 +422,6 @@ def describe(paths: RunPaths) -> str:
     if paths.dag.exists():
         lines.append(
             f"  resuming from existing {paths.dag.name} "
-            f"(delete it for a clean run)"
         )
     if paths.dags_dir.is_dir():
         others = sorted(
@@ -493,8 +492,7 @@ def describe(paths: RunPaths) -> str:
     comments = paths.comments
     if comments.is_file() and comments.read_text(encoding="utf-8").strip():
         lines.append(
-            f"  comments={comments.name} — yours alone (gitignored); "
-            f"passed to the planner verbatim as suggestions"
+            f"  comments={comments.name} passed to the planner verbatim as suggestions"
         )
     if paths.overridden_prompts:
         lines.append(

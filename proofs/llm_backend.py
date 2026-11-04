@@ -12,9 +12,9 @@ Everything model-specific has to live in exactly one of two places, in order
 of preference:
 
   * A probe  — read off the server at startup, so it is correct for whatever
-    is actually loaded, no matter what the alias is: the context ceiling, the
-    thinking support, and — on a llama-server — the file name of the model
-    it has loaded, from /props. See probe(). Where there is no /props, the
+    is actually loaded, no matter what the alias is: the context ceiling
+    and — on a llama-server — the file name of the model it has loaded,
+    from /props. See probe(). Where there is no /props, the
     model that answered is read off each reply instead (recorded_model()).
   * Transport  — HOW to talk to the server. Real code. There is exactly one:
     the OpenAI-compatible /v1/chat/completions endpoint. llama.cpp's
@@ -71,7 +71,6 @@ class Profile:
     model_name: Optional[str] = None
     context_limit: int = 65536     # ceiling of the server's KV cache (tokens).
                                    # --num-ctx must fit inside this.
-    supports_thinking: bool = False
     probe_ok: bool = False         # False => everything below is a guess
     # Transport facts, set by probe(). is_llama_cpp decides the option set;
     # key_verified / auth_error report how a supplied API key was received.
@@ -190,6 +189,19 @@ class ToolCall:
     arguments: str
 
 
+# The keys a reply's reasoning trace can come under, in the order chat()
+# reads them (see the note there).
+REASONING_KEYS = ("reasoning_content", "reasoning")
+
+
+def reasoning_chars(message: Dict[str, Any]) -> int:
+    """The length of the reasoning trace a message carries back to the
+    server (main.reason sends it with a tool-call turn when the model needs
+    it): prompt text, so a prompt-size count must include it. 0 for every
+    other message."""
+    return sum(len(str(message[k])) for k in REASONING_KEYS if message.get(k))
+
+
 @dataclass
 class Reply:
     content: str
@@ -197,6 +209,10 @@ class Reply:
     truncated: bool = False
     usage: Dict[str, Any] = field(default_factory=dict)
     tool_calls: List[ToolCall] = field(default_factory=list)
+    # The trace under the key the server sent it ({} when there was none),
+    # for a tool-call turn to carry back to a server that needs to see it
+    # again (main.reason).
+    reasoning_field: Dict[str, Any] = field(default_factory=dict)
     # The reply's own "model" field: on a hosted API, the model that
     # actually answered (often with a version suffix the request did not
     # carry). A llama-server puts its --alias here, whatever was requested.
@@ -318,8 +334,8 @@ class OpenAICompatibleBackend:
         Two independent checks, because they answer different questions:
 
         * /props is llama.cpp's. If it answers, this is a llama-server and we
-          get the real context ceiling, whether the chat template thinks, and
-          the file name of the model it has loaded. A hosted API has no
+          get the real context ceiling and the file name of the model it
+          has loaded. A hosted API has no
           /props, so its absence is not an error — it is the signature of
           "not llama.cpp", and we switch to the standard OpenAI option set and
           a default context limit.
@@ -331,7 +347,7 @@ class OpenAICompatibleBackend:
           alone). Its list of models is not used for naming: on a hosted
           API it is the provider's whole catalogue, in no useful order.
 
-        The probe's measurements (context ceiling, thinking support) are kept
+        The probe's measurements (context ceiling, loaded model) are kept
         either way — they describe the server that is actually there. What
         the probe decides is the dialect, and only when --backend is auto:
         an explicit backend wins over the probe, and a mismatch is flagged in
@@ -355,17 +371,6 @@ class OpenAICompatibleBackend:
             if isinstance(n_ctx, int) and n_ctx > 0:
                 prof.context_limit = n_ctx
 
-            # Whether the loaded template has a reasoning section. llama.cpp
-            # reports the chat template; qwen3.5 thinks by default. qwen3.8 keys
-            # its thinking on the OpenAI-style reasoning_effort knob instead
-            # (launched with --chat-template-kwargs
-            # '{"reasoning_effort":"xhigh"}'), so that name marks it too.
-            template = body.get("chat_template", "") or ""
-            prof.supports_thinking = (
-                "enable_thinking" in template
-                or "</thinking>" in template
-                or "reasoning_effort" in template
-            )
             # The file name of the model the server has loaded
             # (Profile.model_name).
             prof.model_name = _model_name_from_props(body)
@@ -491,7 +496,8 @@ class OpenAICompatibleBackend:
         # the tokens the server counted for the prompt we just sent, against
         # its char count. Every caller benefits; none has to remember to.
         note_usage(body.get("usage") or {},
-                   sum(len(str(m.get("content") or "")) for m in messages))
+                   sum(len(str(m.get("content") or "")) + reasoning_chars(m)
+                       for m in messages))
         choice = (body.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
         calls: List[ToolCall] = []
@@ -505,6 +511,7 @@ class OpenAICompatibleBackend:
                     arguments=(args if isinstance(args, str)
                                else json.dumps(args or {})),
                 ))
+        reasoning_key = next((k for k in REASONING_KEYS if msg.get(k)), None)
         return Reply(
             tool_calls=calls,
             content=msg.get("content") or "",
@@ -520,6 +527,8 @@ class OpenAICompatibleBackend:
             truncated=choice.get("finish_reason") == "length",
             usage=body.get("usage") or {},
             model=str(body.get("model") or ""),
+            reasoning_field=({reasoning_key: msg[reasoning_key]}
+                             if reasoning_key else {}),
         )
 
 
@@ -566,44 +575,34 @@ def chars_per_token() -> float:
 
 
 def describe(prof: Profile, requested_ctx: int) -> str:
-    """Startup banner, plus warnings when the request is unsatisfiable."""
-    lines = [
-        f"model={prof.name}"
-        + (f" loaded={prof.model_name}" if prof.model_name else "")
-        + f" ctx_limit={prof.context_limit} thinking={prof.supports_thinking}"
-    ]
+    """Startup warnings about the probe and the request ("" when there is
+    nothing to report)."""
+    lines: List[str] = []
     if prof.auth_error:
-        lines.insert(0, f"  {prof.auth_error}")
+        lines.append(prof.auth_error)
     if prof.key_verified:
-        lines.append("  API key verified against /v1/models.")
+        lines.append("API key verified against /v1/models.")
     if prof.is_llama_cpp and not prof.probed_llama_cpp:
         # Forced llama.cpp against a server that has no /props route.
         lines.append(
-            "  --backend llamacpp was forced, but the server has no /props "
+            "--backend llamacpp was forced, but the server has no /props "
             "route: the full llama.cpp option set (top_k/min_p) and thinking "
             "suppression are sent anyway. If this is not really a "
             "llama-server, a strict provider will 400 them — and the context "
-            "limit below is a default, not a measurement."
+            "limit is a default, not a measurement."
         )
     elif prof.probed_llama_cpp and not prof.is_llama_cpp:
         # Forced standard OpenAI against a server that does answer /props.
         lines.append(
-            "  --backend openai was forced, but the server answers /props "
+            "--backend openai was forced, but the server answers /props "
             "(a llama.cpp server): only the standard OpenAI fields are sent "
             "and thinking is not suppressed for schema calls, so on a real "
             "llama-server those replies may come back fenced."
         )
-    elif not prof.is_llama_cpp:
-        lines.append(
-            "  Not a llama.cpp server (no /props route): the context "
-            "limit is a default unless --num-ctx is given, and only the "
-            "standard OpenAI sampling fields are sent (llama.cpp's "
-            "top_k/min_p are dropped)."
-        )
     if requested_ctx > prof.context_limit:
         if prof.probed_llama_cpp:
             lines.append(
-                f"  --num-ctx {requested_ctx} exceeds the server's "
+                f"--num-ctx {requested_ctx} exceeds the server's "
                 f"{prof.context_limit}. llama-server fixes this at launch: "
                 f"restart it with -c {requested_ctx}. Clamping to "
                 f"{prof.context_limit} for now."
@@ -616,7 +615,7 @@ def describe(prof: Profile, requested_ctx: int) -> str:
             # into a loud stop naming the server's own number
             # (ContextLengthError).
             lines.append(
-                f"  --num-ctx {requested_ctx} replaces the "
+                f"--num-ctx {requested_ctx} replaces the "
                 f"{prof.context_limit} default on record (this endpoint "
                 f"reports no context limit). If the provider's real window "
                 f"is smaller, the first call that outruns it is 400'd and "
@@ -625,15 +624,9 @@ def describe(prof: Profile, requested_ctx: int) -> str:
             )
     if not prof.probe_ok and not prof.key_verified:
         lines.append(
-            "  Capability probe failed and no API key was verified — is "
-            "the server up, and is this the right host? Everything below is a "
-            "default, not a measurement. "
+            "Capability probe failed and no API key was verified — is "
+            "the server up, and is this the right host? The context limit "
+            "is a default, not a measurement. "
             "(open-webui answers on 8080 but has no /props route.)"
-        )
-    if not prof.supports_thinking:
-        lines.append(
-            "  No thinking capability reported. The generation budget "
-            "assumes a reasoning trace, so it will be far larger than needed "
-            "— harmless, since num_predict is a ceiling, not a target."
         )
     return "\n".join(lines)

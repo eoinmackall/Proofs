@@ -226,7 +226,7 @@ except ImportError:  # top-level modules (`python proofs/main.py`)
 MODEL_NAME = ""               # set from the required --model
 
 # Set in main(). BACKEND owns the HTTP conversation; PROFILE is what the
-# capability probe found (context ceiling, thinking support, tokenizer ratio).
+# capability probe found (context ceiling, loaded model, tokenizer ratio).
 BACKEND: Any = None
 PROFILE: Any = None
 
@@ -533,6 +533,19 @@ MAX_COMPACTION_PASSES = 2
 # Set at runtime if schema-constrained extraction proves incompatible with the
 # model's default thinking (empty content, output stranded in .thinking).
 _SCHEMA_MODE_BROKEN = False
+
+# Whether the model needs its reasoning trace sent back with each tool-call
+# turn, as DeepSeek's thinking mode does: the hosted API refuses a tool
+# conversation without the traces, a self-hosted server answers it with
+# nothing. Until a conversation that failed without them succeeds with them
+# (see reason()), tool-call turns go back without the trace, so a model that
+# does not need it pays nothing for it, in requests or in context. Then True
+# for the rest of the process.
+_ECHO_REASONING = False
+
+# HTTP statuses that mean "this request is malformed", not "the server is
+# down": answered by changing the request, never by waiting.
+_REJECTED_STATUSES = (400, 422)
 
 
 def _recorded_model() -> str:
@@ -1781,12 +1794,11 @@ def _verify_session(
         NUM_CTX = num_ctx
     REASONING_OPTIONS["num_ctx"] = NUM_CTX
     EXTRACT_OPTIONS["num_ctx"] = NUM_CTX
-    log(
-        llm_backend.describe(
-            PROFILE, num_ctx if num_ctx is not None else NUM_CTX
-        ),
-        verbose,
+    notes = llm_backend.describe(
+        PROFILE, num_ctx if num_ctx is not None else NUM_CTX
     )
+    if notes:
+        log(notes, verbose)
     USER = user_id
     try:
         paths = workspace.resolve(conjecture_dir, user_id)
@@ -3407,9 +3419,11 @@ def _headroom(messages: List[Dict[str, str]], num_ctx: int) -> int:
     COMPACT_THRESHOLD * num_ctx: the model may think and write until the window
     is COMPACT_THRESHOLD full, and only then is it cut off for compaction.
     """
-    # A tool-call turn carries its calls beside an often-empty content.
+    # A tool-call turn carries its calls beside an often-empty content, and
+    # sometimes its reasoning trace (reason()'s _ECHO_REASONING).
     chars = sum(
         len(str(m.get("content") or "")) + len(json.dumps(m.get("tool_calls") or ""))
+        + llm_backend.reasoning_chars(m)
         for m in messages
     )
     ratio = llm_backend.chars_per_token()
@@ -3769,7 +3783,20 @@ def reason(
     the conversation, up to tools.MAX_TOOL_ROUNDS rounds; then the agent is
     told to answer. A compaction rescue re-sends the task with the results
     folded into it as text, so what the agent looked up survives the cut.
+
+    The tool conversation is the one part of a call whose shape servers and
+    models disagree on, so when it fails after a tool round (an empty
+    reply, the server refusing it) it is rescued in two steps, each tried
+    once. First it is sent again with the reasoning traces switched: added
+    to each tool-call turn, for a thinking model that needs to see them
+    again (remembered for the run once that works, _ECHO_REASONING), or
+    dropped, if they were being sent. Then it is folded into one plain
+    request: the task with the tool results written into it and no tools
+    offered, the form every chat server and model takes. A reply that keeps
+    calling closed tools is folded at once. A call whose tool conversation
+    works is sent exactly as it would be without the rescue.
     """
+    global _ECHO_REASONING
     base_system = system_prompt
     native = bool(tools) and _native_tools()
     if tools and not native:
@@ -3786,6 +3813,57 @@ def reason(
     # rescue folds into the task it re-sends.
     tool_notes: List[str] = []
     rounds = 0
+    # The reasoning trace of each native tool-call turn, by the turn's index
+    # in messages: sent with it only while echo is on.
+    traces: Dict[int, Dict[str, Any]] = {}
+    echo = _ECHO_REASONING
+    # switched: the traces have been switched on or off this call, the
+    # rescue's first step; probing: switched on, and not yet shown to help.
+    # folded: the tool conversation has been folded, its second.
+    switched = probing = folded = False
+
+    def _outgoing() -> List[Dict[str, Any]]:
+        if not (echo and traces):
+            return messages
+        return [{**m, **traces[i]} if i in traces else m
+                for i, m in enumerate(messages)]
+
+    def _fold(why: str) -> None:
+        nonlocal native, folded, probing
+        task = user_prompt
+        if tool_notes:
+            task += (
+                "\n\n---\nResults of the tool calls you made:\n\n"
+                + "\n\n".join(tool_notes)
+                + "\n\n---\nThe tools are closed now: give your answer, in "
+                "the format asked for."
+            )
+        messages[:] = [
+            {"role": "system", "content": base_system},
+            {"role": "user", "content": task},
+        ]
+        traces.clear()
+        native = False
+        folded = True
+        probing = False
+        log(f"  {role} {why}; asking again in one plain message with its "
+            f"{len(tool_notes)} tool result(s) written in.", verbose)
+
+    def _rescue(why: str) -> bool:
+        """Take the rescue's next step for a failed tool conversation.
+        False when there is none left, or no tool round to blame."""
+        nonlocal echo, switched, probing
+        if folded or not tool_notes:
+            return False
+        if traces and not switched:
+            switched = True
+            echo = probing = not echo
+            log(f"  {role} {why}; sending its tool conversation again "
+                f"{'with' if echo else 'without'} its reasoning traces.",
+                verbose)
+            return True
+        _fold(why)
+        return True
 
     def _record(name: str, arguments: Any, result: str) -> None:
         shown = arguments if isinstance(arguments, str) else json.dumps(arguments)
@@ -3797,16 +3875,18 @@ def reason(
     # is an outage ("unavailable"), not the model's.
     answered = False
     while attempt < LLM_MAX_RETRIES:
-        offer = bool(tools) and rounds < tools_mod.MAX_TOOL_ROUNDS
+        offer = (bool(tools) and not folded
+                 and rounds < tools_mod.MAX_TOOL_ROUNDS)
+        outgoing = _outgoing() if native else messages
         # As much room as the window has left, recomputed for this prompt:
         # the prompt differs every iteration and every role — and grows
         # with each tool round — and there is no point asking for more than
         # the window holds or less than it does.
-        options["num_predict"] = _headroom(messages, REASONING_OPTIONS["num_ctx"])
+        options["num_predict"] = _headroom(outgoing, REASONING_OPTIONS["num_ctx"])
         try:
             if native:
                 reply = BACKEND.chat(
-                    messages, think=True, schema=None, options=options,
+                    outgoing, think=True, schema=None, options=options,
                     tools=tools.specs(),
                     tool_choice=None if offer else "none",
                 )
@@ -3821,6 +3901,17 @@ def reason(
             system_prompt = base_system + "\n\n" + tools.json_protocol()
             messages[0] = {"role": "system", "content": system_prompt}
             continue
+        except requests.HTTPError as e:
+            # The server is up and refused this conversation: change the
+            # conversation rather than wait for the server.
+            status = e.response.status_code if e.response is not None else None
+            if (status in _REJECTED_STATUSES
+                    and _rescue(f"conversation was refused (HTTP {status})")):
+                answered = True
+                continue
+            attempt += 1
+            log(f"  {role} transport error (attempt {attempt}): {e}", verbose)
+            continue
         except (requests.RequestException, ValueError, KeyError) as e:
             attempt += 1
             log(f"  {role} transport error (attempt {attempt}): {e}", verbose)
@@ -3831,10 +3922,18 @@ def reason(
         thinking = reply.thinking or ""
         content, thinking = _split_inline_thinking(content, thinking)
         hit_ceiling = reply.truncated
+        if probing and (reply.tool_calls or content.strip()):
+            probing = False
+            if not _ECHO_REASONING:
+                _ECHO_REASONING = True
+                log("The model needs its reasoning sent back with its tool "
+                    "calls; sending it for the rest of the run.", verbose)
 
         if native and reply.tool_calls and not hit_ceiling:
             if offer:
                 rounds += 1
+                if reply.reasoning_field:
+                    traces[len(messages)] = reply.reasoning_field
                 messages.append({
                     "role": "assistant",
                     "content": reply.content or "",
@@ -3851,13 +3950,14 @@ def reason(
                                      "content": result})
                 continue
             if not content.strip():
-                # Still calling with the tools closed and nothing written.
+                # Still calling with the tools closed and nothing written:
+                # re-sending the same conversation tends to get the same.
                 attempt += 1
-                log(f"  {role} kept calling tools after its last round "
-                    f"(attempt {attempt}).", verbose)
+                _fold(f"kept calling tools after its last round "
+                      f"(attempt {attempt})")
                 continue
 
-        if not native and tools and not hit_ceiling:
+        if not native and tools and not folded and not hit_ceiling:
             call = tools.parse_json_call(content)
             if call is not None:
                 messages.append({"role": "assistant", "content": content})
@@ -3921,7 +4021,8 @@ def reason(
             return "", "ceiling", partial
 
         attempt += 1
-        log(f"  {role} returned empty content (attempt {attempt}).", verbose)
+        if not _rescue(f"returned empty content (attempt {attempt})"):
+            log(f"  {role} returned empty content (attempt {attempt}).", verbose)
 
     # Retries exhausted on empty replies or transport errors; nothing to salvage.
     return "", ("" if answered else "unavailable"), None
@@ -7043,7 +7144,7 @@ def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
 
     log(
         f"\nParallel mode: {parallel_loops} proof loop(s), one planner, "
-        f"one lemma generator, one DAG.",
+        f"one lemma generator.",
         verbose,
     )
 
@@ -7481,11 +7582,13 @@ def main(
         NUM_CTX = args.num_ctx
     REASONING_OPTIONS["num_ctx"] = NUM_CTX
     EXTRACT_OPTIONS["num_ctx"] = NUM_CTX
-    # The banner warns when an *explicit* --num-ctx is clamped; in the auto
+    # describe() warns when an *explicit* --num-ctx is clamped; in the auto
     # case the resolution above has already made the two agree.
-    log(llm_backend.describe(
+    notes = llm_backend.describe(
         PROFILE, args.num_ctx if args.num_ctx is not None else NUM_CTX
-    ), args.verbose)
+    )
+    if notes:
+        log(notes, args.verbose)
 
     # The run's user, before the paths: the DAG file is named after it,
     # and every lemma the run commits is stored under it. The model never

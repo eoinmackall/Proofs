@@ -345,11 +345,13 @@ def run(
     main.NUM_CTX = num_ctx
     main.REASONING_OPTIONS["num_ctx"] = num_ctx
     main.EXTRACT_OPTIONS["num_ctx"] = num_ctx
-    # The banner warns when an *explicit* --num-ctx is clamped; in the auto
+    # describe() warns when an *explicit* --num-ctx is clamped; in the auto
     # case the resolution above has already made the two agree.
-    main.log(llm_backend.describe(
+    notes = llm_backend.describe(
         main.PROFILE, args.num_ctx if args.num_ctx is not None else num_ctx
-    ), args.verbose)
+    )
+    if notes:
+        main.log(notes, args.verbose)
 
     # The run's user, before the paths: resolve() names the run's DAG
     # file after it, and the description the operator sees mentions whose

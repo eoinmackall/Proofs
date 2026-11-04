@@ -180,10 +180,10 @@ unless `--num-ctx` is given).
 `--backend {auto,llamacpp,openai}` (default `auto`) overrides that decision
 when the probe can't see the real server — a proxy in front of llama-server
 that eats `/props`, or a provider that happens to serve one. An explicit
-backend is taken on faith and the banner warns when it contradicts the probe
-(a forced llama.cpp against a server with no `/props` route, or a forced
-standard OpenAI against one that has it). The probe's *measurements* — the
-context ceiling and thinking support — are kept either way, because they
+backend is taken on faith, and a startup warning says when it contradicts
+the probe (a forced llama.cpp against a server with no `/props` route, or a
+forced standard OpenAI against one that has it). The probe's *measurements* — the
+context ceiling and the loaded model — are kept either way, because they
 describe the server that is actually there.
 
 **What `--model` does, and which model gets recorded.** `--model` is sent
@@ -195,8 +195,7 @@ Certificates and refutations therefore record the model that actually did
 the work, not the `--model` request:
 
 - **On a llama-server**, the file name of the loaded model, read off
-  `/props` at startup (e.g. `Qwen3.8-27B-UD-Q3_K_XL.gguf`). It is printed
-  in the banner as `loaded=` beside `model=`, the name `--model` sent.
+  `/props` at startup (e.g. `Qwen3.8-27B-UD-Q3_K_XL.gguf`).
 - **Anywhere else**, the model named in the reply's own `model` field — for
   a hosted API, the model `--model` selected, usually with its version
   suffix (`gpt-4o` → `gpt-4o-2024-08-06`).
@@ -205,7 +204,7 @@ the work, not the `--model` request:
 The `/v1/models` list is not used for naming: on a hosted API it is the
 provider's whole catalogue.
 
-Model capabilities (context size, thinking support) are *profiles*, probed
+Model capabilities (context size) are *profiles*, probed
 rather than hard-coded, so adding a model needs no code change.
 
 ## Setup
