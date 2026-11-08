@@ -5,7 +5,12 @@ handler that turns the arguments into a text result for the model. A
 ToolSet is the tools one agent call is offered. reason() in main.py runs
 the loop: the model asks for a tool, the handler runs, the result goes
 back, and the model goes on — until it gives its answer or the rounds run
-out (MAX_TOOL_ROUNDS).
+out (ToolSet.max_rounds()).
+
+A prompt mentions a tool only through the tool's own hint: reason() adds
+the ToolSet's prompt_hints() to the task while it offers the tools, and
+re-sends the task without them once it stops, so a model is never told to
+call a tool it no longer has.
 
 There are two ways a model asks, and the loop speaks both:
 
@@ -39,10 +44,10 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 
-# How many tool rounds one agent call may spend before it must answer. A
-# round is one reply from the model and the results of the calls in it;
-# every round's results stay in the prompt, so the bound is what keeps the
-# prompt's growth bounded too.
+# How many tool rounds one agent call may spend before it must answer, for
+# a tool that does not set its own max_rounds. A round is one reply from
+# the model and the results of the calls in it; every round's results stay
+# in the prompt, so the bound is what keeps the prompt's growth bounded too.
 MAX_TOOL_ROUNDS = 3
 
 # How many lemmas one lookup_lemmas call may return, for the same reason.
@@ -66,6 +71,11 @@ class Tool:
     # for a tool that trims its own result to whole entries.
     handler: Callable[..., str]
     takes_budget: bool = False
+    # What the task prompt tells the model about this tool while it is
+    # offered (ToolSet.prompt_hints): when to reach for it. "" for none.
+    hint: str = ""
+    # The rounds a call offered this tool may spend (ToolSet.max_rounds).
+    max_rounds: int = MAX_TOOL_ROUNDS
 
 
 def cut_to_budget(text: str, budget: Optional[int]) -> str:
@@ -95,6 +105,20 @@ class ToolSet:
 
     def names(self) -> List[str]:
         return [t.name for t in self.tools]
+
+    def max_rounds(self) -> int:
+        """The rounds one agent call offered these tools may spend: the
+        most any of them asks for."""
+        return max((t.max_rounds for t in self.tools),
+                   default=MAX_TOOL_ROUNDS)
+
+    def prompt_hints(self) -> str:
+        """The block reason() adds to the task while the tools are offered:
+        each tool's hint. "" when none has one."""
+        hints = [f"- {t.name}: {t.hint}" for t in self.tools if t.hint]
+        if not hints:
+            return ""
+        return "Tools you can call before you answer:\n" + "\n".join(hints)
 
     def specs(self) -> List[Dict[str, Any]]:
         """The OpenAI-style `tools` field, for a native call."""
@@ -149,7 +173,7 @@ class ToolSet:
             "You have tools. To call one, reply with ONLY a JSON object of "
             'the form {"tool": "<name>", "arguments": {...}} and nothing '
             "else; the result comes back in the next message. Call at most "
-            f"{MAX_TOOL_ROUNDS} times, then give your answer in the format "
+            f"{self.max_rounds()} times, then give your answer in the format "
             "asked for above. The tools:",
         ]
         for t in self.tools:
@@ -296,4 +320,9 @@ def lemma_lookup(
         },
         handler=handler,
         takes_budget=True,
+        hint=(
+            "other_proved_lemmas lists proved lemmas by id only. Call "
+            "lookup_lemmas to read the statement of any of them before "
+            "relying on it."
+        ),
     )

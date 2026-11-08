@@ -404,11 +404,14 @@ lemma). When the window holds every lemma, no index and no tool are sent
 and the prompts carry neither.
 
 Tools live in `proofs/tools.py`: each is a name, a JSON Schema for its
-arguments and a handler. `reason()` runs the loop — at most
-`MAX_TOOL_ROUNDS` (3) rounds per call, `MAX_LOOKUP` (10) lemmas per
-lookup — using native tool calls where the server supports them and a JSON
-protocol otherwise (`--tool-mode`). If a call hits the context wall after
-using tools, the continuation carries the tool results in its task.
+arguments, a handler, a hint (what the prompt tells the model about it) and
+its own round limit. `reason()` runs the loop — at most `MAX_TOOL_ROUNDS`
+(3) rounds per call unless a tool asks for more, `MAX_LOOKUP` (10) lemmas
+per lookup — using native tool calls where the server supports them and a
+JSON protocol otherwise (`--tool-mode`). The tools' hints are added to the
+task only while the tools are offered: once they are closed (rounds spent,
+no room left, or a compaction rescue) the task is re-sent without them,
+with the tool results and a line saying the tools are closed.
 
 ### Modes and the hotkey
 

@@ -3859,7 +3859,7 @@ def reason(
     (tools.py): natively, through the request's `tools` field, or — on a
     server that refuses that, or under --tool-mode json — through the JSON
     protocol the system prompt then describes. Each round's results stay in
-    the conversation, up to tools.MAX_TOOL_ROUNDS rounds; then a native
+    the conversation, up to the ToolSet's max_rounds() rounds; then a native
     conversation is folded (below) into one plain message with the results
     written in, and a JSON-protocol one is told to answer. A native request
     never declares tools it does not offer: with tool_choice "none" a model
@@ -3898,9 +3898,15 @@ def reason(
     native = bool(tools) and _native_tools()
     if tools and not native:
         system_prompt = base_system + "\n\n" + tools.json_protocol()
+    # user_prompt is the task without tools: the tools' hints ride on it
+    # only while the tools are offered, and every request that offers none
+    # (closed from the start, a fold, a compaction rescue) is built from
+    # user_prompt alone, so it never tells the model to call a tool.
+    hints = tools.prompt_hints() if tools else ""
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "user",
+         "content": user_prompt + ("\n\n" + hints if hints else "")},
     ]
     # closed: lookups have been closed for lack of room, and said so (once
     # per call).
@@ -3919,11 +3925,18 @@ def reason(
         tools = None
         native = False
         system_prompt = base_system
-        messages[0] = {"role": "system", "content": system_prompt}
+        messages[:] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
         room = _room(_estimate_tokens(messages), num_ctx)
         if room >= COMPACT_MIN_ROOM:   # else the loop's too_large says it
             log(f"  {role}: closing lookups, ~{room:,} tokens left for the "
                 f"answer.", verbose)
+    # offered: the model was offered tools in this call, so a request that
+    # takes them away says so. max_rounds: the rounds it may spend.
+    offered = bool(tools)
+    max_rounds = tools.max_rounds() if tools else tools_mod.MAX_TOOL_ROUNDS
     options: Dict[str, Any] = {
         **REASONING_OPTIONS,
         "temperature": TEMPERATURES[role],
@@ -3982,16 +3995,23 @@ def reason(
         return [{**m, **traces[i]} if i in traces else m
                 for i, m in enumerate(messages)]
 
-    def _fold(why: str) -> None:
-        nonlocal native, folded, probing, measured
+    def _task_without_tools(then: str) -> str:
+        """The task as a request that offers no tools re-sends it: without
+        the tools' hints, with the results of the calls made so far, and —
+        when tools were offered in this call — a line saying they are
+        closed, ending with `then`."""
         task = user_prompt
         if tool_notes:
-            task += (
-                "\n\n---\nResults of the tool calls you made:\n\n"
-                + "\n\n".join(tool_notes)
-                + "\n\n---\nThe tools are closed now: give your answer, in "
-                "the format asked for."
-            )
+            task += ("\n\n---\nResults of the tool calls you made:\n\n"
+                     + "\n\n".join(tool_notes))
+        if offered:
+            task += f"\n\n---\nThe tools are closed now: {then}"
+        return task
+
+    def _fold(why: str) -> None:
+        nonlocal native, folded, probing, measured
+        task = _task_without_tools(
+            "give your answer, in the format asked for.")
         messages[:] = [
             {"role": "system", "content": base_system},
             {"role": "user", "content": task},
@@ -4032,7 +4052,7 @@ def reason(
     answered = False
     while attempt < LLM_MAX_RETRIES:
         offer = (bool(tools) and not folded
-                 and rounds < tools_mod.MAX_TOOL_ROUNDS)
+                 and rounds < max_rounds)
         outgoing = _outgoing() if native else messages
         # As much room as the window has left, recomputed for this prompt:
         # the prompt differs every iteration and every role — and grows
@@ -4045,7 +4065,7 @@ def reason(
             # wants a lookup writes the call anyway, a server (vLLM) drops
             # it, and the reply comes back empty. One plain message with
             # the results written in declares no tools at all.
-            _fold(f"has used its {tools_mod.MAX_TOOL_ROUNDS} rounds of "
+            _fold(f"has used its {max_rounds} rounds of "
                   f"lookups")
             continue
         if native and _no_lookup_room(room):
@@ -4176,7 +4196,7 @@ def reason(
                     # The room line and the last-call test both read the
                     # prompt with this result in it.
                     line = _room_line()
-                    last = (rounds >= tools_mod.MAX_TOOL_ROUNDS
+                    last = (rounds >= max_rounds
                             or _spare() - _RESULT_FRAME_TOKENS
                             < _MIN_RESULT_TOKENS)
                     messages[-1]["content"] = (
@@ -4217,12 +4237,8 @@ def reason(
             # in the task.
             partial: Optional[Dict[str, str]] = None
             if COMPACT_ENABLED and (thinking.strip() or content.strip()):
-                task = user_prompt
-                if tool_notes:
-                    task += (
-                        "\n\n---\nResults of the tool calls you made:\n\n"
-                        + "\n\n".join(tool_notes)
-                    )
+                task = _task_without_tools(
+                    "make no more tool calls, and finish with what you have.")
                 resumed, partial = _resume_compacted(
                     role, base_system, task, thinking, content, verbose,
                 )
@@ -4439,15 +4455,21 @@ def _tiebreak(pair: Tuple[str, str]) -> bytes:
     ).digest()
 
 
-# What an agent is told about the index, beside it in the view.
-_INDEX_NOTE = (
-    "proved_lemmas lists the most recently proved lemmas in full. "
-    "common_lemmas lists, statement only, older lemmas those cite often. "
-    "other_proved_lemmas lists every other proved lemma by user_id "
-    "(the key) and lemma_id, statement omitted; they are proved lemmas "
-    "all the same. Call lookup_lemmas to read the statement of any of them "
-    "before relying on it."
-)
+def _index_note(common: List[Tuple[str, str]],
+                index: Dict[str, List[str]]) -> str:
+    """What an agent is told about the lemma window, beside it in the view:
+    one sentence per list the view holds. It names no tool — a tool's own
+    hint does that, and only while the tool is offered (tools.py)."""
+    parts = ["proved_lemmas gives the statements of the most recently "
+             "proved lemmas."]
+    if common:
+        parts.append("common_lemmas gives the statements of older lemmas "
+                     "that those cite most often.")
+    if index:
+        parts.append("other_proved_lemmas lists every other proved lemma "
+                     "without its statement, as {user_id: [lemma_id, ...]}; "
+                     "they are proved lemmas all the same and may be cited.")
+    return " ".join(parts)
 
 
 def planner_dag_view(
@@ -4502,7 +4524,7 @@ def planner_dag_view(
     if index:
         view["other_proved_lemmas"] = index
     if common or index:
-        view["note"] = _INDEX_NOTE
+        view["note"] = _index_note(common, index)
     return view
 
 
@@ -4561,7 +4583,7 @@ def prover_context(
     if index:
         view["other_proved_lemmas"] = index
     if common or index:
-        view["note"] = _INDEX_NOTE
+        view["note"] = _index_note(common, index)
     return view
 
 
@@ -4638,8 +4660,10 @@ def _fit_prompt(
     def estimate(user_prompt: str, tools: Optional["tools_mod.ToolSet"]) -> int:
         extra = ""
         if tools:
+            # What reason() adds while it offers the tools: the specs or the
+            # protocol, and the hints on the task.
             extra = (json.dumps(tools.specs()) if _native_tools()
-                     else tools.json_protocol())
+                     else tools.json_protocol()) + tools.prompt_hints()
         return _estimate_tokens([
             {"content": system_prompt}, {"content": user_prompt},
             {"content": extra},
