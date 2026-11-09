@@ -11,6 +11,9 @@
     proofs status PATH lemma_id       list the valid certificates in a lemma's closure
     proofs export PATH [lemma_id] -o OUT_DIR
                                     write a LaTeX document of the DAG
+    proofs limits DIR                 show the code limits in effect, and their sources
+    proofs tools lock DIR             write DIR's tools.lock from its flake (maintainer)
+    proofs tools check DIR            check DIR's declared tools and the sandbox
 
 A workspace is the directory proofs init marks with a .proofs file, found
 by walking up from the current directory (workspace.find_root); main()
@@ -95,15 +98,17 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:  # inside the proofs package: installed, or `python -m proofs`
-    from . import config
+    from . import codetools, config
+    from . import limits as limits_mod
     from . import main as main_mod
     from . import parsing as parsing_mod
-    from . import workspace
+    from . import sandbox, workspace
 except ImportError:  # top-level modules: `python proofs/cli.py`
-    import config
+    import codetools, config
+    import limits as limits_mod
     import main as main_mod
     import parsing as parsing_mod
-    import workspace
+    import sandbox, workspace
 
 # Argument errors exit 2, argparse's convention; a command's own exit
 # code is what its entry returns (0 accepted, 1 rejected, and so on).
@@ -276,6 +281,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=_cmd_run, parser=p)
 
     p = sub.add_parser(
+        "limits",
+        help="Show the code limits in effect for DIR on this machine.",
+        description=(
+            "Show each code limit (code.timeout, code.memory, code.jobs, "
+            "...) in effect for runs on DIR, and where it comes from: "
+            "conjectures/NAME/limits.json, the workspace's "
+            ".proofs-local.json, or the built-in default. Both files are "
+            "gitignored JSON objects holding only the keys they override; "
+            "--code-* flags override both for one run."
+        ),
+    )
+    p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
+    p.set_defaults(func=_cmd_limits, parser=p)
+
+    p = sub.add_parser(
+        "tools",
+        help="Write or check DIR's tools.lock.",
+        description=(
+            "lock: write DIR's tools.lock from the proofsTools output of "
+            "its flake.nix, by nix eval (the conjecture maintainer runs "
+            "this, and commits both). check: report whether every tool "
+            "tools.lock declares is on PATH at its version, and whether "
+            "the sandbox can start here."
+        ),
+    )
+    p.add_argument("action", choices=("lock", "check"))
+    p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
+    p.set_defaults(func=_cmd_tools, parser=p)
+
+    p = sub.add_parser(
         "verify",
         help="Verify one lemma of a user's DAG file.",
         description=(
@@ -292,6 +327,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also verify everything the lemma cites, cited lemmas first.",
     )
     _add_backend_flags(p, help_for="the verification")
+    p.add_argument(
+        "--run-code",
+        action="store_true",
+        help=(
+            "Re-execute the scripts each lemma's proof rests on, in the "
+            "sandbox, after showing them and asking you to confirm: a "
+            "result that differs from the recorded one writes a refutation. "
+            "Needs --tools. Read other people's code before you run it."
+        ),
+    )
+    main_mod.add_code_flags(p)
     p.set_defaults(func=_cmd_verify, parser=p)
 
     p = sub.add_parser(
@@ -312,6 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_backend_flags(p, help_for="the re-verification")
     main_mod.add_lemma_window_flags(p)
     main_mod.add_tool_flags(p)
+    main_mod.add_code_flags(p)
     p.set_defaults(func=_cmd_repair, parser=p)
 
     p = sub.add_parser(
@@ -586,12 +633,18 @@ def _cmd_verify(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
             f"user's DAG file (conjectures/NAME/dags/<user_id>_dag.json), "
             f"whose name supplies the lemma's user_id"
         )
+    if args.run_code and args.tools is None:
+        parser.error("--run-code runs the lemma's scripts, so it needs --tools")
+    # --tools: check the tools and re-launch inside the sandbox (main.py).
+    main_mod.setup_code(args, parser, args.workspace_root,
+                        conjecture=str(p.parent.parent))
     rc = main_mod.verify_entry(
         path=args.path,
         lemma_id=args.lemma_id,
         owner=m.group("user_id"),
         root=str(p.parent.parent),
         full=args.full,
+        run_code=args.run_code,
         user_id=args.user_id,
         model=args.model,
         host=args.host,
@@ -630,6 +683,10 @@ def _cmd_repair(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
                 f"{args.path} has no usable {field!r}; a refutation names "
                 f"the lemma by its user_id and lemma_id"
             )
+    # --tools: the re-proving prover and reviser may run code, and the
+    # whole repair runs inside the sandbox (main.py).
+    main_mod.setup_code(args, parser, args.workspace_root,
+                        conjecture=str(p.parent.parent))
     rc = main_mod.repair_entry(
         lemmas_all=args.lemmas_all,
         my_lemmas=args.my_lemmas,
@@ -664,6 +721,60 @@ def _cmd_prune(args: argparse.Namespace, parser: argparse.ArgumentParser) -> Non
         parser=parser,
     )
     sys.exit(rc)
+
+
+def _cmd_limits(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    root = _require_conjecture_dir(
+        args.dir, args.user_id, args.workspace_root, parser
+    )
+    try:
+        lim = limits_mod.resolve(workspace.find_root(root), root)
+    except limits_mod.LimitsError as e:
+        parser.error(str(e))
+    print(lim.describe())
+    errors, warnings = limits_mod.check(lim)
+    for w in warnings:
+        print(f"warning: {w}")
+    for e in errors:
+        print(f"error: {e}")
+    sys.exit(1 if errors else 0)
+
+
+def _cmd_tools(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    root = _require_conjecture_dir(
+        args.dir, args.user_id, args.workspace_root, parser
+    )
+    if args.action == "lock":
+        try:
+            written = codetools.write_lock(root)
+        except codetools.ToolError as e:
+            parser.error(str(e))
+        print(f"wrote {written}; commit it with the flake")
+        sys.exit(0)
+    ok = True
+    try:
+        lock = codetools.load_lock(root)
+        names = codetools.requested("all", lock, root)
+    except codetools.ToolError as e:
+        parser.error(str(e))
+    for name in names:
+        try:
+            f = codetools.find(name, lock, root)
+            print(f"ok    {name} {f.version}  ({f.path})")
+        except codetools.ToolError as e:
+            ok = False
+            print(f"FAIL  {name}: {e}")
+    try:
+        b = sandbox.check()
+        print(f"ok    sandbox: {b.name} ({b.exe})"
+              + ("" if b.outer else "; scripts only — proofs itself is not confined here"))
+    except sandbox.SandboxError as e:
+        ok = False
+        print(f"FAIL  sandbox: {e}")
+    scope = sandbox.systemd_scope()
+    print(f"{'ok  ' if scope else 'note'}  memory backstop: "
+          f"{'systemd-run user scope' if scope else 'none (watchdog only)'}")
+    sys.exit(0 if ok else 1)
 
 
 def _cmd_status(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:

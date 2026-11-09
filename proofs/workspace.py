@@ -8,6 +8,7 @@ directory to the first one with the marker (find_root()), the way git finds
 Layout:
 
     .proofs                        <- the marker: "format = 1"
+    .proofs-local.json             <- optional, gitignored: this machine's code limits (limits.py)
     .gitignore                     <- holds the proofs block (GITIGNORE_RULES)
     conjectures/
       algebra_example/
@@ -20,6 +21,12 @@ Layout:
         references.md              <- committed: strict-JSON refs, proofs parse's output
         comments.md                <- optional, gitignored: this user's notes, passed to the planner
         prover.md                  <- optional per-conjecture prompt override
+        flake.nix, flake.lock      <- optional, committed: the maintainer's code tools
+        tools.lock                 <- committed with them: the tools runs may use (codetools.py)
+        limits.json                <- optional, gitignored: this machine's limits here (limits.py)
+        scratch/<user_id>/         <- gitignored: every code execution's script and log
+        code/<user_id>/            <- committed: the scripts cited proofs rest on (computations.py)
+        runs/<user_id>.jsonl       <- committed: that user's executions of them
       some_other_problem/
         conjecture.md
 
@@ -99,6 +106,9 @@ REFERENCES_FILENAME = "references.md"
 # and never committed or shared: each user keeps their own copy in their
 # own clone (see the README's "Comments" section).
 COMMENTS_FILENAME = "comments.md"
+# Every code execution of a run with --tools (execution.py): one directory
+# per run under scratch/<user_id>/, local to the machine and never committed.
+SCRATCH_DIRNAME = "scratch"
 AGENTS_DIR = "agents"
 # Every prompt the loop can load, and therefore every per-conjecture override
 # that is meaningful. parsing.md is the standalone parser's (parsing.py's).
@@ -116,7 +126,9 @@ PROMPT_FILES: Dict[str, str] = {
     "verifier_1.md": "verifier_1.md",
     "verifier_2.md": "verifier_2.md",
     "verifier_3.md": "verifier_3.md",
+    "coding_verifier.md": "coding_verifier.md",
     "reviser.md": "reviser.md",
+    "coding.md": "coding.md",
     "parsing.md": "parsing.md",
     "parallel_planner.md": "parallel/parallel_planner.md",
     "parallel_lemma_generator.md": "parallel/parallel_lemma_generator.md",
@@ -171,6 +183,14 @@ conjectures/*/dags/*.tmp
 conjectures/*/certificates/*.tmp
 conjectures/*/refutations/.*.tmp
 conjectures/*/references.md.*.tmp
+# Code tools (codetools.py, execution.py): every execution's script and
+# log, and the per-machine limits — the machine's, never the conjecture's.
+conjectures/*/scratch/
+conjectures/*/limits.json
+.proofs-local.json
+conjectures/*/runs/*.lock
+conjectures/*/runs/*.tmp
+conjectures/*/code/*/*.tmp
 # Never commit API keys (README "Backend": --api-key).
 .env
 .env.*

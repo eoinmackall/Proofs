@@ -213,6 +213,7 @@ import os
 import random
 import re
 import signal
+import string
 import sys
 import threading
 import time
@@ -224,13 +225,19 @@ import requests
 
 try:  # inside the proofs package (installed, or `python -m proofs`)
     from . import (
-        certificates, config, export, interaction, llm_backend, locking,
-        merkle, refutations, resolution, suspension, workspace,
+        certificates, codetools, computations, config, execution, export,
+        interaction,
+        llm_backend, locking, merkle, refutations, resolution, sandbox,
+        suspension, workspace,
     )
+    from . import limits as limits_mod
     from . import tools as tools_mod
 except ImportError:  # top-level modules (`python proofs/main.py`)
-    import certificates, config, export, interaction, llm_backend, locking
-    import merkle, refutations, resolution, suspension, workspace
+    import certificates, codetools, computations, config, execution, export
+    import interaction
+    import llm_backend, locking, merkle, refutations, resolution, sandbox
+    import suspension, workspace
+    import limits as limits_mod
     import tools as tools_mod
 
 # ----------------------------------------------------------------------------
@@ -371,14 +378,233 @@ def _disable_native_tools(why: str, verbose: bool) -> None:
 def agent_tools(
     dag: Dict[str, Any],
     suspended: Optional[Set[Tuple[str, str]]] = None,
+    code: Optional[str] = None,
 ) -> Optional["tools_mod.ToolSet"]:
     """The tools an agent shown the lemma window is offered: lookup_lemmas,
-    over the same lemmas the window chose from — or None when the window
-    shows every proved lemma, so a small DAG's prompts carry no tools."""
+    over the same lemmas the window chose from, when the window leaves
+    some out; and, when code names the agent's role ("prover",
+    "reviser") and the run was given --tools, run_code with that role's
+    hint. None when that leaves nothing, so a small DAG's prompts carry no
+    tools."""
     _shown, _common, index = lemma_window(dag, suspended)
-    if not index:
+    offered = []
+    if index:
+        offered.append(tools_mod.lemma_lookup(dag["lemmas"], suspended))
+    if code is not None and code in CODE_TOOLS and _CODE_LOOP.get():
+        offered.append(CODE_TOOLS[code])
+    return tools_mod.ToolSet(offered) if offered else None
+
+
+def verifier_tools() -> Optional["tools_mod.ToolSet"]:
+    """What a verifier is offered: run_code, under the verifier's hint (a
+    computation may justify a rejection, never an acceptance), when the
+    run was given --tools; else nothing."""
+    tool = CODE_TOOLS.get("verifier")
+    if tool is None or not _CODE_LOOP.get():
         return None
-    return tools_mod.ToolSet([tools_mod.lemma_lookup(dag["lemmas"], suspended)])
+    return tools_mod.ToolSet([tool])
+
+
+# Set once by setup_code() when the run was given --tools, empty otherwise:
+# the runner every run_code call goes through, the run_code tool for each
+# role that is offered it ("prover", "reviser", "verifier"; one tool, a
+# hint per role, from the sections of agents/coding.md), and the note the
+# prover's task carries on how to cite a computation in its answer. The
+# note is in the task rather than the tool's hint because the hint goes
+# when the tools close, and the answer is written after.
+CODE_RUNNER: Optional["execution.Runner"] = None
+CODE_TOOLS: Dict[str, "tools_mod.Tool"] = {}
+# How many proof loops may run code: the machine-wide job slots this
+# process holds (execution.acquire_slots) — 1 for a serial run, verify or
+# repair; up to --parallel N in a parallel run, the first CODE_LOOPS loops.
+# _CODE_LOOP is whether the current thread's loop is one of them: a loop
+# that is not is offered no run_code, its verifiers included.
+CODE_LOOPS = 0
+_CODE_LOOP: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "code_loop", default=True
+)
+CODE_ANSWER_NOTE = ""
+CODING_VERIFIER = "coding_verifier.md"
+# proofs verify --run-code: re-execute a lemma's scripts (_reexecute) before
+# the verifiers read it. Set by verify_entry; never by a run.
+RUN_CODE = False
+
+
+def add_code_flags(parser: argparse.ArgumentParser) -> None:
+    """--tools and the --code-* limits (limits.py), for the commands whose
+    agents may run code."""
+    parser.add_argument(
+        "--tools", default=None, metavar="LIST",
+        help=(
+            "Let the prover and the reviser run code: a comma-separated "
+            "list of tools from the conjecture's tools.lock (sage, python), "
+            "or all. Each must be on PATH at the declared version. The "
+            "whole run is then sandboxed (Linux, bubblewrap)."
+        ),
+    )
+    for key in limits_mod.KEYS:
+        name = key.split(".", 1)[1].replace("_", "-")
+        parser.add_argument(
+            f"--code-{name}", dest=f"code_{key.split('.', 1)[1]}",
+            default=None, metavar="N",
+            help=f"Override {key} for this run (default "
+                 f"{limits_mod.DEFAULTS[key]}; see `proofs limits`).",
+        )
+    parser.add_argument(
+        "--code-overcommit", action="store_true",
+        help="Run even when code.jobs x code.memory + code.reserve_memory "
+             "exceeds this machine's memory.",
+    )
+    parser.add_argument(
+        "--unsandboxed-code", action="store_true",
+        help="Run code without the sandbox: only where bubblewrap is "
+             "unavailable, and only for code you would run yourself.",
+    )
+
+
+def _prompt_sections(text: str) -> Tuple[str, Dict[str, str]]:
+    """(the text before the first "## name" heading, {name: section}) —
+    how agents/coding.md holds one shared contract and the parts for each
+    role."""
+    shared: List[str] = []
+    sections: Dict[str, List[str]] = {}
+    current: Optional[List[str]] = None
+    for line in text.splitlines():
+        m = re.match(r"##\s+(\w+)\s*$", line)
+        if m:
+            current = sections.setdefault(m.group(1).lower(), [])
+        elif current is None:
+            shared.append(line)
+        else:
+            current.append(line)
+    return ("\n".join(shared).strip(),
+            {k: "\n".join(v).strip() for k, v in sections.items()})
+
+
+def code_limit_flags(args: argparse.Namespace) -> Dict[str, Any]:
+    """The --code-* limit flags as limits.resolve() takes them."""
+    return {key: getattr(args, f"code_{key.split('.', 1)[1]}", None)
+            for key in limits_mod.KEYS}
+
+
+def setup_code(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    root: Optional[Path],
+    conjecture: Optional[str] = None,
+) -> None:
+    """For a run given --tools: check the tools and the limits, relaunch
+    the whole command inside the sandbox (sandbox.relaunch, which does not
+    return) unless this is already the relaunched process, and set
+    CODE_RUNNER, CODE_TOOLS and CODE_ANSWER_NOTE. Every problem is a usage
+    error, reported before anything runs. proofs run calls it, and so do
+    proofs verify and proofs repair (cli.py), with conjecture naming the
+    directory their DAG or refutation file belongs to."""
+    global CODE_RUNNER, CODE_ANSWER_NOTE, CODE_LOOPS
+    if sandbox.inside():
+        # The launcher ignored SIGINT so bwrap would survive a Ctrl-C (see
+        # sandbox.py); an ignored signal stays ignored across exec, so put
+        # back the default for the stretch before main() installs its own.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    if args.tools is None:
+        return
+    parallel = getattr(args, "parallel", None)
+    try:
+        user = config.ensure_user_id()
+        paths = workspace.resolve(conjecture or args.conjecture, user, root)
+        lock = codetools.load_lock(paths.root)
+        names = codetools.requested(args.tools, lock, paths.root)
+        found = {n: codetools.find(n, lock, paths.root) for n in names}
+        workspace_root = workspace.find_root(paths.root) or paths.root
+        lim = limits_mod.resolve(workspace_root, paths.root,
+                                 code_limit_flags(args))
+    except (config.UserConfigError, workspace.ConjectureNotFound,
+            codetools.ToolError, limits_mod.LimitsError) as e:
+        parser.error(str(e))
+        return
+    errors, warnings = limits_mod.check(lim, overcommit=args.code_overcommit)
+    if errors:
+        parser.error("\n".join(errors))
+    backend: Optional["sandbox.Backend"] = None
+    if not args.unsandboxed_code:
+        try:
+            outer = sandbox.check().outer
+        except sandbox.SandboxError as e:
+            parser.error(str(e))
+        if outer and not sandbox.inside():
+            for w in warnings:
+                print(f"warning: {w}", file=sys.stderr)
+            try:
+                sandbox.relaunch(
+                    workspace_root,
+                    [config.config_path().parent, *(f.prefix for f in found.values())],
+                    limits_mod.total_memory(lim),
+                    limits_mod.total_tasks(lim),
+                    writable=[execution.slot_dir()],
+                )
+            except sandbox.SandboxError as e:
+                parser.error(str(e))
+        try:
+            backend = sandbox.check()
+        except sandbox.SandboxError as e:
+            parser.error(f"inside the sandbox: {e}")
+        if not outer:
+            for w in warnings:
+                print(f"warning: {w}", file=sys.stderr)
+            print(f"note: {backend.name} confines each script; proofs itself "
+                  f"runs unconfined here (a sandbox cannot be nested)",
+                  file=sys.stderr)
+    else:
+        for w in warnings:
+            print(f"warning: {w}", file=sys.stderr)
+        print("warning: --unsandboxed-code: scripts the agents write run "
+              "with your permissions, network and files", file=sys.stderr)
+    # The machine-wide job slots: one per loop that may run code, at most
+    # code.jobs across every proofs process on this machine. A serial run
+    # (or verify, or repair) needs its one; a parallel run takes what it
+    # can, and its other loops run without code.
+    wanted = max(1, parallel) if parallel is not None else 1
+    try:
+        CODE_LOOPS = execution.acquire_slots(lim.jobs, wanted)
+    except OSError as e:
+        parser.error(f"could not take a code job slot in {execution.slot_dir()}: {e}")
+    if CODE_LOOPS == 0:
+        busy = (f"all code.jobs = {lim.jobs} code slot(s) on this machine are "
+                f"held by other proofs commands")
+        if parallel is None:
+            parser.error(busy + "; wait for one to finish, or raise code.jobs")
+        print(f"warning: {busy}: every loop runs without code", file=sys.stderr)
+    runner = execution.Runner(
+        found, lim, lock.policy,
+        paths.root / workspace.SCRATCH_DIRNAME / user, user, backend,
+    )
+    text = string.Template(load_file(str(paths.prompts["coding.md"]))).safe_substitute(
+        languages=", ".join(runner.languages),
+        timeout=lim.timeout,
+        memory=limits_mod.format_size(lim.memory),
+        threads=lim.threads,
+        result_bytes=lock.policy["result_bytes"],
+    )
+    shared, sections = _prompt_sections(text)
+    CODE_RUNNER = runner
+    for role in ("prover", "reviser", "verifier"):
+        hint = shared + ("\n\n" + sections[role] if sections.get(role) else "")
+        CODE_TOOLS[role] = tools_mod.run_code(
+            runner, hint,
+            on_harness_error=lambda m: log(f"run_code: {m}", True),
+        )
+    CODE_ANSWER_NOTE = sections.get("answer", "")
+    tools_desc = ", ".join(f"{f.spec.name} {f.version}" for f in found.values())
+    if parallel is not None:
+        tools_desc += (f"; {CODE_LOOPS} of {max(1, parallel)} loop(s) may "
+                       f"run code")
+    print(
+        f"code tools: {tools_desc} "
+        f"({'sandboxed: ' + backend.name if backend else 'UNSANDBOXED'}; {lim.timeout} s, "
+        f"{limits_mod.format_size(lim.memory)}, {lim.threads} thread(s) "
+        f"per run; scripts under {runner.scratch_dir})",
+        file=sys.stderr,
+    )
 
 
 def add_tool_flags(parser: argparse.ArgumentParser) -> None:
@@ -525,6 +751,8 @@ TEMPERATURES = {
     "verifier_2": 0.8,
     "verifier_3": 0.8,   # Looser, so the three independent checks don't
                         # collapse into one review of the first pass.
+    "coding_verifier": 0.8,   # The fourth check, for proofs with code:
+                              # sampled like the other three.
     "reviser": 0.7,    # Diagnosing a failure is planning-scale judgement.
     "parser": 0.3,     # Extracting from a fixed source, not exploring.
     "parallel_planner": 0.3,          # Steering a run, not exploring one.
@@ -638,6 +866,9 @@ _LEMMA_SCHEMA: Dict[str, Any] = {
     "properties": {
         "id": {"type": "string"},
         "statement": {"type": "string"},
+        # Parallel runs with --tools: the lemma needs a computation, so only
+        # a loop that may run code takes it (LemmaBuffer).
+        "computation": {"type": "boolean"},
     },
     "required": ["id", "statement"],
 }
@@ -1270,17 +1501,40 @@ def _stored_node(node: Dict[str, Any], last_prover_id: str) -> Dict[str, Any]:
     cited_references as bare ids. proved_at is the moment of this write,
     the lemma window's recency. Neither last_prover_id nor proved_at is in
     the Merkle hash, which covers only the statement, the proof and the
-    cited statements."""
-    return {
+    cited statements.
+
+    A proof that rests on computations also stores code, the list of
+    {"hash", "lang", "produced_output"} entries (computations.py), which
+    the hash does cover; a proof with none stores no code field at all."""
+    stored = {
         "statement": node["statement"],
         "proof": node["proof"],
         "cited_lemmas": [
             _dep_to_json(dep) for dep in node.get("cited_lemmas", [])
         ],
         "cited_references": list(node.get("cited_references", [])),
-        "last_prover_id": last_prover_id,
-        "proved_at": certificates.now_iso(),
     }
+    code = computations.entries(node)
+    if code:
+        stored["code"] = [
+            {"hash": e["hash"], "lang": e["lang"],
+             "produced_output": e.get("produced_output")}
+            for e in code
+        ]
+    stored["last_prover_id"] = last_prover_id
+    stored["proved_at"] = certificates.now_iso()
+    return stored
+
+
+def _store_computations(node: Dict[str, Any]) -> None:
+    """Copy the scripts a node cites into code/<user>/ and record their runs
+    (computations.store): the first step of a commit, before the
+    certificate and the lemma, so the lemma is never in a file without its
+    scripts. A node with no computations, or with scripts already
+    committed (a re-verification), has nothing to copy."""
+    sources = node.get("_code_sources") or {}
+    if computations.entries(node) and sources:
+        computations.store(Path(CONJECTURE_ROOT), USER, node, sources)
 
 
 def commit_lemma_to_dag(
@@ -1324,6 +1578,7 @@ def commit_lemma_to_dag(
             while f"{lemma_id}_{suffix}" in lemmas:
                 suffix += 1
             committed_id = f"{lemma_id}_{suffix}"
+        _store_computations(node)
         _certify_before_write(
             USER, committed_id, node, verified_hash, verbose,
         )
@@ -1617,6 +1872,7 @@ def _replace_lemma_in_owner_file(
         lemmas = data.get("lemmas")
         if not isinstance(lemmas, dict) or lemma_id not in lemmas:
             raise KeyError(f"{owner}:{lemma_id} is not in {path}")
+        _store_computations(node)
         _certify_before_write(owner, lemma_id, node, verified_hash, verbose)
         # A re-proof is a fresh proof: its proved_at moves it to the front
         # of the lemma window, as a new commit does.
@@ -1646,6 +1902,92 @@ def _verifier_prompts(parser: argparse.ArgumentParser) -> Dict[str, str]:
     if missing:
         parser.error(f"no prompt text for: {', '.join(missing)}")
     return verifier_sys
+
+
+# Limit kills (a timeout, the memory cap) say nothing about a script's
+# claim, only about this machine: such a re-execution is inconclusive.
+def _reexecute(
+    user_id: str, lemma_id: str, node: Dict[str, Any], verbose: bool,
+) -> Tuple[str, str, str]:
+    """proofs verify --run-code: run the lemma's scripts again and compare.
+
+    Every script is shown in full and the operator asked to confirm before
+    anything runs — the scripts are other people's code, and the sandbox
+    is a second line, not the first. Returns (outcome, message, tool):
+    outcome is "skip" (nothing to run, or --run-code not given), "match"
+    (every script exited 0 with the RESULT the lemma records; each
+    execution is added to runs/), "mismatch" (one did not: message says
+    how, and is the refutation's justification) or "inconclusive" (the
+    operator declined, a script is missing or needs a tool this run does
+    not have, or a run hit this machine's limits: nothing is recorded
+    either way). tool names the tool of a mismatching run."""
+    code = computations.entries(node)
+    if not RUN_CODE or not code:
+        return "skip", "", ""
+    root = Path(CONJECTURE_ROOT)
+    scripts = []
+    for e in code:
+        text = computations.load_script(root, e)
+        if text is None:
+            return ("inconclusive",
+                    f"script {computations.short(e)} has no intact copy on "
+                    f"disk, so it cannot be re-run", "")
+        if e["lang"] not in CODE_RUNNER.tools:
+            return ("inconclusive",
+                    f"script {computations.short(e)} is {e['lang']}, and this "
+                    f"verification was not given that tool (--tools)", "")
+        scripts.append((e, text))
+    print(f"\n{lemma_id} rests on {len(scripts)} computation(s). Read them "
+          f"before running them:")
+    for e, text in scripts:
+        print(f"\n----- [code:{computations.short(e)}] {e['lang']}, "
+              f"recorded RESULT: {json.dumps(e.get('produced_output'), sort_keys=True)}")
+        print(text.rstrip("\n"))
+        print("-----")
+    if not sys.stdin.isatty():
+        return ("inconclusive",
+                "--run-code asks before running anything, and there is no "
+                "terminal to ask on", "")
+    try:
+        answer = input(f"Run these {len(scripts)} script(s) in the sandbox? [y/N] ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in ("y", "yes"):
+        return "inconclusive", "the operator declined to run the scripts", ""
+    for e, text in scripts:
+        sid = computations.short(e)
+        try:
+            res = CODE_RUNNER.run(e["lang"], text)
+        except execution.HarnessError as ex:
+            return "inconclusive", f"script {sid}: {ex}", ""
+        found = CODE_RUNNER.tools[e["lang"]]
+        tool = f"{found.spec.name} {found.version}"
+        log(f"  [code:{sid}] re-run with {tool}: {res.status}"
+            + (f" — {res.failure}" if res.failure else
+               f", RESULT {json.dumps(res.result, sort_keys=True)}"),
+            verbose)
+        if res.limit_killed:
+            return ("inconclusive",
+                    f"script {sid} hit this machine's limits ({res.failure}); "
+                    f"raise them (proofs limits) and re-run", "")
+        recorded = e.get("produced_output")
+        if res.status == "ok" and computations.result_hash(res.result) == \
+                computations.result_hash(recorded):
+            computations.record_run(root, USER, res.log)
+            continue
+        if res.status == "ok":
+            how = (f"it printed RESULT {json.dumps(res.result, sort_keys=True)}, "
+                   f"but the lemma records "
+                   f"{json.dumps(recorded, sort_keys=True)}")
+        else:
+            how = res.failure
+            if res.stderr_tail:
+                how += "\nstderr (tail):\n" + res.stderr_tail
+        return ("mismatch",
+                f"Re-execution of script [code:{sid}] with {tool} "
+                f"({found.path}) does not reproduce the computation the proof "
+                f"rests on: {how}. Scratch run: {res.run_id}.", tool)
+    return "match", "", ""
 
 
 def verify_stored_lemma(
@@ -1702,6 +2044,14 @@ def verify_stored_lemma(
 
     on_file = refutations.for_lemma(CONJECTURE_ROOT, user_id, lemma_id)
     stale = 0
+    # A counting refutation from a re-execution (model exec:<tool>) says a
+    # script did not reproduce; only a re-execution that does can answer
+    # it, so the verifiers' reading alone may not dismiss it.
+    exec_counting = [
+        path for path, ref in on_file
+        if refutations.is_counting(ref, h)
+        and str(ref.get("model") or "").startswith("exec:")
+    ]
     for path, ref in on_file:
         if refutations.is_counting(ref, h):
             log(
@@ -1717,6 +2067,41 @@ def verify_stored_lemma(
             f"justifications go to the verifiers.",
             verbose,
         )
+
+    # --run-code: the computations first. A script that no longer gives
+    # what the lemma records is a rejection on its own, before any
+    # verifier reads the proof; an inconclusive re-run leaves the reading
+    # verification to decide.
+    if exec_counting and not RUN_CODE:
+        why = (
+            f"{lemma_id} has a refutation from a re-execution of its scripts "
+            f"({exec_counting[0].name}); only a re-execution that reproduces "
+            f"them can answer it. Verify with --tools and --run-code."
+        )
+        log(why, verbose)
+        return "no_verdict", why
+    outcome, message, tool = _reexecute(user_id, lemma_id, node, verbose)
+    if exec_counting and outcome != "match" and outcome != "mismatch":
+        why = (
+            f"{lemma_id} has a refutation from a re-execution of its "
+            f"scripts, and this re-execution was inconclusive ({message}); "
+            f"nothing is written."
+        )
+        log(why, verbose)
+        return "no_verdict", why
+    if outcome == "mismatch":
+        path = refutations.record(
+            CONJECTURE_ROOT, user_id, lemma_id, h, USER, f"exec:{tool}",
+            "reject", message,
+        )
+        log(f"{message}\nRefutation for {lemma_id} written: {path}", verbose)
+        return "rejected", message
+    if outcome == "inconclusive":
+        log(f"  Re-execution inconclusive: {message}. Nothing is recorded "
+            f"for it; the verifiers read the proof as usual.", verbose)
+    elif outcome == "match":
+        log(f"  Every computation of {lemma_id} reproduced; recorded in "
+            f"runs/{USER}.jsonl.", verbose)
 
     cited_lemmas = [c for c in node.get("cited_lemmas", []) if isinstance(c, tuple)]
     cited_references = [str(r) for r in node.get("cited_references", [])]
@@ -1756,12 +2141,16 @@ def verify_stored_lemma(
         "Target lemma:\n"
         f"{json.dumps({'user_id': user_id, 'lemma_id': lemma_id, 'statement': statement}, indent=2)}\n\n"
         f"Proposed proof:\n{proof}"
+        + computations_block(node)
     )
-    for step, agent in enumerate(VERIFIER_AGENTS, 1):
+    steps = verifier_steps(node)
+    for step, agent in enumerate(steps, 1):
         role = agent[:-3]
-        decision, justification = _run_verifier(role, verifier_sys[agent], verifier_user, verbose)
+        decision, justification = _run_verifier(
+            role, verifier_prompt(verifier_sys, agent), verifier_user, verbose,
+        )
         log(
-            f"Verifier {step}/{len(VERIFIER_AGENTS)} ({role}): "
+            f"Verifier {step}/{len(steps)} ({role}): "
             f"{decision.upper() or '???'} — {justification}",
             verbose,
         )
@@ -1810,7 +2199,7 @@ def verify_stored_lemma(
         except OSError as e:
             log(f"Could not delete the refutation {path}: {e}", verbose)
     log(
-        f"Lemma {lemma_id} passed all {len(VERIFIER_AGENTS)} verifier checks.",
+        f"Lemma {lemma_id} passed all {len(steps)} verifier checks.",
         verbose,
     )
     return "accepted", None
@@ -1894,6 +2283,7 @@ def verify_entry(
     num_ctx: Optional[int],
     verbose: bool,
     parser: argparse.ArgumentParser,
+    run_code: bool = False,
 ) -> int:
     """proofs verify PATH lemma_id [--full]: the three verifier checks on
     the stored proof of a lemma that is already in the DAG, with the
@@ -1911,7 +2301,12 @@ def verify_entry(
     lemma verified was accepted, 1 when one was rejected (its refutation
     written), EXIT_NO_VERDICT when a verifier gave no verdict (nothing
     written; re-run once the server answers).
+
+    run_code (--run-code, which needs --tools) re-executes each lemma's
+    scripts before its verifiers read it (_reexecute), asking first.
     """
+    global RUN_CODE
+    RUN_CODE = run_code
     _verify_session(
         conjecture_dir=root, user_id=user_id, model=model, host=host,
         api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
@@ -2046,7 +2441,18 @@ def repair_entry(
     if p.parent.name != refutations.DIR_NAME:
         parser.error(f"{path} is not in a {refutations.DIR_NAME}/ directory")
     root = p.parent.parent
-    global LEMMAS_ALL, MY_LEMMAS, TOOL_MODE, LEMMAS_COMMON
+    # A refutation written by a re-execution (proofs verify --run-code:
+    # its model is exec:<tool>) is a script that did not reproduce, a fact
+    # no reading can answer. The lemma's re-verification re-runs its
+    # scripts too, so only a re-execution that reproduces dismisses it.
+    from_execution = str(ref.get("model") or "").startswith("exec:")
+    if from_execution and CODE_RUNNER is None:
+        parser.error(
+            f"{p.name} was written by a re-execution of the lemma's scripts "
+            f"({ref.get('model')}); repairing it re-runs them, so pass "
+            f"--tools"
+        )
+    global LEMMAS_ALL, MY_LEMMAS, TOOL_MODE, LEMMAS_COMMON, RUN_CODE
     LEMMAS_ALL, MY_LEMMAS, TOOL_MODE = lemmas_all, my_lemmas, tool_mode
     LEMMAS_COMMON = lemmas_common
     _verify_session(
@@ -2094,10 +2500,14 @@ def repair_entry(
     reproved = False
     try:
         try:
-            outcome, just = verify_stored_lemma(
-                dag, references, owner, lemma_id, conjecture_text,
-                verifier_sys, verbose,
-            )
+            RUN_CODE = from_execution
+            try:
+                outcome, just = verify_stored_lemma(
+                    dag, references, owner, lemma_id, conjecture_text,
+                    verifier_sys, verbose,
+                )
+            finally:
+                RUN_CODE = False
         except merkle.MerkleCycleError as e:
             log(f"{e}", verbose)
             return 1
@@ -2499,9 +2909,26 @@ def prune_entry(
             kept, dropped = certificates.prune(
                 CONJECTURE_ROOT, USER, hashes, user=_user_header()
             )
+            # The scripts no lemma rests on any more, under the same locks:
+            # a commit copies its scripts before it writes its lemma, so
+            # with every DAG file locked none is caught between the two.
+            cited = {e["hash"] for node in dag["lemmas"].values()
+                     for e in computations.entries(node)}
+            scripts, run_lines, scratch = computations.prune(
+                Path(CONJECTURE_ROOT), USER, cited,
+                Path(CONJECTURE_ROOT) / workspace.SCRATCH_DIRNAME / USER,
+            )
     except OSError as e:
-        log(f"Could not read or rewrite {USER}'s certificate file: {e}")
+        log(f"Could not read or rewrite {USER}'s certificate or code files: {e}")
         return 1
+    for p in scripts:
+        log(f"Removed {p.relative_to(CONJECTURE_ROOT)}: no lemma rests on it.")
+    if scripts or run_lines:
+        log(f"Pruned {len(scripts)} uncited script(s) and {run_lines} "
+            f"runs/ line(s) for {USER}.")
+    if scratch:
+        log(f"Removed {len(scratch)} scratch run(s) older than "
+            f"{computations.SCRATCH_KEEP_SECONDS // 86400} days.")
     if dropped:
         for line in dropped:
             pair = (
@@ -2578,6 +3005,7 @@ def status_entry(
             f"{owner}:{lemma_id} (from {path}) is not a lemma of the DAG {root}"
         )
     order = _citation_closure(dag, owner, lemma_id)
+    run_lines = computations.load_runs(Path(CONJECTURE_ROOT))
     try:
         all_lines = certificates.load_all(CONJECTURE_ROOT)
     except OSError as e:
@@ -2628,6 +3056,9 @@ def status_entry(
                 f"     {len(stale)} stale certificate(s) for an earlier "
                 f"version of this lemma are not listed"
             )
+        for line in computations.describe(
+                Path(CONJECTURE_ROOT), dag["lemmas"][(u, lid)], run_lines):
+            log(f"     {line}")
     # Whether the conjecture is settled, recomputed the way the run
     # computes it (resolution.py): an unsuspended lemma, anyone's, stating
     # conjecture.md (or its negation) verbatim.
@@ -2724,6 +3155,22 @@ def export_entry(
             f"{owner}'s lemma {lemma_id} and everything it cites — "
             f"{len(order)} lemma(s)"
         )
+    # The scripts the exported lemmas rest on, for the appendix: export.py
+    # renders from data, so they are read here.
+    run_lines = computations.load_runs(paths.root)
+    code_shown: Dict[str, Dict[str, Any]] = {}
+    for pair in order:
+        for e in computations.entries(lemmas.get(pair) or {}):
+            code_shown[e["hash"]] = {
+                "lang": e["lang"],
+                "produced_output": e.get("produced_output"),
+                "script": computations.load_script(paths.root, e),
+                "ran_with": sorted({
+                    f"{(l.get('tool') or {}).get('name')} "
+                    f"{(l.get('tool') or {}).get('version')}"
+                    for l in computations.executions(paths.root, e["hash"], run_lines)
+                }),
+            }
     document = export.render(
         conjecture_name=paths.root.name,
         conjecture=load_file(paths.conjecture),
@@ -2731,6 +3178,7 @@ def export_entry(
         order=order,
         lemmas=lemmas,
         references=references,
+        computations=code_shown,
     )
     out = export.write(Path(out_dir) / name, document)
     log(
@@ -3167,6 +3615,10 @@ def _on_sigint(signum, frame) -> None:
     """
     global _sigint_count, _SIGINT_PENDING
     _sigint_count += 1
+    # Code executions run in their own session, where the terminal's
+    # Ctrl-C never reaches them: they are killed here, first, whatever
+    # happens to the run (execution.kill_all).
+    execution.kill_all()
     if _sigint_count > 1:
         print("\nForced exit.", file=sys.stderr)
         os._exit(130)
@@ -4624,6 +5076,41 @@ def verifier_context(
     return {"cited_results": statements}
 
 
+def computations_block(
+    node: Dict[str, Any], sources: Optional[Dict[str, Path]] = None,
+) -> str:
+    """The computations a proof cites, as the verifiers are shown them
+    (computations.context): "" for a proof with none."""
+    shown = computations.context(Path(CONJECTURE_ROOT), node, sources)
+    if not shown:
+        return ""
+    return (
+        "\n\nComputations the proof cites (each script exactly as it ran, "
+        "and the RESULT the harness recorded from it; the proof refers to "
+        "each as [code:<id>]. They were run once, by the prover's harness, "
+        "and are not run again for you):\n"
+        + json.dumps(shown, indent=2)
+    )
+
+
+def verifier_steps(node: Dict[str, Any]) -> Tuple[str, ...]:
+    """The verification steps a proof goes through: the three verifier
+    checks, and coding_verifier.md as a fourth when the proof rests on a
+    computation."""
+    if computations.entries(node):
+        return (*VERIFIER_AGENTS, CODING_VERIFIER)
+    return VERIFIER_AGENTS
+
+
+def verifier_prompt(loaded: Dict[str, str], agent: str) -> str:
+    """The system prompt of a verification step: from the prompts the
+    caller loaded, or read now (coding_verifier.md, only a code-backed
+    proof needs it)."""
+    if agent not in loaded:
+        loaded[agent] = load_file(PROMPT_PATHS[agent])
+    return loaded[agent]
+
+
 def _fit_prompt(
     role: str,
     system_prompt: str,
@@ -4949,7 +5436,7 @@ def _run_verifier(
     verdict is not one.
     """
     review, review_status, _partial = reason(
-        system_prompt, user_prompt, role, verbose,
+        system_prompt, user_prompt, role, verbose, tools=verifier_tools(),
     )
     check_mode_toggle(verbose)
     if review_status == "unavailable":
@@ -5231,8 +5718,9 @@ def run_proof_loop(
                     f"{json.dumps(feedback, indent=2)}"
                     if feedback
                     else ""
-                ),
-                agent_tools(dag, suspended),
+                )
+                + (f"\n\n{CODE_ANSWER_NOTE}" if CODE_ANSWER_NOTE else ""),
+                agent_tools(dag, suspended, code="prover"),
             )
         prover_user, prover_tools = _fit_prompt(
             "prover", prover_sys, build_prover, verbose, dag, suspended,
@@ -5315,7 +5803,7 @@ def run_proof_loop(
                     f"{reviser_ref_block}\n\n"
                     f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
                     f"{report}",
-                    agent_tools(dag, suspended),
+                    agent_tools(dag, suspended, code="reviser"),
                 )
             overflow_user, overflow_tools = _fit_prompt(
                 "reviser", reviser_sys, build_overflow, verbose, dag,
@@ -5464,12 +5952,14 @@ def run_proof_loop(
         prover_res = parse_json_or_none(proof_text)
         raw_cited_lemmas: Any = None
         raw_cited_refs: Any = None
+        raw_code_runs: Any = None
         if prover_res is not None:
             candidate = prover_res.get("proof")
             if isinstance(candidate, str) and candidate.strip():
                 proof = candidate.strip()
             raw_cited_lemmas = prover_res.get("cited_lemmas")
             raw_cited_refs = prover_res.get("cited_references")
+            raw_code_runs = prover_res.get("code_runs")
 
         if not proof:
             # The model's failure, not the server's (an outage was waited
@@ -5593,6 +6083,66 @@ def run_proof_loop(
                 attempt += 1
                 continue
 
+        # The computations the proof rests on: each cited run_id read back
+        # from this user's scratch directory (computations.from_runs), so
+        # what the node records as a script's output is the harness's
+        # record, never the model's. A bad citation is sent back like a
+        # bad lemma citation, before any verifier sees the proof.
+        code: List[Dict[str, Any]] = []
+        code_sources: Dict[str, Path] = {}
+        if not raw_code_runs and computations.unknown_references(proof, []):
+            log(
+                f"  The proof refers to computations ([code:...]) but "
+                f"cites no run in code_runs — sent back as feedback.",
+                verbose,
+            )
+            feedback = [
+                "Your proof refers to computations ([code:...]) but lists "
+                "no run in code_runs. List the run_id of every run the "
+                "proof rests on, or remove the references."
+            ]
+            attempt_notes.append(
+                f"Prover attempt {attempt}: the proof referred to "
+                "computations it did not cite; it never reached the "
+                "verifiers."
+            )
+            attempt += 1
+            continue
+        if raw_code_runs:
+            if not isinstance(raw_code_runs, list):
+                raw_code_runs = [raw_code_runs]
+            if CODE_RUNNER is None:
+                code_problems = ["this run has no code tools, so it can cite no runs"]
+            else:
+                code, code_sources, code_problems = computations.from_runs(
+                    CODE_RUNNER.scratch_dir, raw_code_runs,
+                )
+            if not code_problems:
+                code_problems = computations.unknown_references(proof, code)
+            if code_problems:
+                log(
+                    f"  Prover's code_runs: {'; '.join(code_problems)} — "
+                    f"sent back as feedback.",
+                    verbose,
+                )
+                feedback = [
+                    "Your proof's code_runs: " + "; ".join(code_problems)
+                    + ". List only the run_id of runs whose status is ok, "
+                    "as run_code reported them."
+                ]
+                attempt_notes.append(
+                    f"Prover attempt {attempt}: code_runs cited runs that "
+                    f"do not stand ({'; '.join(code_problems)}); the proof "
+                    "never reached the verifiers."
+                )
+                attempt += 1
+                continue
+            log(
+                f"  The proof rests on {len(code)} computation(s): "
+                + ", ".join(f"{computations.short(e)} ({e['lang']})" for e in code),
+                verbose,
+            )
+
         all_cited = [*cited_lemmas, *cited_refs]
         if all_cited:
             log(
@@ -5622,20 +6172,23 @@ def run_proof_loop(
             f"{json.dumps(verifier_context(dag, cited_lemmas, cited_refs, references), indent=2)}\n\n"
             f"Target lemma:\n{json.dumps(target, indent=2)}\n\n"
             f"Proposed proof:\n{proof}"
+            + computations_block({"code": code}, code_sources)
         )
         reject_just: Optional[str] = None
         stopped = False
-        for step, agent in enumerate(VERIFIER_AGENTS, 1):
+        steps = verifier_steps({"code": code})
+        for step, agent in enumerate(steps, 1):
             role = agent[:-3]   # "verifier_1.md" -> "verifier_1"
             # An unreachable server is waited out and the same step
             # retried: the proof is not at fault, and keeping it saves
             # re-running the prover.
             while True:
                 decision, justification = _run_verifier(
-                    role, verifier_sys[agent], verifier_user, verbose,
+                    role, verifier_prompt(verifier_sys, agent), verifier_user,
+                    verbose,
                 )
                 log(
-                    f"Verifier {step}/{len(VERIFIER_AGENTS)} ({role}): "
+                    f"Verifier {step}/{len(steps)} ({role}): "
                     f"{decision.upper() or '???'} — {justification}",
                     verbose,
                 )
@@ -5657,7 +6210,7 @@ def run_proof_loop(
             # ---------------- Step 4: DAG update ----------------
             # All three verifier checks accepted the same proof.
             log(
-                f"Lemma {lemma_id} passed all {len(VERIFIER_AGENTS)} "
+                f"Lemma {lemma_id} passed all {len(steps)} "
                 f"verifier checks. Adding to DAG.",
                 verbose,
             )
@@ -5671,6 +6224,11 @@ def run_proof_loop(
                 "cited_lemmas": list(cited_lemmas or []),
                 "cited_references": list(cited_refs or []),
             }
+            if code:
+                proved_node["code"] = code
+                # Not stored: where the scripts are until the commit copies
+                # them into code/ (computations.store).
+                proved_node["_code_sources"] = code_sources
             committed_id = on_proof(
                 lemma_id, proved_node,
                 _verified_hash(dag, references, proved_node),
@@ -5693,7 +6251,7 @@ def run_proof_loop(
                 f"The last proof of this lemma (the one just rejected; judge "
                 f"the lemma's difficulty from it):\n{proof}\n\n"
                 f"Verifier's reasoning (why the proof failed):\n{reject_just}",
-                agent_tools(dag, suspended),
+                agent_tools(dag, suspended, code="reviser"),
             )
         reviser_user, reviser_tools = _fit_prompt(
             "reviser", reviser_sys, build_reviser, verbose, dag, suspended,
@@ -6626,13 +7184,20 @@ class LemmaBuffer:
     loops never work on one id.
     """
 
-    def __init__(self, size: int) -> None:
+    def __init__(self, size: int, marked_cap: int = 0) -> None:
         # Each slot is {"lemma": candidate, "claimed_by": loop id or None,
         # "seq": arrival number}, or None while the slot is empty. seq is
         # what makes the buffer a queue; a released claim keeps its place.
         self.slots: List[Optional[Dict[str, Any]]] = [None] * size
         self._next_seq = 0
         self.cond = threading.Condition()
+        # A lemma marked "computation" (a parallel run with --tools) is
+        # claimed only by a loop that may run code, and at most marked_cap
+        # of them — the coding loops — sit in the slots at once. One beyond
+        # that is held here, out of the slots, until a marked slot frees:
+        # held, not dropped, and not crowding out the loops without code.
+        self.marked_cap = marked_cap
+        self.held: List[Dict[str, Any]] = []
 
     def __len__(self) -> int:
         with self.cond:
@@ -6667,42 +7232,82 @@ class LemmaBuffer:
         with self.cond:
             return any(e is None for e in self.slots)
 
+    def held_ids(self) -> Set[str]:
+        with self.cond:
+            return {c["id"] for c in self.held}
+
+    def _marked_locked(self) -> int:
+        return sum(1 for e in self.slots
+                   if e is not None and e["lemma"].get("computation"))
+
+    def _place_locked(self, cand: Dict[str, Any]) -> bool:
+        for i, e in enumerate(self.slots):
+            if e is None:
+                self.slots[i] = {
+                    "lemma": cand, "claimed_by": None, "seq": self._next_seq,
+                }
+                self._next_seq += 1
+                return True
+        return False
+
+    def _promote_held_locked(self) -> int:
+        """Move held marked lemmas into the slots while the cap and the
+        free slots allow. Call with self.cond held."""
+        moved = 0
+        while self.held and self._marked_locked() < self.marked_cap \
+                and self._place_locked(self.held[0]):
+            self.held.pop(0)
+            moved += 1
+        return moved
+
     def fill(self, candidates: List[Dict[str, Any]]) -> int:
         """Put fresh candidates into the empty slots, first come first
-        served, skipping any whose id already sits in the buffer. Returns
-        how many landed."""
+        served, skipping any whose id already sits in the buffer. A marked
+        candidate past the cap is held (see __init__). Returns how many
+        landed in the slots."""
         added = 0
         with self.cond:
+            added += self._promote_held_locked()
             for cand in candidates:
                 if any(
                     e is not None and e["lemma"]["id"] == cand["id"]
                     for e in self.slots
-                ):
+                ) or any(c["id"] == cand["id"] for c in self.held):
                     continue
-                for i, e in enumerate(self.slots):
-                    if e is None:
-                        self.slots[i] = {
-                            "lemma": cand, "claimed_by": None,
-                            "seq": self._next_seq,
-                        }
-                        self._next_seq += 1
-                        added += 1
-                        break
+                if cand.get("computation") and \
+                        self._marked_locked() >= self.marked_cap:
+                    self.held.append(cand)
+                    continue
+                if self._place_locked(cand):
+                    added += 1
             if added:
                 self.cond.notify_all()
         return added
 
-    def claim_oldest(self, loop_id: str) -> Optional[Dict[str, Any]]:
-        """The unattended pick: claim the unclaimed lemma that entered the
-        buffer first. None when nothing is unclaimed."""
+    def _claimable_locked(self, code: bool) -> List[Dict[str, Any]]:
+        return [
+            e for e in self.slots
+            if e is not None and e["claimed_by"] is None
+            and (code or not e["lemma"].get("computation"))
+        ]
+
+    def claimable(self, code: bool) -> bool:
+        """Whether a loop that may (code) or may not run code has anything
+        to claim."""
         with self.cond:
-            waiting = [
-                e for e in self.slots
-                if e is not None and e["claimed_by"] is None
-            ]
+            return bool(self._claimable_locked(code))
+
+    def claim_oldest(self, loop_id: str, code: bool = True) -> Optional[Dict[str, Any]]:
+        """The unattended pick: claim the unclaimed lemma that entered the
+        buffer first. A loop that may run code takes a lemma marked
+        "computation" first, the oldest of them — no other loop can; a loop
+        that may not never takes one. None when nothing is claimable."""
+        with self.cond:
+            waiting = self._claimable_locked(code)
             if not waiting:
                 return None
-            oldest = min(waiting, key=lambda e: e["seq"])
+            marked = [e for e in waiting if e["lemma"].get("computation")]
+            oldest = min(marked or waiting, key=lambda e: e["seq"])
             oldest["claimed_by"] = loop_id
             self.cond.notify_all()
             return oldest["lemma"]
@@ -6751,6 +7356,7 @@ class LemmaBuffer:
             for i, e in enumerate(self.slots):
                 if e is not None and e["lemma"]["id"] == lemma_id:
                     self.slots[i] = None
+                    self._promote_held_locked()
                     self.cond.notify_all()
                     return
 
@@ -6781,7 +7387,7 @@ class ParallelState:
     """
 
     def __init__(self, loop_ids: List[str], max_iterations: int) -> None:
-        self.buffer = LemmaBuffer(len(loop_ids) + 5)
+        self.buffer = LemmaBuffer(len(loop_ids) + 5, marked_cap=CODE_LOOPS)
         self.loops: Dict[str, Dict[str, Any]] = {
             lid: {"in_flight": None, "iterations_used": 0} for lid in loop_ids
         }
@@ -7072,7 +7678,10 @@ def _clean_candidate(raw: Any, conjecture: str) -> Optional[Dict[str, Any]]:
     statement = str(raw.get("statement") or "").strip()
     if not lemma_id or not statement:
         return None
-    return resolution.pin({"id": lemma_id, "statement": statement}, conjecture)
+    cand = resolution.pin({"id": lemma_id, "statement": statement}, conjecture)
+    if raw.get("computation") is True and CODE_LOOPS > 0:
+        cand["computation"] = True
+    return cand
 
 
 def _steering_inputs(state: ParallelState) -> Tuple[Any, ...]:
@@ -7258,6 +7867,7 @@ def _parallel_generator(
         # already rejected.
         known = lemma_id_set(dag, susp.suspended)
         known |= {e["lemma"]["id"] for e in buffer_snapshot}
+        known |= state.buffer.held_ids()
         known |= {e["id"] for e in state.rejected_snapshot()}
         # A lemma a loop holds in flight is off-limits too: the run
         # resumed it, and it is not in this run's buffer.
@@ -7274,7 +7884,8 @@ def _parallel_generator(
                 f"Possible lemmas currently in the buffer (claimed_by marks the "
                 f"loop that has picked one up; never duplicate any of "
                 f"these):\n{json.dumps(buffer_snapshot, indent=2)}\n\n"
-                f"{rejected}\n",
+                f"{rejected}\n"
+                + _computation_note(state),
                 agent_tools(dag, susp.suspended),
             )
         gen_user, gen_tools = _fit_prompt(
@@ -7352,13 +7963,34 @@ def _parallel_generator(
                 return
 
 
+def _computation_note(state: ParallelState) -> str:
+    """What the lemma generator is told about marking a lemma for
+    computation: nothing in a run without code tools."""
+    if CODE_LOOPS == 0:
+        return ""
+    marked = sum(1 for e in state.buffer.snapshot() if e["lemma"].get("computation"))
+    held = len(state.buffer.held_ids())
+    return (
+        f"\n{CODE_LOOPS} of the proof loops can run code "
+        f"({', '.join(CODE_RUNNER.languages)}). Add \"computation\": true to "
+        f"a candidate only when proving it needs a computer search or an "
+        f"exact finite check; only those loops take a marked candidate. At "
+        f"most {CODE_LOOPS} marked candidate(s) wait in the buffer at once; "
+        f"{marked} do now"
+        + (f", and {held} more are held until one frees" if held else "")
+        + ". Leave the field out otherwise.\n"
+    )
+
+
 def _auto_claim(state: ParallelState, loop_id: str, verbose: bool) -> Optional[Dict[str, Any]]:
     """The unattended claim: the oldest unclaimed lemma in the buffer,
     first in, first out. None when the buffer holds nothing the loops have
     not already taken."""
-    claimed = state.buffer.claim_oldest(loop_id)
+    claimed = state.buffer.claim_oldest(loop_id, code=_CODE_LOOP.get())
     if claimed is not None:
-        log(f"[{loop_id}] Took {claimed['id']}, the oldest in the buffer.", verbose)
+        log(f"[{loop_id}] Took {claimed['id']}, "
+            + ("marked for computation." if claimed.get("computation")
+               else "the oldest in the buffer."), verbose)
     return claimed
 
 
@@ -7596,8 +8228,9 @@ def _parallel_proof_loop(
             if fresh_target is None:
                 # Nothing unclaimed in the buffer: the generator is behind.
                 # Wait for it to fill a slot (or the run to stop).
+                code_loop = _CODE_LOOP.get()
                 if not state.buffer.wait_for(
-                    state.buffer.unclaimed, state.stop_event
+                    lambda: state.buffer.claimable(code_loop), state.stop_event
                 ):
                     break
                 continue
@@ -7825,6 +8458,9 @@ def run_parallel(parallel_loops: int, verbose: bool = True) -> Dict[str, Any]:
         ))
 
     def _proof_thread(i: int, lid: str) -> None:
+        # The first CODE_LOOPS loops may run code (see CODE_LOOPS); a new
+        # thread starts from the default context, so this is per loop.
+        _CODE_LOOP.set(CODE_RUNNER is None or i < CODE_LOOPS)
         restarts = 0
         finished_at_start = state.lemmas_finished(lid)
         try:
@@ -8093,7 +8729,11 @@ def main(
     )
     add_lemma_window_flags(parser)
     add_tool_flags(parser)
+    add_code_flags(parser)
     args = parser.parse_args(argv)
+    # Before the backend probe: with --tools this re-execs the command
+    # inside the sandbox, and the probe is the relaunched process's to make.
+    setup_code(args, parser, root)
     LEMMAS_ALL = args.lemmas_all
     MY_LEMMAS = args.my_lemmas
     LEMMAS_COMMON = args.lemmas_common

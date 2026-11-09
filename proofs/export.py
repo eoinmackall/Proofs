@@ -44,6 +44,7 @@ export_entry is the one that loads the DAG and knows what PATH named.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import datetime, timezone
@@ -160,8 +161,15 @@ def render(
     references: Optional[Sequence[Mapping[str, Any]]] = None,
     conjecture: str = "",
     date: Optional[str] = None,
+    computations: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> str:
     """The LaTeX document of the given lemmas, in the given order.
+
+    computations maps a script's hash to what the appendix shows of it —
+    "lang", "produced_output", "script" (its text, None when no intact
+    copy is on disk) and "ran_with" (the tools recorded running it). A
+    lemma that rests on computations points to them, and the appendix
+    lists every one the document's lemmas cite, script verbatim.
 
     order is the lemmas in dependency order (dependencies first) — the
     order the caller settled, the way _citation_closure or
@@ -176,6 +184,7 @@ def render(
     """
     position: Dict[Tuple[str, str], int] = {}
     body: List[str] = []
+    cited_code: List[str] = []
     for i, pair in enumerate(order, 1):
         node = lemmas.get(pair)
         if not isinstance(node, Mapping):
@@ -215,6 +224,18 @@ def render(
         )
         if cites:
             body.append("\\textit{Cites:} " + ", ".join(cites) + ".")
+        code_ids = [str(e.get("hash") or "") for e in node.get("code") or []
+                    if isinstance(e, Mapping) and e.get("hash")]
+        if code_ids:
+            for h in code_ids:
+                if h not in cited_code:
+                    cited_code.append(h)
+            body.append(
+                "\\textit{Rests on computations:} "
+                + ", ".join(f"\\texttt{{[code:{h[:8]}]}} "
+                            f"(\\ref{{code:{h[:8]}}})" for h in code_ids)
+                + "."
+            )
         body.append("")
 
     # The References section: the references the document's lemmas cite,
@@ -249,6 +270,7 @@ def render(
         # following \label nothing to point at, and every \ref to the
         # section would come out undefined.
         "\\newcounter{lem}",
+        "\\newcounter{comp}",
         "",
         f"\\title{{{tex_escape(conjecture_name)}}}",
         f"\\author{{{tex_escape(scope)}}}",
@@ -284,6 +306,37 @@ def render(
             if source:
                 doc.append(f"\\textit{{(source: {tex_escape(source)})}}")
         doc.append("\\end{description}")
+    if cited_code:
+        # The computations: every script the document's lemmas rest on,
+        # exactly as it ran, with the RESULT recorded from it. A script is
+        # shown verbatim, so a line that would end the environment early
+        # is broken apart.
+        doc.append("")
+        doc.append("\\section*{Computations}")
+        for i, h in enumerate(cited_code, 1):
+            c = (computations or {}).get(h) or {}
+            doc.append(f"\\subsection*{{Computation {i}: "
+                       f"\\texttt{{[code:{h[:8]}]}}}}")
+            doc.append("\\refstepcounter{comp}")
+            doc.append(f"\\label{{code:{h[:8]}}}")
+            ran = ", ".join(c.get("ran_with") or []) or "no recorded execution"
+            doc.append(f"Language \\texttt{{{tex_escape(c.get('lang') or '')}}}; "
+                       f"run with {tex_escape(ran)}; script SHA-256 "
+                       f"\\texttt{{{h}}}.")
+            doc.append("")
+            doc.append("Recorded \\texttt{RESULT}:")
+            doc.append("\\begin{verbatim}")
+            doc.append(json.dumps(c.get("produced_output"), sort_keys=True, indent=1))
+            doc.append("\\end{verbatim}")
+            script = c.get("script")
+            if script is None:
+                doc.append("\\textit{(No intact copy of this script is on disk.)}")
+            else:
+                doc.append("\\begin{verbatim}")
+                doc.append(script.rstrip("\n").replace("\\end{verbatim}",
+                                                     "\\end {verbatim}"))
+                doc.append("\\end{verbatim}")
+            doc.append("")
     doc.append("")
     doc.append("\\end{document}")
     return "\n".join(doc) + "\n"

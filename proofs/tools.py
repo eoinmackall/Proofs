@@ -26,6 +26,10 @@ There are two ways a model asks, and the loop speaks both:
     message. No agent's answer has a top-level "tool" key, which is what
     lets parse_json_call tell a call from an answer.
 
+The second, run_code, is offered to the prover and the reviser only when
+the run was given --tools: it runs one complete script in a sandbox
+(execution.py) and returns its status and RESULT line.
+
 The first tool is lookup_lemmas: the lemma window (main.lemma_window)
 shows the agents the most recently proved lemmas in full and lists the
 rest by id only; this is how an agent reads one of the rest.
@@ -325,4 +329,59 @@ def lemma_lookup(
             "lookup_lemmas to read the statement of any of them before "
             "relying on it."
         ),
+    )
+
+
+# How many rounds a call offered run_code may spend: a computation is
+# written, run, read and corrected, so it needs more than a lookup does.
+CODE_TOOL_ROUNDS = 8
+
+
+def run_code(runner: Any, hint: str,
+             on_harness_error: Callable[[str], None] = lambda _m: None) -> Tool:
+    """run_code over runner (execution.Runner): the model passes a complete
+    script and its language, and reads back the run — its status, its
+    RESULT, the tails of its output (execution.RunResult.to_text). hint is
+    the script contract (agents/coding.md, filled in by the caller). A
+    sandbox that cannot start is the harness's failure, not the model's:
+    on_harness_error tells the operator, and the model is told to go on
+    without code."""
+
+    def handler(args: Dict[str, Any]) -> str:
+        language = str(args.get("language") or "").strip()
+        code = args.get("code")
+        if not isinstance(code, str) or not code.strip():
+            return 'error: pass "code", the complete script to run'
+        try:
+            return runner.run(language, code).to_text()
+        except ValueError as e:
+            return f"error: {e}"
+        except Exception as e:
+            if type(e).__name__ != "HarnessError":
+                raise
+            on_harness_error(str(e))
+            return (
+                "error: the sandbox failed to start, through no fault of "
+                "the script. Do not call run_code again; answer without it."
+            )
+
+    return Tool(
+        name="run_code",
+        description=(
+            "Run one complete, self-contained script in a fresh sandboxed "
+            "process (no network, no files from earlier runs) and read back "
+            "its status, its RESULT line and the end of its output. "
+            f"Languages: {', '.join(runner.languages)}."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "language": {"type": "string", "enum": runner.languages},
+                "code": {"type": "string"},
+            },
+            "required": ["language", "code"],
+        },
+        handler=handler,
+        hint=hint,
+        max_rounds=CODE_TOOL_ROUNDS,
     )

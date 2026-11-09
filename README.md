@@ -247,7 +247,7 @@ See [Workspaces](#workspaces).
 
 ### The `proofs` command
 
-One command, ten subcommands:
+One command, twelve subcommands:
 
 | Subcommand | Takes | Does |
 | --- | --- | --- |
@@ -256,10 +256,12 @@ One command, ten subcommands:
 | `proofs new NAME` | a directory name | Lays out a blank conjecture, `conjectures/NAME/` under the workspace root: empty `references/`, `dags/` and `certificates/` directories, an empty `conjecture.md` and `comments.md`, and a `references.md` holding the empty collection `[]`. Refuses a `NAME` that already exists. |
 | `proofs run DIR` | `DIR`, then the loop's options | Runs the proof loop on the conjecture. |
 | `proofs parse DIR` | `DIR`, then the parser's options | The maintainer's tool: parses `DIR`'s `references/` into the committed `references.md`. |
-| `proofs verify PATH lemma_id [--full]` | a user's DAG file, a lemma | Verifies the lemma; with `--full`, what it cites too, cited lemmas first. |
+| `proofs verify PATH lemma_id [--full]` | a user's DAG file, a lemma | Verifies the lemma; with `--full`, what it cites too, cited lemmas first. With `--tools ... --run-code`, re-executes the lemma's [computations](#code-tools-sage-python) first, after asking. |
 | `proofs repair path_to_refutation` | a refutation file | Repairs the lemma the refutation names. |
-| `proofs prune DIR` | a conjecture directory | Drops the current user's stale certificates. |
+| `proofs prune DIR` | a conjecture directory | Drops the current user's stale certificates, uncited scripts and their `runs/` lines, and old scratch runs. |
 | `proofs status PATH lemma_id` | a user's DAG file, a lemma | Lists the valid certificates in the lemma's citation closure, then whether the conjecture is settled. |
+| `proofs limits DIR` | a conjecture directory | Prints the [code limits](#limits) in effect on this machine and where each comes from. |
+| `proofs tools lock\|check DIR` | a conjecture directory | `lock`: the maintainer's tool — writes `tools.lock` from the conjecture's `flake.nix`. `check`: whether each declared tool is on PATH at its version, and whether the sandbox starts. See [Code tools](#code-tools-sage-python). |
 | `proofs export PATH [lemma_id] -o OUT_DIR` | a DAG file or a conjecture directory, an optional lemma, the output directory | Writes a LaTeX document of the DAG, in dependency order, into OUT_DIR. |
 
 Every command works inside a **workspace**, the directory `proofs init`
@@ -379,6 +381,10 @@ server options.
 | `--my-lemmas N` | 25 | How many of your own most recently proved lemmas the agents also see in full, overlap with `--lemmas-all` shown once. `-1` shows all. Also taken by `proofs repair`. |
 | `--lemmas-common K` | 10 | How many *common lemmas* the agents also see, statement only: the lemmas outside the two recency windows that the shown lemmas cite most often (direct citations only). Ties are broken in a random order fixed for the run. A lemma nothing shown cites never ranks. `-1` shows every cited lemma. Also taken by `proofs repair`. |
 | `--tool-mode {auto,json}` | `auto` | How agents call tools such as `lookup_lemmas`. `auto` uses the server's native tool calling and falls back to a JSON protocol the first time the server refuses it (llama-server needs `--jinja` for native calls); `json` uses the protocol from the start. Also taken by `proofs repair`. |
+| `--tools LIST` | off | Let the prover and the reviser run code: a comma-separated list of tools the conjecture's `tools.lock` declares (`sage`, `python`), or `all`. The whole run is then sandboxed. See [Code tools](#code-tools-sage-python); with `--parallel`, see [Coding loops](#coding-loops). |
+| `--code-timeout`, `--code-memory`, `--code-jobs`, `--code-threads`, `--code-max-tasks`, `--code-output-cap`, `--code-reserve-memory` | see `proofs limits` | Override one [code limit](#limits) for this run. |
+| `--code-overcommit` | off | Run even when `code.jobs` × `code.memory` + `code.reserve_memory` exceeds this machine's memory. |
+| `--unsandboxed-code` | off | Run code without the sandbox (where bubblewrap is unavailable). Scripts then run with your permissions, network and files. |
 | `--fresh` | off | Ignore and delete your checkpoint (`dags/<user_id>_dag.checkpoint.json`), restarting the iteration budget from 1. The DAG files are kept. |
 | `--parallel [N]` | off | Run N proof loops in parallel around one shared DAG, steered by one planner and one lemma generator. Bare `--parallel` is N=1. `--mode human`, when set, takes the place of one of the loops (loop-0). See [Parallel mode](#parallel-mode). |
 | `--num-ctx N` | the server's own (probed) | Context window in tokens. On a local llama-server: defaults to the `-c` it was launched with, as probed — lower it if VRAM is tight — and an explicit value is clamped to that ceiling. On a hosted `--host` API nothing is probed, so the default is 65536 and an explicit value replaces it. Budgeting above the server's own window is caught at once from the server's 400, which names its real limit and the `--num-ctx` to re-run with. |
@@ -412,6 +418,181 @@ JSON protocol otherwise (`--tool-mode`). The tools' hints are added to the
 task only while the tools are offered: once they are closed (rounds spent,
 no room left, or a compaction rescue) the task is re-sent without them,
 with the tool results and a line saying the tools are closed.
+
+### Code tools (Sage, Python)
+
+With `--tools`, the prover and the reviser may call `run_code`: they write
+one complete script, it runs in a fresh sandboxed process, and they read
+back its status, its `RESULT` line and the end of its output. There is no
+REPL: nothing carries over from one call to the next, so the script on
+disk is exactly what ran. Every script ends by printing exactly one line
+`RESULT: <json>`, and puts what it checks in `assert`s, so exit status 0
+means the claim held on what it examined (`agents/coding.md` is the full
+contract the agents are given — a shared part and one section per role;
+override it per conjecture like any prompt). The verifiers get the tool
+too, under one rule: a computation may justify a rejection (a
+counterexample to a step), never an acceptance.
+
+**Proofs that rest on a computation.** Only an exact, decidable claim may
+rest on code. The proof stays prose: it says what the script checks and
+why that settles the step, and refers to the script as `[code:<id>]`, the
+id `run_code` reported. The prover lists the runs it relies on in one more
+field of its answer, `code_runs`, by `run_id`; the loop reads each run
+back from the scratch directory, so the recorded output is the harness's,
+never the model's, and sends the proof back before any verifier sees it
+when a run is unknown, failed, or a `[code:<id>]` names no cited script.
+The lemma then stores the computations it cites:
+
+```json
+"code": [{"hash": "<sha256 of the script>", "lang": "sage", "produced_output": {"checked": 1000}}]
+```
+
+and, when it is committed, the scripts are copied into
+`conjectures/NAME/code/<user_id>/<sha256>.sage` and the runs that produced
+them recorded in `conjectures/NAME/runs/<user_id>.jsonl` (both committed)
+before the lemma is written. A `runs/` line is one outcome — script, tool
+name, version and path, result — with a count, so the same outcome again
+adds to the count rather than a line. The Merkle hash covers the `code`
+field when there is one (and only then, so a lemma without computations
+hashes exactly as before): editing a script, or the result recorded for
+it, makes the lemma a different proof, uncertified.
+
+Every verifier sees each cited script and its recorded output, and a
+fourth step, `coding_verifier.md`, runs for a proof with computations: it
+checks the reduction to the finite check, the script's bounds against it,
+that the claim is asserted rather than printed, exact arithmetic, no
+`proof=False` or Monte Carlo methods. Nothing is run again for the
+verifiers; a script whose bytes on disk no longer match its hash is shown
+to them as missing. `proofs verify` works the same way on a stored lemma,
+with or without `--tools`.
+
+**Running the scripts again.** `proofs verify PATH lemma_id --tools sage
+--run-code` re-executes the scripts a lemma rests on before its verifiers
+read it. It prints every script in full and asks before running anything
+— the scripts are other people's code, and the sandbox is a second line of
+defence, not the first: read them. Each script must exit 0 and print the
+recorded `RESULT`:
+
+* every script reproduces: each execution is added to `runs/<user_id>.jsonl`
+  (a count goes up), and the verifiers read the proof as usual;
+* one does not (a failed assert, a different `RESULT`): a refutation is
+  written, model `exec:<tool> <version>`, its justification saying what the
+  script did and what the lemma records — the lemma is suspended until the
+  computation is repaired;
+* a run hits this machine's limits, a script needs a tool the run was not
+  given, or you decline: inconclusive, nothing is recorded either way, and
+  the verifiers read the proof as usual.
+
+A refutation from a re-execution can only be answered by a re-execution:
+while one counts, `proofs verify` without `--run-code` gives no verdict
+rather than let a reading dismiss it, and `proofs repair` on one needs
+`--tools` and re-runs the scripts first (re-proving the lemma if they still
+do not reproduce). `proofs repair --tools` also lets the re-proving prover
+and reviser run code, sandboxed like a run.
+
+`proofs status` lists each lemma's computations: its recorded `RESULT`, and
+how many recorded executions reproduced it, with which tools. `proofs
+prune` also removes, from your own files only, the scripts in
+`code/<user_id>/` no lemma rests on any more, their `runs/` lines, and
+scratch runs older than seven days (a cited script was copied out of
+scratch when its lemma was committed). `proofs export` adds a Computations
+appendix: each script the exported lemmas rest on, verbatim, with its
+recorded `RESULT`, its SHA-256 and the tools recorded running it.
+
+**Which tools, at which versions.** The conjecture's maintainer owns a
+`flake.nix` beside `conjecture.md` that provides the tools and exports
+their versions as `proofsTools`:
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  outputs = { self, nixpkgs }:
+    let
+      system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
+      python = pkgs.python3.withPackages (ps: [ ps.sympy ]);
+    in {
+      devShells.${system}.default = pkgs.mkShell { packages = [ pkgs.sage python ]; };
+      proofsTools = {
+        tools = {
+          sage.version = pkgs.sage.version;
+          python.version = pkgs.python3.version;
+          python.packages.sympy = pkgs.python3Packages.sympy.version;
+        };
+        policy.result_bytes = 65536;   # the most a RESULT line may hold
+      };
+    };
+}
+```
+
+`proofs tools lock NAME` writes that object to `tools.lock` with `nix eval`
+(which evaluates the flake and runs none of it), and the maintainer commits
+both. Everyone else reads only `tools.lock`. Review a flake you pulled
+before you `nix develop` it: its `shellHook` runs on your machine, outside
+any sandbox. `--tools sage` then needs `sage` on your PATH at the declared
+version — from `nix develop conjectures/NAME`, or installed any other way —
+and fails naming the problem otherwise. `proofs tools check NAME` reports
+on every declared tool and on the sandbox.
+
+**The sandbox.** A run given `--tools` re-launches itself inside
+bubblewrap (Linux), in two layers:
+
+* *proofs itself* keeps the network (it must reach the LLM server) but
+  sees the filesystem read-only, `$HOME` hidden except its config and its
+  own code, and may write only inside the workspace;
+* *each script* has no network, an environment built from nothing (no API
+  key reaches it), the system's software directories read-only, nothing
+  of `$HOME` or the workspace, and one writable work directory. It runs in
+  its own session and PID namespace, so killing it kills everything it
+  started.
+
+Ctrl-C works as without tools: running scripts are killed, the checkpoint
+is written, and re-running the command resumes.
+
+On **macOS** each script runs under `sandbox-exec` instead, with a profile
+generated per execution: no network, writes only in its work directory,
+`$HOME` unreadable apart from that directory and the tool's own install
+prefix. There is no outer layer there — macOS cannot apply a second
+sandbox inside a sandboxed process — so proofs itself runs unconfined, and
+the scripts, the untrusted part, are confined one by one. Without a PID
+namespace a script that leaves its process group (`setsid`) escapes the
+kill, and memory is policed as resident size. The macOS backend has not
+yet been tested on a Mac. Where neither backend can run,
+`--unsandboxed-code` runs scripts with your own permissions — only for code
+you would run yourself.
+
+Every execution is kept, gitignored, in
+`conjectures/NAME/scratch/<user_id>/<run_id>/`: the script, its stdout and
+stderr, and `run.json` (tool version and path, platform, limits, wall
+time, peak memory, exit status, `RESULT`, output hashes).
+
+#### Limits
+
+Limits describe the machine, not the conjecture, so they live in
+gitignored files, each a JSON object holding only the keys it overrides:
+`<workspace>/.proofs-local.json` for the machine, and
+`conjectures/NAME/limits.json` for one conjecture on it, which wins key by
+key. A `--code-*` flag beats both for one run; `proofs limits NAME` prints
+what is in effect and where each value came from.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `code.timeout` | 600 | Seconds one execution may run. |
+| `code.memory` | 8G | Memory one execution may hold, all its processes together. |
+| `code.jobs` | 1 | Code job slots on this machine, shared by every proofs command on it: a serial run, `verify` or `repair` with `--tools` takes one, a parallel run one per [coding loop](#coding-loops). |
+| `code.threads` | 1 | Threads one execution is told to use (OpenMP, BLAS, Sage); as many as you pass. |
+| `code.max_tasks` | 32 | Processes and threads one execution may have at once: a guard against a runaway fork. It counts threads, so keep it above `code.threads`. |
+| `code.output_cap` | 1M | Bytes of output one execution may write. |
+| `code.reserve_memory` | 4G | Memory kept back for proofs itself — raise it when a local llama-server shares the machine. |
+
+An execution past a limit is killed and the agent is told which limit, so
+it can make the computation smaller. A run is refused when `code.jobs` ×
+`code.memory` + `code.reserve_memory` exceeds physical memory (unless
+`--code-overcommit`), since that is what takes a machine down; more threads
+than the machine has only slows things down, so that is a warning. Where
+`systemd-run` is available the whole sandboxed run also sits in one
+systemd scope capped at that total, so a runaway the watchdog misses is
+killed by the kernel instead of the machine running out.
 
 ### Modes and the hotkey
 
@@ -505,14 +686,18 @@ of every lemma that cites it; a new proof under the same statement changes
 only the lemma's own hash. Whether everything beneath a lemma is sound is
 [suspension](#suspension)'s question, which walks the whole citation
 closure. A citation cycle leaves the lemmas in it with no hash at all.
-Hashes are never stored: everyone who has the same files computes the same
+A proof that rests on computations also hashes its `code` field — each
+script's hash and the output recorded for it — and a proof without one
+hashes exactly as it always has
+(see [Code tools](#code-tools-sage-python)). Hashes are never stored: everyone who has the same files computes the same
 hashes.
 
 A **certificate** (`proofs/certificates.py`) records an acceptance: one
 line in the verifier's own `certificates/<user_id>.jsonl` holding the
 lemma's pair, its hash at the time, the verifier's `user_id`, the model,
 the date and a count. A run writes one whenever all three verifiers accept
-a proof, the prover's or the operator's. `proofs verify` writes one for
+a proof (all four, for a proof with computations), the prover's or the
+operator's. `proofs verify` writes one for
 each lemma it accepts.
 Accepting the same lemma again with the same model increments the count
 rather than adding a line. A certificate is **valid** only while its hash
@@ -595,6 +780,29 @@ loops never work on the same lemma — the buffer below makes that impossible �
 a loop that has spent its budget stops on its own, and the run ends when the
 last loop out stops, which is also what tells the planner and generator to
 finish.
+
+### Coding loops
+
+With `--tools`, a parallel run takes one **code job slot** per loop that
+may run code. `code.jobs` (see [Limits](#limits)) is the number of slots on
+the machine, shared by every proofs command running on it — a slot is a
+lock file in `$XDG_RUNTIME_DIR/proofs/slots/`, held until the command
+exits — so `--parallel 3` with `code.jobs` 2 and no other run in progress
+gets two **coding loops** (loop-0 and loop-1) and one loop without code,
+whose prover, reviser and verifiers are never offered `run_code`. A
+command that finds every slot taken says so: a parallel run goes on with
+no coding loops; a serial run, `proofs verify` or `proofs repair` with
+`--tools` stops, since its one loop needs one.
+
+The lemma generator is told how many coding loops there are, and may mark
+a candidate `"computation": true` when proving it needs a computer search
+or an exact finite check. Only a coding loop claims a marked lemma — and a
+coding loop takes marked lemmas before any other — while a loop without
+code never does. At most one marked lemma per coding loop sits in the
+buffer at a time; one marked beyond that is **held** outside the buffer and
+enters it as a marked slot frees, so marked lemmas wait for the loops that
+can prove them without crowding out the loops that cannot. (Held lemmas
+are not in the checkpoint: after a restart the generator proposes afresh.)
 
 ### The shared possible-lemma list
 
@@ -701,6 +909,8 @@ proofs/
     parallel/                                    # parallel-mode prompts
       parallel_planner.md  parallel_lemma_generator.md
     parsing.md                                   # references parser prompt
+    coding.md                                    # the run_code contract, shown with --tools
+    coding_verifier.md                           # the fourth check, for proofs with computations
   cli.py               # the `proofs` command: subcommands and argument validation
   config.py            # the user's global config (~/.config/proofs/config): user.id, user.name, user.email
   main.py              # the proof loop (planner → prover → verifier → reviser) and the verify/repair/prune/status/export entries
@@ -711,7 +921,12 @@ proofs/
   suspension.py        # which lemmas are not to be built on, computed from the files
   resolution.py        # whether the conjecture is settled, computed from the files
   export.py            # the LaTeX export
-  tools.py             # agent tools (lookup_lemmas) and the two tool-calling protocols
+  tools.py             # agent tools (lookup_lemmas, run_code) and the two tool-calling protocols
+  codetools.py         # the code tools (sage, python), tools.lock, finding them on PATH
+  limits.py            # code limits: defaults, the per-machine files, the memory check
+  sandbox.py           # bubblewrap: the outer sandbox around proofs, the inner one per script
+  execution.py         # running one script: scratch directory, watchdog, RESULT
+  computations.py      # computations in the DAG: code_runs, code/, runs/, what verifiers see
   llm_backend.py       # OpenAI-compatible transport (llama.cpp or a hosted API) + model profiles
   interaction.py       # human-in-the-loop menu + hotkey
   workspace.py         # the workspace (init, root discovery, the .gitignore block), per-conjecture directories, prompt resolution
@@ -724,6 +939,7 @@ A workspace, as `proofs init` and `proofs new` lay it out:
 ```
 .proofs                # the workspace marker (format = 1)
 .gitignore             # your own rules, plus the proofs block proofs init writes
+.proofs-local.json     # optional, gitignored: this machine's code limits
 conjectures/
   algebra_example/
     conjecture.md          # required: the statement
@@ -737,6 +953,12 @@ conjectures/
     references.md          # committed: parsed theorem-level results (strict JSON array)
     comments.md            # optional, gitignored: this user's private notes for the planner
     prover.md              # optional per-conjecture prompt override
+    flake.nix, flake.lock  # optional, committed: the maintainer's code tools
+    tools.lock             # committed with them: the tools and versions runs may use
+    limits.json            # optional, gitignored: this machine's code limits for this conjecture
+    scratch/<user_id>/     # gitignored: every code execution (script, output, run.json)
+    code/<user_id>/        # committed: the scripts that proofs rest on, named by hash
+    runs/<user_id>.jsonl   # committed: that user's executions of them, with counts
 ```
 
 ### Workspaces

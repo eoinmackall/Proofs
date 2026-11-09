@@ -18,6 +18,12 @@
           then self.source + "/proofs"
           else ./proofs;
 
+        # The sandbox for runs given --tools (proofs/sandbox.py): Linux only.
+        # The wrapper below points proofs at this bwrap through
+        # PROOFS_BWRAP, so the sandbox works without bubblewrap installed.
+        bwrapExport = pkgs.lib.optionalString pkgs.stdenv.isLinux
+          "export PROOFS_BWRAP=${pkgs.bubblewrap}/bin/bwrap";
+
         # Python environment with required packages
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
           requests
@@ -41,6 +47,7 @@
 #!${pkgs.stdenv.shell}
 if [ -n "\$PYTHONPATH" ]; then PYTHONPATH="$out/lib:\$PYTHONPATH"; else PYTHONPATH="$out/lib"; fi
 export PYTHONPATH
+${bwrapExport}
 exec ${pythonEnv}/bin/python -m proofs "\$@"
 EOF
             chmod +x $out/bin/proofs
@@ -62,7 +69,7 @@ EOF
           buildInputs = [
             pythonEnv
             proofs
-          ];
+          ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.bubblewrap ];
 
           shellHook = ''
             echo "------------------------------------------------"

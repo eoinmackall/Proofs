@@ -11,7 +11,17 @@ statement hashes of everything the lemma cites:
     }
 
 written with sorted keys and no whitespace (canonical_json), UTF-8
-encoded, and hashed. A cited lemma contributes the SHA-256 of its
+encoded, and hashed. A lemma whose proof rests on computations
+(computations.py) has one more key,
+
+        "code": [{"hash": "<sha256 of the script>", "lang": "sage",
+                  "produced_output": <its RESULT>}, ...]
+
+sorted by script hash (code_entries); a lemma with none has no "code" key
+at all, so every hash from before computations existed is unchanged. The
+script is pinned by its hash, and its result by value: a different
+script, or the same script claimed to give a different result, is a
+different proof. A cited lemma contributes the SHA-256 of its
 normalized statement, and a cited reference the SHA-256 of its
 normalized formal statement — the same function for both
 (statement_hash). The ids, the slogans and a cited lemma's proof are
@@ -163,6 +173,26 @@ def reference_hash(reference: Mapping[str, Any]) -> str:
     return statement_hash(reference.get("formal statement", ""))
 
 
+def code_entries(node: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The computations a lemma rests on, in the form the hash takes them:
+    each script's hash, its language and the RESULT it produced, sorted by
+    script hash so their order in the file does not matter. [] when the
+    node has none — and then the hash has no "code" key at all."""
+    raw = node.get("code")
+    if not isinstance(raw, list):
+        return []
+    out = [
+        {
+            "hash": str(e.get("hash") or ""),
+            "lang": str(e.get("lang") or ""),
+            "produced_output": e.get("produced_output"),
+        }
+        for e in raw
+        if isinstance(e, Mapping)
+    ]
+    return sorted(out, key=lambda e: (e["hash"], e["lang"]))
+
+
 def _unresolved(kind: str, *parts: str) -> str:
     """The contribution of a citation that resolves to nothing: the
     SHA-256 of a canonical marker carrying the citation's identity.
@@ -288,17 +318,16 @@ class Merkle:
             )
         self._stack.append(pair)
         try:
-            digest = sha256_hex(
-                canonical_json(
-                    {
-                        "statement": normalize(
-                            self._lemmas[pair].get("statement")
-                        ),
-                        "proof": normalize(self._lemmas[pair].get("proof")),
-                        "cited": self._cited_hashes(self._lemmas[pair]),
-                    }
-                ).encode("utf-8")
-            )
+            node = self._lemmas[pair]
+            hashed: Dict[str, Any] = {
+                "statement": normalize(node.get("statement")),
+                "proof": normalize(node.get("proof")),
+                "cited": self._cited_hashes(node),
+            }
+            code = code_entries(node)
+            if code:
+                hashed["code"] = code
+            digest = sha256_hex(canonical_json(hashed).encode("utf-8"))
         finally:
             self._stack.pop()
         self.cache[pair] = digest
