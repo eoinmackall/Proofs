@@ -48,19 +48,17 @@ stored permanently and cited by later proofs.
 Some proved lemmas may not follow this form; do not imitate them.
 
 Rules:
-- Every candidate id must be unique within the list and must not reuse the id
-  of an already-proved lemma.
 - Do not re-propose an already-proved lemma statement.
 - The rejected lemmas are statements the prover failed to prove in every
   attempt it was given. Do not propose one unchanged: decompose (or alter) it into
   smaller (or different) lemmas or take a new route entirely.
-- Two ids are reserved for settling the conjecture: "conjecture" (the
-  conjecture itself) and "conjecture_negation" (that the conjecture is
-  false, by an explicit counterexample). The conjecture is settled only when
-  a lemma under one of these ids is proved and verified — never by your
-  saying so. To attempt it, propose a candidate with that id; its statement
-  is filled in by the system from the conjecture verbatim, so whatever you
-  write there is replaced. Never use these ids for anything else.
+- The conjecture is settled only when a lemma stating it ("conjecture"), or
+  stating that it is false by an explicit counterexample
+  ("conjecture_negation"), is proved and verified — never by your saying
+  so. To attempt it, propose a candidate with "settles" set to
+  "conjecture" or "conjecture_negation"; its statement is filled in by the
+  system from the conjecture verbatim, so whatever you write there is
+  replaced. Leave "settles" out of every other candidate.
 - Propose "conjecture" only once the lemmas it rests on are actually proved,
   so that its proof is an assembly of proved lemmas. Propose
   "conjecture_negation" only once the lemmas that build a concrete refuting
@@ -73,23 +71,18 @@ Output strictly valid JSON in this exact structure, with no markdown fences and 
   "plan_summary": "Brief explanation of the overall strategy and how these five candidates relate to it",
   "candidate_lemmas": [
     {
-      "id": "lemma_1",
       "statement": "Precise, self-contained statement of the candidate lemma"
     },
     {
-      "id": "lemma_2",
       "statement": "..."
     },
     {
-      "id": "lemma_3",
       "statement": "..."
     },
     {
-      "id": "lemma_4",
       "statement": "..."
     },
     {
-      "id": "lemma_5",
       "statement": "..."
     }
   ]

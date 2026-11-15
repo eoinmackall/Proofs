@@ -4,18 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "proofs"
-version = "0.1.0"
+version = "0.2.0"
 description = "A distributed system for constructing proofs to conjectures, coordinated through git."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "GPL-3.0-or-later"
-dependencies = ["requests"]
+dependencies = ["requests", "rich", "orjson"]
 
 [project.scripts]
-proofs = "proofs.cli:main"
+proofs = "proofs.cli.main:main"
 
-[tool.setuptools]
-packages = ["proofs"]
+[tool.setuptools.packages.find]
+include = ["proofs*"]
 
 # The default agent prompts, installed beside the code (workspace.agents_dir).
 [tool.setuptools.package-data]

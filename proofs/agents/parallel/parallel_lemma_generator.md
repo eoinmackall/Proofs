@@ -14,7 +14,7 @@ The input gives you the whole picture:
 
 Propose five lemmas that move the plan forward. They must be distinct from
 each other and from everything already known: never reuse, restate, or
-reword an id or statement that appears among the proved lemmas, the
+reword a statement that appears among the proved lemmas, the
 possible-lemma list, or the rejected lemmas. A lemma another loop is
 already working on is as unavailable as a proved one — the list shows who
 claims what, so do not propose it again.
@@ -39,19 +39,16 @@ stored permanently and cited by later proofs.
 Some proved lemmas may not follow this form; do not imitate them.
 
 Rules:
-- Every id must be unique within the batch and must not collide with any id
-  already known: the proved lemmas or the possible-lemma list. Continue the
-  numbering the list uses.
 - Do not re-propose a rejected lemma unchanged: if the plan still wants it,
   decompose (or alter) it into something smaller (or different) 
   that a single prover may be able to close.
-- Two ids are reserved: "conjecture" (the conjecture itself) and
-  "conjecture_negation" (that the conjecture is false, by an explicit
-  counterexample). A lemma under one of them, once proved and verified, is
-  what settles the conjecture. Propose one only once the lemmas it rests on
-  (or that build the refuting instance) are actually proved; its statement
-  is filled in by the system from the conjecture verbatim, so whatever you
-  write there is replaced. Never use these ids for anything else.
+- A lemma stating the conjecture itself, or that it is false by an explicit
+  counterexample, is what settles the conjecture once proved and verified.
+  To propose one, set "settles" to "conjecture" or "conjecture_negation";
+  do so only once the lemmas it rests on (or that build the refuting
+  instance) are actually proved. Its statement is filled in by the system
+  from the conjecture verbatim, so whatever you write there is replaced.
+  Leave "settles" out of every other lemma.
 - If "Known references" are provided, they name theorem-level results the
   provers may cite by id without proving them. Do not propose a lemma that
   merely restates a reference; it is already available.
@@ -61,23 +58,18 @@ and no extra text:
 {
   "candidate_lemmas": [
     {
-      "id": "lemma_6",
       "statement": "Precise, self-contained statement of the candidate lemma"
     },
     {
-      "id": "lemma_7",
       "statement": "..."
     },
     {
-      "id": "lemma_8",
       "statement": "..."
     },
     {
-      "id": "lemma_9",
       "statement": "..."
     },
     {
-      "id": "lemma_10",
       "statement": "..."
     }
   ]

@@ -11,7 +11,7 @@ explains how. It contains one of two kinds of failure.
   lemma is too difficult for the prover to complete in one go.
 
 Besides the failure itself, the message lists the lemmas already proved
-(each with its user_id, its lemma_id, and its statement) and, if there are
+(each with its id and its statement) and, if there are
 any, the known references. Use them: a choice must neither duplicate what
 is already established nor contradict it.
 
@@ -83,9 +83,8 @@ is met.
    original by more than the hypothesis you added. The evidence itself (the
    counterexample, the flawed quantifier) goes in the diagnosis, not in the
    statement. The lemma keeps its id and its role in the overall strategy.
-   Never choose this when the target's id is "conjecture" or
-   "conjecture_negation": that statement is the conjecture itself (or its
-   negation) and cannot be changed. If it looks false, say so in the
+   Never choose this when the target's statement is the conjecture itself
+   (or the statement that it is false): that statement cannot be changed. If it looks false, say so in the
    diagnosis and choose "new_lemma" instead.
 
 3. "new_lemma": choose this in every other case.
@@ -112,9 +111,6 @@ Choosing "new_lemma":
   established or plainly checkable.
 - Do NOT bundle. If the failed attempt revealed several missing facts,
   choose the single most useful one and name the others in the diagnosis.
-- Give it a fresh id that does not collide with any id in the proved list.
-  The ids "conjecture" and "conjecture_negation" are reserved and may not
-  be used.
 
 The diagnosis:
 - For "keep": the fix itself, objection by objection.
@@ -130,7 +126,6 @@ The diagnosis:
 
 General rules:
 - Choose exactly one action, and make the JSON fields consistent with it.
-- "new_id" is the empty string unless the action is "new_lemma".
 - "new_statement" is the full text of the revised or new statement, written
   to the rules above, or the empty string when the statement is kept.
 
@@ -138,6 +133,5 @@ Output strictly valid JSON in this exact structure, with no markdown fences and 
 {
   "action": "keep" or "revise_statement" or "new_lemma",
   "diagnosis": "For keep: the fix. Otherwise: where the fault lies, why the chosen action fits, and all guidance for the prover (route, useful lemmas, mistakes to avoid)",
-  "new_id": "Fresh lemma id, or empty string unless the action is new_lemma",
   "new_statement": "A bare mathematical proposition (hypotheses, then one conclusion) with no instructions, history or commentary; or empty string if the statement is kept"
 }

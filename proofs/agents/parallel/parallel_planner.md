@@ -32,12 +32,10 @@ false, the shortest way to settle it may be to build the refutation rather
 than the proof. Say so in the plan and let the priorities point at the
 concrete refuting instance.
 
-The conjecture is settled only when a lemma under one of two reserved ids is
-proved and verified: "conjecture" (the conjecture itself) or
-"conjecture_negation" (that it is false, by an explicit counterexample). You
-never declare it settled. When the proved lemmas suffice to assemble one of
-them, say so and make it a priority; the lemma generator proposes it under
-the reserved id.
+The conjecture is settled only when a lemma stating it, or stating that it
+is false by an explicit counterexample, is proved and verified. You never
+declare it settled. When the proved lemmas suffice to assemble one of them,
+say so and make it a priority; the lemma generator proposes it.
 
 Output strictly valid JSON in this exact structure, with no markdown fences
 and no extra text:

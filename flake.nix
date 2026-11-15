@@ -18,7 +18,7 @@
           then self.source + "/proofs"
           else ./proofs;
 
-        # The sandbox for runs given --tools (proofs/sandbox.py): Linux only.
+        # The sandbox for runs given --tools (proofs/tools/run_code/sandbox.py): Linux only.
         # The wrapper below points proofs at this bwrap through
         # PROOFS_BWRAP, so the sandbox works without bubblewrap installed.
         bwrapExport = pkgs.lib.optionalString pkgs.stdenv.isLinux
@@ -27,6 +27,8 @@
         # Python environment with required packages
         pythonEnv = pkgs.python3.withPackages (ps: with ps; [
           requests
+          rich
+          orjson
         ]);
 
         # The installed package: the proofs/ module copied into a Python home,
@@ -34,7 +36,7 @@
         # `nix run .` (or `nix run <flake-url>`) works without cloning.
         proofs = pkgs.stdenvNoCC.mkDerivation {
           pname = "proofs";
-          version = "0.1.0";
+          version = "0.2.0";
           src = proofsSrc;
           dontBuild = true;
           installPhase = ''
