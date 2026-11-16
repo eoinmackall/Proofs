@@ -262,7 +262,9 @@ One command, twelve subcommands:
 | `proofs run DIR` | `DIR`, then the loop's options | Runs the proof loop on the conjecture. |
 | `proofs parse DIR` | `DIR`, then the parser's options | The maintainer's tool: parses `DIR`'s `references/` into the committed `references.md`. |
 | `proofs verify DIR LEMMA_ID [--full]` | a conjecture, a lemma id | Verifies the lemma; with `--full`, what it cites too, cited lemmas first. With `--tools ... --run-code`, re-executes the lemma's [computations](#code-tools-sage-python) first, after asking. |
+| `proofs verify DIR --uncertified` | a conjecture | Verifies every [suspended](#suspension) lemma that lacks only a certificate, cited lemmas first. |
 | `proofs repair path_to_refutation` | a refutation file | Repairs the lemma the refutation names. |
+| `proofs repair --all DIR` | a conjecture | Repairs every refuted lemma, cited lemmas first, each at most once. |
 | `proofs prune DIR [--with-dependents]` | a conjecture directory | Removes every lemma whose refutation still counts, with its certificates and refutation files (and, with `--with-dependents`, everything citing it); compacts repaired lemmas to their current version and drops certificates that match no current hash; and clears scratch no run needs. See [Pruning](#pruning). |
 | `proofs migrate [DIR]` | a workspace root (default: the one you are in) | Converts a format-1 workspace (one file per user and kind) to streams. See [Migrating a format-1 workspace](#migrating-a-format-1-workspace). |
 | `proofs status DIR LEMMA_ID` | a conjecture, a lemma id | Lists the lemma's citation closure: each lemma's hash, stream file, valid certificates with how many times each was issued, and suspension; then whether the conjecture is settled. |
@@ -382,7 +384,7 @@ server options.
 | `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
 | `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
 | `--verbose / --no-verbose` | on | Console logging. |
-| `--ui {auto,live,plain}` | `auto` | `live` keeps a [status board](#the-status-board) of every agent at the bottom of the terminal, under the scrolling log; `plain` prints the log lines only. `auto` is live on a terminal (with `--verbose` and `rich` installed), plain otherwise. |
+| `--ui {auto,live,plain}` | `auto` | `live` keeps a compact [status board](#the-status-board) at the bottom of the terminal: the last few log lines and a row per agent; `plain` prints every log line instead, with no board; `--no-verbose` prints neither. `auto` is live on a terminal (with `--verbose` and `rich` installed), plain otherwise. |
 
 ### The lemma window and tools
 
@@ -705,9 +707,11 @@ against the current one. Everyone decides a fork the same way:
   one (the smaller lemma hash, if several are). Nothing citing the lemma is
   affected, since a citation pins only the statement. `proofs prune` keeps
   the certified version and deletes the rest.
-- If the statements differ, the lemma is suspended, and every command
-  reports it when it loads the DAG, until a person deletes all but one of
-  the versions. `proofs prune` leaves it alone.
+- If the statements differ, the lemma is suspended until a person deletes
+  all but one of the versions, and `proofs prune` leaves it alone. Every
+  command that loads the DAG says how many such lemmas there are, naming
+  one with where its versions are; settle that one and the next load
+  names the next.
 
 ### Certificates and the Merkle hash
 
@@ -764,11 +768,25 @@ A lemma is **suspended** (`proofs/core/suspension.py`) when any of these holds:
   settle);
 - it cites a suspended lemma.
 
-Suspension is computed from the in-memory DAG and never stored. A suspended lemma is hidden from the planner and the prover, and the prover may not cite it; the run warns about each
-one once. `verify`, `repair` and `status` still load suspended lemmas,
-since verification is how they come back. A lemma whose run stopped
-between committing it and certifying it is reported as such; run `proofs
-verify` on it to give it its certificate.
+Suspension is computed from the in-memory DAG and never stored. A suspended lemma is hidden from the planner and the prover, and the prover may not cite it. The run
+does not list them — there may be thousands — but logs one line counting
+them by what brings each back, again whenever the counts change:
+
+- **refuted** — a refutation counts: `proofs repair` on its file;
+- **uncertified** — no valid certificate and nothing else wrong of its
+  own (a run stopped between commit and certificate, or a statement it
+  cites changed): `proofs verify DIR --uncertified`;
+- **only citing a suspended lemma** — its own certificate stands, so it
+  comes back with what it cites;
+- **citing a lemma or reference that is not there** — pruned, not pulled,
+  or dropped from `references.md`;
+- **forked with different statements**, or **on a citation cycle** — a
+  person settles these.
+
+`verify`, `repair` and `status` still load suspended lemmas, since
+verification is how they come back. Alternating `proofs verify DIR
+--uncertified` with `proofs repair --all DIR` brings back everything the
+first three kinds hold, as far as the proofs allow.
 
 ### Verify, repair, prune and status
 
@@ -780,6 +798,17 @@ verify` on it to give it its certificate.
   lemma was accepted, 1 means one was rejected, and 3 means a verifier gave
   no verdict (the server failed). Nothing is written in that last case, so
   an outage never suspends anything.
+- **`proofs verify DIR --uncertified`** brings back, from the roots up, the
+  suspended lemmas only a verification stands between and the DAG. It
+  walks the uncertified lemmas in dependency order and verifies each one;
+  a lemma suspended only for what it cites is not verified, since its own
+  certificate stands. A lemma citing one that stays suspended — refuted,
+  forked, on a cycle, citing what is not there, or rejected in this run —
+  is skipped, and so is everything above it. A rejection writes a
+  refutation, for `proofs repair`, and the walk goes on; a missing verdict
+  stops it. The log has a line per lemma verified and counts otherwise,
+  and the exit code is 0 when nothing was rejected, 1 when something was,
+  and 3 on a missing verdict.
 - **`proofs repair path_to_refutation`** first re-verifies the lemma the
   refutation names, with the objection in front of the verifiers. If the
   proof is accepted, the refutation is dismissed and the repair stops.
@@ -795,6 +824,18 @@ verify` on it to give it its certificate.
   reproof would supersede only one of its versions: if one of them is
   certified, `proofs prune` resolves the fork; otherwise delete all but one
   version by hand (the message names where they are), then repair.
+- **`proofs repair --all DIR`** repairs every lemma a refutation counts
+  against, each as above, cited lemmas first. The refuted lemmas are read
+  once, at the start, and each is tried at most once: one rejected again
+  keeps its new refutation for the next run, and one a climb has already
+  reached is not repaired again. A refuted lemma citing one that stays
+  suspended — forked, on a cycle, citing what is not there, uncertified, or
+  one this run could not repair — is skipped, and so is everything above
+  it; so is one refuted by a re-execution, without `--tools`. A missing
+  verdict stops the run. The log ends with counts (repaired, failed,
+  skipped, not reached) and the suspension line; the exit code is 0 when
+  nothing failed, 1 when a lemma could not be re-proved, 3 on a missing
+  verdict.
 - **`proofs status DIR LEMMA_ID`** lists, for the lemma and everything it
   cites, each lemma's current hash, the stream file of its current version,
   its valid certificates with how many times each was issued, and whether
@@ -823,6 +864,10 @@ still writing to is never rewritten: a lemma with a record in one is neither
 removed nor compacted until the next prune. Prune also clears scratch — everything except a live run's, and
 the executions an interrupted run's checkpoint still needs — and the run
 directories with nothing to resume.
+
+Prune reports counts, not lemma ids, since one prune can touch tens of
+thousands of lemmas: how many it removed and why, compacted, kept for a
+live run or for the next prune, and left alone as forks (naming one).
 
 ## Parallel mode
 
@@ -1167,19 +1212,30 @@ one without forking the defaults.
 
 ### The status board
 
-On a terminal, `proofs run` keeps a small block at the bottom of the screen
-while the log scrolls above it: one line about the run (the conjecture, the
+On a terminal, `proofs run` keeps one compact block at the bottom of the
+screen, redrawn in place. On top are the last three log lines, each with
+the agent that logged it and, in a column of its own, what kind of line it
+is: `tool call`, `accept`, `reject`, `commit`, `compaction`, `warning` or
+`error`, each in its own colour. A message of several lines (a shortlist, a
+traceback) shows its first line and `...`. Under them is one line about the run (the conjecture, the
 model, the run id, the iteration, how long it has been going) and one row
 per agent — the serial run's loop, or a parallel run's planner, generator
 and each loop — with what it is doing (`planner`, `prover`, `verifier 2`,
 `reviser`, `waiting for a lemma`, ...), the lemma it is on, the prover
 round, how long it has been at it, and the last thing that happened to it
-(`verifier 2/3 rejected`, `committed alice/3f9a2c1b4d5e6f70/5e02bd`). Nothing is streamed from
-the model, so the time column is what moves during a long call. The block
-steps aside while the human menu, a pasted proof or a y/N is on screen,
-and is cleared when the run ends. `--ui plain` turns it off; it is off
-anyway when the output is not a terminal, and when `rich` is not installed
-(`nix develop` provides it).
+(`verifier 2/3 rejected`, `committed alice/3f9a2c1b4d5e6f70/5e02bd`).
+
+The log does not scroll above the block, so the earlier lines are not kept
+on screen; `--ui plain` prints every one. The board draws at most 12 rows,
+and fewer when the terminal is too short for that. When there are more
+agents than fit, the ones longest at what they are doing are shown first,
+and the rest are counted by role on a last line (`+58 more: 41 prover,
+12 verifier, 5 waiting`). Nothing is streamed from the model, so the time
+column is what moves during a long call. The block steps aside while the
+human menu, a pasted proof or a y/N is on screen. When the run ends the
+block is cleared and the log lines it last showed are printed. `--ui plain`
+turns it off; it is off anyway when the output is not a terminal, and when
+`rich` is not installed (`nix develop` provides it).
 
 ### Cancelling a run (Ctrl-C) and resuming
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import itertools
 import json
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from .. import tools as tools_mod
 from ..core import resolution
@@ -160,9 +160,9 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
         return ctx.dag
 
     warned_dangling = set()
-    # Suspended lemmas already warned about this run: the warning is told
-    # once per lemma, the way the dangling-citation warning is told.
-    warned_suspended: Set[str] = set()
+    # The suspension warning last told this run: told again only when its
+    # counts change.
+    warned_suspended: Dict[str, Any] = {}
     ctx.run.live_state["rejected_lemmas"] = rejected_lemmas
     ctx.run.live_state["in_flight"] = in_flight
     ctx.run.live_state["plan"] = plan
@@ -202,20 +202,21 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
         # Citations that no longer resolve dangle every proof that used
         # them, and the verifier would reject those for good reason: a lemma
         # id no stream holds (pruned, or not pulled), or a reference id
-        # references.md no longer has (a re-parse dropped it). Warn once
-        # per (lemma, citation) rather than every iteration.
-        for key, node in dag.lemmas.items():
-            for dep, kind, known in (
-                *((d, "proved lemma", dag.lemmas) for d in node.get("cited_lemmas", [])),
-                *((d, "parsed reference", ref_ids) for d in node.get("cited_references", [])),
-            ):
-                if dep in known or (key, dep) in warned_dangling:
-                    continue
-                warned_dangling.add((key, dep))
-                ctx.ui.log(
-                    f"{key} cites {dep}, which is not a {kind}; verification "
-                    f"of it will see a citation with no statement behind it."
-                )
+        # references.md no longer has (a re-parse dropped it). Counted, not
+        # listed (there may be thousands), and told again only when the
+        # count grows.
+        dangling = {
+            key for key, node in dag.lemmas.items()
+            if any(d not in dag.lemmas for d in node.get("cited_lemmas", []))
+            or any(d not in ref_ids for d in node.get("cited_references", []))
+        }
+        if len(dangling) > len(warned_dangling):
+            warned_dangling = dangling
+            ctx.ui.log(
+                f"{len(dangling):,} lemma(s) cite a lemma or reference that "
+                f"is not there; verification of one will see a citation "
+                f"with no statement behind it."
+            )
 
         # Checkpoint: this iteration is now the resumable position. If the
         # previous run was cancelled mid-proof, `in_flight` names the lemma

@@ -271,19 +271,31 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "verify",
-        help="Verify one lemma.",
+        help="Verify one lemma, or every uncertified one.",
         description=(
             "Verify the named lemma. With --full, also verify everything it "
-            "cites, cited lemmas first. There is no mode that verifies "
-            "every lemma at once."
+            "cites, cited lemmas first. With --uncertified instead of a "
+            "lemma, verify every suspended lemma that lacks only a "
+            "certificate, from the roots up."
         ),
     )
     p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
-    p.add_argument("lemma_id", metavar="LEMMA_ID", help="The lemma to verify.")
+    p.add_argument("lemma_id", metavar="LEMMA_ID", nargs="?",
+                   help="The lemma to verify.")
     p.add_argument(
         "--full",
         action="store_true",
         help="Also verify everything the lemma cites, cited lemmas first.",
+    )
+    p.add_argument(
+        "--uncertified",
+        action="store_true",
+        help=(
+            "Verify every suspended lemma whose only fault is a missing "
+            "certificate, cited lemmas first, skipping any that cites a "
+            "lemma that stays suspended. A rejection writes a refutation "
+            "for proofs repair and the run goes on."
+        ),
     )
     _add_backend_flags(p, help_for="the verification")
     p.add_argument(
@@ -301,17 +313,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "repair",
-        help="Repair the lemma a refutation file names.",
+        help="Repair the lemma a refutation file names, or every refuted lemma.",
         description=(
             "Repair the lemma a refutation file names. The refutation file "
-            "supplies the lemma's id, so no other arguments are needed."
+            "supplies the lemma's id, so no other arguments are needed. "
+            "With --all DIR, repair every lemma a refutation counts against, "
+            "cited lemmas first, each at most once."
         ),
     )
     p.add_argument(
         "path",
         metavar="path_to_refutation",
         help="A file in conjectures/NAME/refutations/ (under the "
-             "workspace root).",
+             "workspace root); with --all, the conjecture DIR.",
+    )
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help=(
+            "Repair every refuted lemma of the conjecture DIR, cited lemmas "
+            "first. A lemma is tried once per run: one rejected again keeps "
+            "its refutation for the next run. One citing a lemma that stays "
+            "suspended is skipped."
+        ),
     )
     _add_backend_flags(p, help_for="the re-verification")
     flags.add_lemma_window_flags(p)
@@ -544,17 +568,20 @@ def _cmd_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
 
 
 def _cmd_verify(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.uncertified and (args.lemma_id or args.full):
+        parser.error("--uncertified verifies every uncertified lemma: give "
+                     "it no LEMMA_ID and no --full")
+    if not args.uncertified and not args.lemma_id:
+        parser.error("name the LEMMA_ID to verify, or give --uncertified")
     root = _require_conjecture_dir(args.dir, args.user_id, args.workspace_root, parser)
     if args.run_code and args.tools is None:
         parser.error("--run-code runs the lemma's scripts, so it needs --tools")
     # --tools: check the tools and re-launch inside the sandbox (tools/run_code/setup.py).
     code = code_setup.setup_code(args, parser, args.workspace_root,
                                  conjecture=str(root))
-    rc = verify.verify_entry(
+    common = dict(
         code=code,
-        lemma_id=args.lemma_id,
         root=str(root),
-        full=args.full,
         run_code=args.run_code,
         user_id=args.user_id,
         model=args.model,
@@ -565,12 +592,19 @@ def _cmd_verify(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         verbose=args.verbose,
         parser=parser,
     )
-    # verify_entry returns the exit code: 0 accepted, 1 rejected (its
-    # refutation written), 3 no verdict (the server failed; nothing written).
+    if args.uncertified:
+        rc = verify.verify_uncertified_entry(**common)
+    else:
+        rc = verify.verify_entry(lemma_id=args.lemma_id, full=args.full, **common)
+    # Both return the exit code: 0 accepted, 1 rejected (its refutation
+    # written), 3 no verdict (the server failed; nothing written).
     sys.exit(rc)
 
 
 def _cmd_repair(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if args.all:
+        _cmd_repair_all(args, parser)
+        return
     # Resolved first: the path is relative to the current directory or
     # absolute, and the conjecture root is found by climbing from it — a
     # bare relative name (run inside refutations/) has no parents to climb
@@ -618,6 +652,31 @@ def _cmd_repair(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
     # re-verified or re-proved), 1 a re-proof failed (its lemma and its
     # dependents stay suspended), 3 a verifier gave no verdict (the server
     # failed; nothing written for that lemma).
+    sys.exit(rc)
+
+
+def _cmd_repair_all(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    root = _require_conjecture_dir(args.path, args.user_id, args.workspace_root, parser)
+    code = code_setup.setup_code(args, parser, args.workspace_root,
+                                 conjecture=str(root))
+    rc = repair.repair_all_entry(
+        code=code,
+        lemmas_all=args.lemmas_all,
+        my_lemmas=args.my_lemmas,
+        tool_mode=args.tool_mode,
+        lemmas_common=args.lemmas_common,
+        root=str(root),
+        user_id=args.user_id,
+        model=args.model,
+        host=args.host,
+        api_key=args.api_key,
+        backend=args.backend,
+        num_ctx=args.num_ctx,
+        verbose=args.verbose,
+        parser=parser,
+    )
+    # 0 nothing failed, 1 a lemma could not be re-proved or was refused,
+    # 3 a verifier gave no verdict (the run stopped there), 130 Ctrl-C.
     sys.exit(rc)
 
 

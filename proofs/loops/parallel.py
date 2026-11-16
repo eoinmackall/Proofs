@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import threading
 import traceback
-from typing import Any, Collection, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional, Set, Tuple
 
 from .. import llm
 from .. import tools as tools_mod
@@ -80,6 +80,10 @@ class LemmaBuffer:
         # held, not dropped, and not crowding out the loops without code.
         self.marked_cap = marked_cap
         self.held: List[Dict[str, Any]] = []
+        # Called after every change to the slots or the held list, with
+        # self.cond released: ParallelState sets it to its checkpoint
+        # writer, which takes self.cond itself (checkpoint_entries).
+        self.on_change: Callable[[], None] = lambda: None
 
     def __len__(self) -> int:
         with self.cond:
@@ -148,7 +152,7 @@ class LemmaBuffer:
         tell that two loops would be proving the same thing. A marked
         candidate past the cap is held (see __init__). Returns (how many
         landed in the slots, how many were dropped as duplicates)."""
-        added = duplicates = 0
+        added = duplicates = held = 0
         with self.cond:
             added += self._promote_held_locked()
             for cand in candidates:
@@ -159,11 +163,14 @@ class LemmaBuffer:
                 if cand.get("computation") and \
                         self._marked_locked() >= self.marked_cap:
                     self.held.append(cand)
+                    held += 1
                     continue
                 if self._place_locked(cand):
                     added += 1
             if added:
                 self.cond.notify_all()
+        if added or held:
+            self.on_change()
         return added, duplicates
 
     def _claimable_locked(self, code: bool) -> List[Dict[str, Any]]:
@@ -192,11 +199,13 @@ class LemmaBuffer:
             oldest = min(marked or waiting, key=lambda e: e["seq"])
             oldest["claimed_by"] = loop_id
             self.cond.notify_all()
-            return oldest["lemma"]
+        self.on_change()
+        return oldest["lemma"]
 
     def claim_id(self, loop_id: str, lemma_id: str) -> Optional[Dict[str, Any]]:
         """Claim a named lemma — the human loop's pick. Same atomicity as
         claim_oldest(): None when the id is not in the buffer unclaimed."""
+        claimed = None
         with self.cond:
             for e in self.slots:
                 if (
@@ -206,8 +215,11 @@ class LemmaBuffer:
                 ):
                     e["claimed_by"] = loop_id
                     self.cond.notify_all()
-                    return e["lemma"]
-        return None
+                    claimed = e["lemma"]
+                    break
+        if claimed is not None:
+            self.on_change()
+        return claimed
 
     def release_claims(
         self, loop_id: str, keep: Optional[str] = None
@@ -227,6 +239,8 @@ class LemmaBuffer:
                     released.append(e["lemma"]["id"])
             if released:
                 self.cond.notify_all()
+        if released:
+            self.on_change()
         return released
 
     def consume(self, lemma_id: str) -> None:
@@ -240,7 +254,10 @@ class LemmaBuffer:
                     self.slots[i] = None
                     self._promote_held_locked()
                     self.cond.notify_all()
-                    return
+                    break
+            else:
+                return
+        self.on_change()
 
     def restore(self, entries: List[Dict[str, Any]]) -> None:
         """Put a checkpoint's buffer back (core/checkpoint.py): each
@@ -299,6 +316,7 @@ class ParallelState:
     def __init__(self, ctx, loop_ids: List[str], max_iterations: int) -> None:
         self.ctx = ctx
         self.buffer = LemmaBuffer(len(loop_ids) + 5, marked_cap=self.ctx.code.loops)
+        self.buffer.on_change = self.write_checkpoint
         self.loops: Dict[str, Dict[str, Any]] = {
             lid: {"in_flight": None, "iterations_used": 0} for lid in loop_ids
         }
@@ -401,6 +419,7 @@ class ParallelState:
             }
             moved = self.dag_version > dag_version_before
             self.plan_stale = moved
+        self.write_checkpoint()
         with self.plan_cond:
             self.plan_cond.notify_all()
         return moved
@@ -652,7 +671,7 @@ def _parallel_planner(
     stale and the planner goes straight back around: no DAG change is
     lost, and the plan that steers the loops was always written for the
     DAG as it stood."""
-    warned: Set[str] = set()
+    warned: Dict[str, Any] = {}
     while state.running():
         ctx.status(role="waiting for the DAG to change")
         if not state.wait_for_work():

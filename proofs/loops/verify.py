@@ -13,7 +13,8 @@ from ..core import certificates, merkle, refutations
 from ..core.checkpoint import attach_run, open_fresh_run
 from ..core.context import Code, Context, Paths
 from ..core.dag import (
-    _citation_closure, load_file, writer,
+    _citation_closure, _dependency_order, describe_suspension, load_file,
+    suspension_kinds, writer,
 )
 from ..tools.run_code import computations, execution
 from ..validity import verdicts
@@ -450,20 +451,26 @@ def verify_entry(
     # it is the path back to them. The warning names a lemma the run must
     # not build on as one.
     susp = dag.suspension()
-    for lid in order:
-        if susp.has(lid):
-            ctx.ui.log(
-                f"{lid} is suspended ({'; '.join(susp.reasons(lid))}); "
-                f"it is loaded and verified anyway — the verification is how "
-                f"the suspension is lifted.",
-                verbose,
-            )
+    if not full and susp.has(lemma_id):
+        ctx.ui.log(
+            f"{lemma_id} is suspended ({'; '.join(susp.reasons(lemma_id))}); "
+            f"it is loaded and verified anyway — the verification is how "
+            f"the suspension is lifted.",
+            verbose,
+        )
     conjecture_text = load_file(ctx.paths.conjecture_file)
     verifier_sys = _verifier_prompts(ctx, parser)
-    ctx.ui.log(
-        f"Verifying {len(order)} lemma(s): " + ", ".join(order),
-        verbose,
-    )
+    if full:
+        # Counted, not listed: a closure can run to thousands of lemmas.
+        held = sum(1 for lid in order if susp.has(lid))
+        ctx.ui.log(
+            f"Verifying {len(order):,} lemma(s), cited lemmas first, "
+            f"{lemma_id} last"
+            + (f"; {held:,} of them suspended, verified anyway — the "
+               f"verification is how a suspension is lifted" if held else "")
+            + ".",
+            verbose,
+        )
     try:
         for lid in order:
             outcome, _just = verify_stored_lemma(
@@ -485,3 +492,118 @@ def verify_entry(
         ctx.ui.log(f"{e}", verbose)
         return 1
     return 0
+
+
+def verify_uncertified_entry(
+    *,
+    root: str,
+    run_code: bool,
+    user_id: str,
+    model: str,
+    host: Optional[str],
+    api_key: Optional[str],
+    backend: str,
+    num_ctx: Optional[int],
+    verbose: bool,
+    parser: argparse.ArgumentParser,
+    code: Optional[Code] = None,
+) -> int:
+    """proofs verify NAME --uncertified: bring back, from the roots up,
+    every suspended lemma that only a verification stands between and the
+    DAG — the "uncertified" and "cites" kinds of core.dag.suspension_kinds.
+
+    The two kinds are walked together in dependency order, cited lemmas
+    first. An uncertified lemma gets the three verifier checks of
+    verify_stored_lemma: an acceptance issues its certificate, a rejection
+    writes its refutation, for proofs repair. A lemma of the cites kind
+    has a certificate that stands, so it is not verified: it comes back by
+    itself once what it cites is certified. A lemma citing one that stays
+    suspended — refuted, forked, on a cycle, citing what is not there, or
+    rejected here — is skipped,
+    since a certificate would not lift its suspension; so is everything
+    above it. A rejection does not stop the walk; a missing verdict does,
+    with nothing written for that lemma, as in verify_entry.
+
+    The log has a line per lemma verified and counts otherwise, never a
+    list of ids. Returns 0 when nothing was rejected, 1 when a lemma was
+    (its refutation written), EXIT_NO_VERDICT on a missing verdict.
+    """
+    ctx = Context(user=user_id, code=code if code is not None else Code())
+    ctx.code.run_code = run_code
+    _verify_session(
+        ctx,
+        conjecture_dir=root, user_id=user_id, model=model, host=host,
+        api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
+        verbose=verbose, parser=parser,
+    )
+    name = Path(ctx.paths.conjecture_root).name
+    kinds = suspension_kinds(ctx.dag)
+    walk = kinds["uncertified"] | kinds["cites"]
+    # The suspended lemmas no certificate brings back: what cites one stays
+    # suspended whatever it is given. A rejection here joins them.
+    stuck = set(kinds["refuted"] | kinds["conflict"] | kinds["cycle"]
+                | kinds["dangling"])
+    line = describe_suspension(ctx.dag, name)
+    ctx.ui.log(line or "No lemma is suspended.", verbose)
+    if not kinds["uncertified"]:
+        if line:
+            ctx.ui.log("None is uncertified: nothing to verify.", verbose)
+        return 0
+    conjecture_text = load_file(ctx.paths.conjecture_file)
+    verifier_sys = _verifier_prompts(ctx, parser)
+    total = len(kinds["uncertified"])
+    ctx.ui.log(
+        f"Verifying up to {total:,} uncertified lemma(s), cited lemmas first.",
+        verbose,
+    )
+    certified = rejected = skipped = done = 0
+
+    def summary() -> None:
+        ctx.ui.log(
+            f"\nCertified {certified:,}; rejected {rejected:,} (each with a "
+            f"refutation for proofs repair); skipped {skipped:,} citing a "
+            f"lemma that stays suspended; {total - done - skipped:,} not "
+            f"reached.",
+            verbose,
+        )
+        ctx.ui.log(describe_suspension(ctx.dag, name) or
+                   "No lemma is suspended now.", verbose)
+
+    try:
+        for lid in _dependency_order(ctx.dag, walk):
+            cited = ctx.dag.lemmas[lid].get("cited_lemmas") or []
+            if any(c in stuck for c in cited):
+                stuck.add(lid)
+                if lid in kinds["uncertified"]:
+                    skipped += 1
+                continue
+            if lid in kinds["cites"]:
+                continue
+            done += 1
+            ctx.ui.log(f"\n[{done:,}/{total:,}] {lid}", verbose)
+            outcome, _just = verify_stored_lemma(
+                ctx,
+                ctx.dag, ctx.dag.references, lid, conjecture_text,
+                verifier_sys, verbose,
+            )
+            if outcome == "accepted":
+                certified += 1
+            elif outcome == "rejected":
+                rejected += 1
+                stuck.add(lid)
+            else:
+                done -= 1
+                ctx.ui.log(
+                    f"{lid} got no verdict; the verification stops here, "
+                    f"with nothing written for it. Re-run once the server "
+                    f"answers.",
+                    verbose,
+                )
+                summary()
+                return EXIT_NO_VERDICT
+    except merkle.MerkleCycleError as e:
+        ctx.ui.log(f"{e}", verbose)
+        summary()
+        return 1
+    summary()
+    return 1 if rejected else 0

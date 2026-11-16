@@ -320,12 +320,17 @@ class Dag:
 
         lemmas, forked, conflicts, ranked = _resolve(versions, references, certs)
         hashes = _settle(lemmas, ranked, references)
-        warnings = [
-            f"{lid} has versions that state different things ("
-            + ", ".join(files) + "): it is suspended until all but one are "
-            "deleted by hand."
-            for lid, files in sorted(conflicts.items())
-        ]
+        # One line however many forks there are, naming one of them, with
+        # where its versions are, for the person who has to settle it.
+        warnings = []
+        if conflicts:
+            first = min(conflicts)
+            warnings.append(
+                f"{len(conflicts):,} lemma(s) have versions that state "
+                f"different things, and are suspended until all but one "
+                f"version of each is deleted by hand (e.g. {first}: "
+                + ", ".join(conflicts[first]) + ")."
+            )
         return cls(lemmas, hashes, references, certs, refs, root, warnings,
                    forked, conflicts)
 
@@ -665,47 +670,100 @@ def _verified_hash(dag: "Dag", node: Dict[str, Any]) -> Optional[str]:
 # ----------------------------------------------------------------------------
 # What the run tells the operator
 # ----------------------------------------------------------------------------
+def suspension_kinds(dag: "Dag") -> Dict[str, Set[str]]:
+    """The suspended lemmas (see suspension.py) sorted by what brings each
+    back, every lemma in exactly one kind, the first that holds of it:
+
+      conflict     its versions state different things: a person deletes
+                   all but one
+      cycle        on a citation cycle, so it has no hash and no
+                   certificate can be valid for it
+      dangling     cites a lemma id no stream holds (pruned, or not
+                   pulled) or a reference id references.md lacks: its hash
+                   covers a statement that is not there
+      refuted      a refutation counts against it: proofs repair
+      uncertified  no valid certificate, and nothing else of its own:
+                   proofs verify --uncertified
+      cites        suspended only for citing a suspended lemma: its own
+                   certificate stands, so it comes back with what it cites
+    """
+    susp = dag.suspension()
+    kinds: Dict[str, Set[str]] = {
+        k: set() for k in
+        ("conflict", "cycle", "dangling", "refuted", "uncertified", "cites")
+    }
+    if not susp.suspended:
+        return kinds
+    certified = {
+        str(c.get("lemma_id") or "") for c in dag.certificates
+        if certificates.is_valid(c, dag.hashes.get(str(c.get("lemma_id") or "")))
+    }
+    ref_ids = {str(r.get("id")) for r in dag.references}
+    for lid in susp.suspended:
+        node = dag.lemmas[lid]
+        if lid in dag.conflicts:
+            kinds["conflict"].add(lid)
+        elif dag.hashes.get(lid) is None:
+            kinds["cycle"].add(lid)
+        elif any(c not in dag.lemmas for c in node.get("cited_lemmas") or []) \
+                or any(str(r) not in ref_ids
+                       for r in node.get("cited_references") or []):
+            kinds["dangling"].add(lid)
+        elif lid in susp.refuted:
+            kinds["refuted"].add(lid)
+        elif lid not in certified:
+            kinds["uncertified"].add(lid)
+        else:
+            kinds["cites"].add(lid)
+    return kinds
+
+
+def describe_suspension(dag: "Dag", name: str) -> str:
+    """One line counting the suspended lemmas by kind (suspension_kinds),
+    each with what brings it back; "" when none is suspended. Counts, never
+    ids: a DAG can hold tens of thousands of suspended lemmas."""
+    kinds = suspension_kinds(dag)
+    total = sum(len(v) for v in kinds.values())
+    if not total:
+        return ""
+    parts = [
+        f"{len(kinds[kind]):,} {what}"
+        for kind, what in (
+            ("refuted", "refuted (proofs repair)"),
+            ("uncertified", f"uncertified (proofs verify {name} --uncertified)"),
+            ("cites", "only citing a suspended lemma"),
+            ("dangling", "citing a lemma or reference that is not there "
+                         "(pull, or proofs prune --with-dependents)"),
+            ("conflict", "forked with different statements (delete all but "
+                         "one version by hand)"),
+            ("cycle", "on a citation cycle"),
+        )
+        if kinds[kind]
+    ]
+    return (f"{total:,} lemma(s) are suspended, hidden from the planner and "
+            f"the prover: " + "; ".join(parts) + ".")
+
+
 def _warn_suspended(
     ctx,
     susp: "suspension.Suspension",
     verbose: bool,
-    warned: Optional[Set[str]] = None,
+    shown: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """The run's warning for the suspended lemmas (see suspension.py): a
-    lemma with a refutation whose hash matches it, or without a valid
-    certificate, or citing a lemma that has either, is hidden from the
-    planner and the prover, and the operator is told so — once per lemma
-    per run with a warned set.
-
-    A lemma committed but never certified — suspended only for having no
-    certificate, with none in any stream, ever — gets its own message:
-    nothing is wrong with the proof that anyone has recorded, and proofs
-    verify is how it gets its certificate."""
-    pending = [p for p in sorted(susp.suspended) if warned is None or p not in warned]
-    if not pending:
+    """The run's warning for the suspended lemmas (see suspension.py): one
+    line of counts by kind (describe_suspension), never a line per lemma.
+    With shown (a dict the caller keeps for the run), told again only when
+    the counts change."""
+    if shown is not None and shown.get("susp") is susp:
         return
-    ever_certified = {str(c.get("lemma_id") or "") for c in ctx.dag.certificates}
-    name = Path(ctx.paths.conjecture_root).name
-    for lid in pending:
-        if warned is not None:
-            warned.add(lid)
-        if susp.reasons(lid) == ["no valid certificate"] and lid not in ever_certified:
-            ctx.ui.log(
-                f"{lid} was committed but never certified — its certificate "
-                f"was not issued (see the log of the run that committed it). "
-                f"It is suspended (hidden from the planner and the prover) "
-                f"until certified: run proofs verify {name} {lid}.",
-                verbose,
-            )
-            continue
-        ctx.ui.log(
-            f"{lid} is suspended ({'; '.join(susp.reasons(lid))}); it is hidden "
-            f"from the planner and the prover, and proofs run will not build "
-            f"on it. proofs verify and proofs repair still load it: "
-            f"re-accepting it (and any suspended lemma it cites) re-issues the "
-            f"certificate and lifts the suspension.",
-            verbose,
-        )
+    line = describe_suspension(ctx.dag, Path(ctx.paths.conjecture_root).name)
+    if shown is not None:
+        shown["susp"] = susp
+        if shown.get("line") == line:
+            return
+        shown["line"] = line
+    if line:
+        ctx.ui.log(line, verbose)
 
 
 def _settled(ctx, dag: "Dag", suspended: Iterable[str], conjecture: str,

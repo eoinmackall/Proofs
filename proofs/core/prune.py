@@ -298,34 +298,36 @@ def prune_entry(
         ctx.ui.log(f"Could not read or rewrite the conjecture's files: {e}")
         return 1
 
-    for lid in sorted(remove):
-        why = ("its refutation counts" if lid in refuted
-               else "it depends on a removed lemma")
-        ctx.ui.log(f"Removed {lid}: {why}.")
-    for lid in sorted(moved):
-        ctx.ui.log(f"Kept {lid} uncompacted for now: its current version is not "
-                   f"where the DAG read it. Prune again.")
-    for lid in sorted(compact):
-        ctx.ui.log(f"Compacted {lid}: its current version, in "
-                   f"{dag.lemmas[lid]['file']}, is now its only record.")
-    for lid in sorted(in_live):
-        ctx.ui.log(f"Kept {lid} for now: a run on this machine is writing to a "
-                   f"stream that holds it. Prune again once it has ended.")
+    # Counts, never lists of ids: a prune can touch tens of thousands of
+    # lemmas. A fork left alone is the one case a person must act on, so
+    # one of them is named with where its versions are.
+    if moved:
+        ctx.ui.log(f"Kept {len(moved):,} lemma(s) uncompacted for now: the "
+                   f"current version is not where the DAG read it. Prune again.")
+    if in_live:
+        ctx.ui.log(f"Kept {len(in_live):,} lemma(s) for now: a run on this "
+                   f"machine is writing to a stream that holds them. Prune "
+                   f"again once it has ended.")
     if not with_dependents and remove:
         left = dependents(dag, remove) - remove
         if left:
             ctx.ui.log(
-                f"{len(left)} lemma(s) citing what was removed stay, "
+                f"{len(left):,} lemma(s) citing what was removed stay, "
                 f"suspended (proofs repair can revive them; --with-dependents "
-                f"removes them): " + ", ".join(sorted(left)))
-    for lid in sorted(conflicted):
-        ctx.ui.log(f"Left {lid} alone: its versions state different things; "
-                   f"delete all but one by hand.")
+                f"removes them).")
+    if conflicted:
+        first = min(conflicted)
+        ctx.ui.log(f"Left {len(conflicted):,} lemma(s) alone: their versions "
+                   f"state different things; delete all but one version of "
+                   f"each by hand (e.g. {first}: "
+                   f"{', '.join(dag.conflicts[first])}).")
     merged = len(duplicates)
     did = (remove or compact or stale_certs or merged or refutation_files
            or stale_refutations or scratch_runs or scratch_execs)
     ctx.ui.log(
-        f"Pruned {len(remove)} lemma(s) and compacted {len(compact)} "
+        f"Pruned {len(remove):,} lemma(s) ({len(remove & refuted):,} whose "
+        f"refutation counts, {len(remove - refuted):,} depending on a removed "
+        f"lemma) and compacted {len(compact):,} "
         f"({lemma_records} record(s) removed); removed {stale_certs} stale "
         f"certificate(s) and merged {merged} duplicate(s); removed "
         f"{refutation_files} refutation file(s) with their lemmas and "
