@@ -217,6 +217,53 @@ def _more(hidden: List[Tuple[str, Any]]) -> str:
     )
 
 
+def _reflowing(live: Any, console: Any) -> None:
+    """Make live find the top of its block after the terminal is resized.
+
+    rich redraws by moving the cursor up as many lines as it last drew.
+    A terminal that rewraps its lines when it narrows (kitty, and most
+    others now) turns each of those lines into as many rows as it takes at
+    the new width — the table's lines are as wide as the old terminal, so
+    every one of them — and moving up by the old count stops partway up
+    the block, leaving its top behind on every redraw. This counts the
+    rows at the width the terminal has now instead."""
+    from rich.live_render import LiveRender
+
+    class _Render(LiveRender):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._widths: List[int] = []
+
+        def __rich_console__(self, console: Any, options: Any) -> Any:
+            widths = [0]
+            for segment in super().__rich_console__(console, options):
+                if segment.text == "\n" and not segment.control:
+                    widths.append(0)
+                else:
+                    widths[-1] += segment.cell_length
+                yield segment
+            self._widths = widths
+
+        def _rewrapped(self) -> None:
+            if self._shape is None or not self._widths:
+                return
+            width = max(1, console.size.width)
+            rows = sum(max(1, -(-w // width)) for w in self._widths)
+            self._shape = (self._shape[0], rows)
+
+        def position_cursor(self) -> Any:
+            self._rewrapped()
+            return super().position_cursor()
+
+        def restore_cursor(self) -> Any:
+            self._rewrapped()
+            return super().restore_cursor()
+
+    old = live._live_render
+    live._live_render = _Render(old.renderable, old.style,
+                                old.vertical_overflow)
+
+
 class _Sink(io.TextIOBase):
     """sys.stdout / sys.stderr while the block is up: a stray print from
     anywhere becomes a log line, by whole lines, instead of writing
@@ -273,6 +320,7 @@ class LiveUI(PlainUI):
             _Block(self), console=self.console, refresh_per_second=2,
             transient=True, redirect_stdout=False, redirect_stderr=False,
         )
+        _reflowing(self._live, self.console)
         self._running = False
         self._pauses = 0
 
