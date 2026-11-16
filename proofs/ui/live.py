@@ -3,7 +3,8 @@
 While a run is live, the bottom of the terminal holds one block:
 
     the last few log lines (LOG_LINES), each with the agent that logged
-        it and what kind of line it is (tool call, accept, reject, ...)
+        it and what kind of line it is (tool call, accept, reject, ...),
+        between two short rules ("... no events yet ..." until there are)
     one line about the run (the conjecture, the model, the run id, the
         iteration, how long it has been going)
     a table with one row per agent — what it is doing, on which lemma,
@@ -142,8 +143,9 @@ class _Block:
     """What the block draws, rebuilt on every refresh."""
 
     # The lines the block always has besides the log and the agent rows:
-    # the rule, the run line and the table's column names.
-    _FIXED = 3
+    # the two rules, the run line and the table's column names. The log
+    # between the rules takes at least one line ("no events yet").
+    _FIXED = 4
 
     def __init__(self, ui: "LiveUI") -> None:
         self.ui = ui
@@ -167,7 +169,7 @@ class _Block:
         log = ui.recent()
 
         rows = ui.board.snapshot()
-        room = ui.console.size.height - self._FIXED - len(log)
+        room = ui.console.size.height - self._FIXED - max(1, len(log))
         shown, hidden = _cap(rows, max(1, min(MAX_AGENT_ROWS, room)))
 
         table = Table(box=None, pad_edge=False, expand=True, show_edge=False,
@@ -184,10 +186,10 @@ class _Block:
                 _elapsed(now - row.since) if row.since else "",
                 Text(row.event, style="dim"),
             )
-        parts = [Text("─" * 8, style="dim")]
-        if log:
-            parts.append(_log_lines(log))
-        parts += [header, table]
+        rule = Text("─" * 8, style="dim")
+        events = (_log_lines(log) if log else
+                  Text("... no events yet ...", style="dim", justify="center"))
+        parts = [rule, events, rule, header, table]
         if hidden:
             parts.append(Text(_more(hidden), style="dim", no_wrap=True,
                               overflow="ellipsis"))
