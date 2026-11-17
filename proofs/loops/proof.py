@@ -6,13 +6,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .. import tools as tools_mod
 from ..core import resolution
 from ..core.dag import _verified_hash, new_lemma_id
-from ..tools.run_code import computations
+from ..tools.run_code import computations, files
 from ..validity import verdicts
 from ..validity.citations import check_citations, scan_citations
 from ..validity.steps import role_of, verifier_steps
@@ -69,7 +71,35 @@ def _restore_failed(ctx, lemma_id: str, why: str, verbose: bool) -> None:
     )
 
 
-def run_proof_loop(
+def run_proof_loop(ctx, **kwargs) -> Dict[str, Any]:
+    """_proof_loop (which documents the loop), in the loop's own code
+    directory (tools/run_code/files.py): the one the resumed round saved,
+    or a new one. The directory goes when the lemma settles — proved, out
+    of attempts, or given up — and stays for a loop that stopped or was
+    interrupted, whose checkpoint resumes in it."""
+    if ctx.code.runner is None:
+        return _proof_loop(ctx, **kwargs)
+    name = str((kwargs.get("initial") or {}).get("code_dir") or "")
+    if not re.fullmatch(r"[0-9a-f]{8}", name):
+        name = files.new_loop_dir_name()
+    code_dir = ctx.code.runner.scratch_dir / name
+    prev, ctx.loop.code_dir = ctx.loop.code_dir, code_dir
+    try:
+        result = _proof_loop(ctx, **kwargs)
+    finally:
+        ctx.loop.code_dir = prev
+    if not result.get("stopped"):
+        shutil.rmtree(code_dir, ignore_errors=True)
+    return result
+
+
+def _as_list(raw: Any) -> List[Any]:
+    if not raw:
+        return []
+    return list(raw) if isinstance(raw, list) else [raw]
+
+
+def _proof_loop(
     ctx,
     *,
     verbose: bool,
@@ -189,12 +219,17 @@ def run_proof_loop(
         attempt_notes: List[str] = list(in_flight.get("attempt_notes") or [])
         first_attempt = in_flight["attempt"]
         last_proof = str(in_flight.get("last_proof") or "")
+        # The scripts the last proof cited (their ids), which the next
+        # prover round is shown again (the carry-over), until the
+        # statement changes.
+        last_code_runs: List[Any] = _as_list(in_flight.get("last_code_runs"))
     else:
         feedback: List[str] = []
         guidance = ""
         attempt_notes: List[str] = []
         first_attempt = 1
         last_proof = ""
+        last_code_runs: List[Any] = []
     # A loop resuming past its prover call (stage verify or revise; see
     # core/checkpoint.py): the prover's saved output stands in for the
     # call, once, and the verdicts saved with it for the verifiers that
@@ -251,6 +286,8 @@ def run_proof_loop(
             "guidance": guidance,
             "attempt_notes": attempt_notes,
             "last_proof": last_proof,
+            "last_code_runs": last_code_runs,
+            "code_dir": ctx.loop.code_dir.name if ctx.loop.code_dir else "",
             "stage": saved["stage"] if restoring else "prove",
             "proof": saved["proof"] if restoring else None,
             "prover_model": saved["prover_model"] if restoring else "",
@@ -282,6 +319,18 @@ def run_proof_loop(
             )
             answer = (json.dumps(saved["proof"]), "", None)
         else:
+            # The carry-over: the scripts the last proof cited, shown again
+            # so the prover can cite them unchanged or edit them. They are
+            # the only files the prover's directory keeps from earlier
+            # rounds — no other file's text is in the new call's context.
+            carry = ""
+            if ctx.loop.code_dir is not None and ctx.loop.code_loop:
+                prover_files = files.Scripts(ctx.loop.code_dir / "prover")
+                c_entries, c_sources, _problems, c_names = \
+                    prover_files.resolve(last_code_runs)
+                prover_files.keep_only(c_names)
+                carry = files.carried_block(c_entries, c_names, c_sources)
+
             def build_prover() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
                 return (
                     f"Conjecture:\n{conjecture}\n\n"
@@ -302,6 +351,7 @@ def run_proof_loop(
                         if feedback
                         else ""
                     )
+                    + (f"\n\n{carry}" if carry else "")
                     + (f"\n\n{ctx.code.answer_note}" if ctx.code.answer_note else ""),
                     agent_tools(ctx, "prover", dag, suspended),
                 )
@@ -314,6 +364,7 @@ def run_proof_loop(
                     "the lemma": json.dumps(target, indent=2),
                     "the reviser's guidance": guidance,
                     "the feedback": json.dumps(feedback, indent=2) if feedback else "",
+                    "the carried computations": carry,
                 },
             )
             # An unreachable server is waited out, not counted: the round
@@ -460,6 +511,7 @@ def run_proof_loop(
                 feedback = []
                 guidance = diagnosis
                 last_proof = ""
+                last_code_runs = []
                 attempt = 1
                 ctx.ui.log(
                     f"Prover overflowed {old_id}; now trying the smaller "
@@ -482,6 +534,7 @@ def run_proof_loop(
                 # revision does.
                 target = {"id": lemma_id, "statement": new_stmt}
                 last_proof = ""
+                last_code_runs = []
                 overflow_feedback.append(
                     f"Revised statement proposed: {new_stmt}"
                 )
@@ -560,6 +613,7 @@ def run_proof_loop(
         # check, what the reviser will judge its difficulty by, and what
         # the checkpoint records beside the in-flight state.
         last_proof = proof
+        last_code_runs = _as_list(raw_code_runs)
 
         # The DAG's edges now come from here, in the two stored fields:
         # cited_lemmas, a list of lemma ids, and cited_references, a list
@@ -670,10 +724,10 @@ def run_proof_loop(
                 attempt += 1
                 continue
 
-        # The computations the proof rests on: each cited run_id read back
-        # from this user's scratch directory (computations.from_runs), so
-        # what the node records as a script's output is the harness's
-        # record, never the model's. A bad citation is sent back like a
+        # The computations the proof rests on: each cited script id read
+        # back from the prover's directory (files.Scripts.resolve), so what
+        # the node records as a script's output is the harness's record,
+        # never the model's. A bad citation is sent back like a
         # bad lemma citation, before any verifier sees the proof.
         code: List[Dict[str, Any]] = []
         code_sources: Dict[str, Path] = {}
@@ -689,8 +743,8 @@ def run_proof_loop(
             )
             feedback = [
                 "Your proof refers to computations ([code:...]) but lists "
-                "no run in code_runs. List the run_id of every run the "
-                "proof rests on, or remove the references."
+                "no script in code_runs. List the script id of every script "
+                "the proof rests on, or remove the references."
             ]
             attempt_notes.append(
                 f"Prover attempt {attempt}: the proof referred to "
@@ -700,14 +754,12 @@ def run_proof_loop(
             attempt += 1
             continue
         if raw_code_runs:
-            if not isinstance(raw_code_runs, list):
-                raw_code_runs = [raw_code_runs]
-            if ctx.code.runner is None:
-                code_problems = ["this run has no code tools, so it can cite no runs"]
+            if ctx.loop.code_dir is None:
+                code_problems = ["this run has no code tools, so it can cite no scripts"]
             else:
-                code, code_sources, code_problems = computations.from_runs(
-                    ctx.code.runner.scratch_dir, raw_code_runs,
-                )
+                code, code_sources, code_problems, _names = files.Scripts(
+                    ctx.loop.code_dir / "prover"
+                ).resolve(_as_list(raw_code_runs))
             if not code_problems:
                 code_problems = computations.unknown_references(proof, code)
             if code_problems and restoring:
@@ -721,11 +773,11 @@ def run_proof_loop(
                 )
                 feedback = [
                     "Your proof's code_runs: " + "; ".join(code_problems)
-                    + ". List only the run_id of runs whose status is ok, "
-                    "as run_code reported them."
+                    + ". List only the script ids of scripts whose last run "
+                    "is ok, as run_code reported them."
                 ]
                 attempt_notes.append(
-                    f"Prover attempt {attempt}: code_runs cited runs that "
+                    f"Prover attempt {attempt}: code_runs cited scripts that "
                     f"do not stand ({'; '.join(code_problems)}); the proof "
                     "never reached the verifiers."
                 )
@@ -979,6 +1031,7 @@ def run_proof_loop(
             feedback = []
             guidance = diagnosis
             last_proof = ""
+            last_code_runs = []
             attempt = 1
             ctx.ui.log(
                 f"Reviser decomposed {old_id}; the prover now starts on "
@@ -999,6 +1052,7 @@ def run_proof_loop(
         elif action == "revise_statement" and new_stmt and new_stmt != target["statement"]:
             target = {"id": lemma_id, "statement": new_stmt}
             last_proof = ""
+            last_code_runs = []
             ctx.ui.log(
                 f"Reviser revised the lemma; the prover starts again "
                 f"from:\n{new_stmt}",

@@ -26,7 +26,7 @@ Layout:
         flake.nix, flake.lock      <- optional, committed: the maintainer's code tools
         tools.lock                 <- committed with them: the tools runs may use (codetools.py)
         limits.json                <- optional, gitignored: this machine's limits here (limits.py)
-        scratch/<user_id>/<run_id>/  <- gitignored: every code execution's script and log, per run
+        scratch/<user_id>/<run_id>/  <- gitignored: the scripts of a run's live proof loops (run_code/files.py)
         code/<user_id>/<run_id>/   <- committed: the scripts cited proofs rest on (computations.py)
       some_other_problem/
         conjecture.md
@@ -99,7 +99,7 @@ REFERENCES_FILENAME = "references.md"
 # and never committed or shared: each user keeps their own copy in their
 # own clone (see the README's "Comments" section).
 COMMENTS_FILENAME = "comments.md"
-# Every code execution of a run with --tools (execution.py): one directory
+# The scripts of a run with --tools (tools/run_code/files.py): one directory
 # per run under scratch/<user_id>/, local to the machine and never committed.
 SCRATCH_DIRNAME = "scratch"
 AGENTS_DIR = "agents"

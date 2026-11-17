@@ -67,6 +67,13 @@ class Tool:
     # The rounds a call offered this tool may spend (ToolSet.max_rounds);
     # None for the ToolSet's default.
     max_rounds: Optional[int] = None
+    # What a request that re-sends the task with the tool calls written in
+    # (a fold, a compaction rescue) adds after them (ToolSet.fold_notes):
+    # the state the calls led to. None for nothing.
+    fold_note: Optional[Callable[[], str]] = None
+    # Called when the agent call that was offered the tool ends
+    # (ToolSet.close). None for nothing.
+    on_close: Optional[Callable[[], None]] = None
 
 
 def cut_to_budget(text: str, budget: Optional[int]) -> str:
@@ -116,6 +123,18 @@ class ToolSet:
         if not hints:
             return ""
         return "Tools you can call before you answer:\n" + "\n".join(hints)
+
+    def fold_notes(self) -> str:
+        """What the tools add to a task re-sent with their calls written
+        in: each one's fold_note. "" when none has anything to add."""
+        notes = [n for n in (t.fold_note() for t in self.tools if t.fold_note) if n]
+        return "\n\n".join(notes)
+
+    def close(self) -> None:
+        """The agent call is over: each tool's on_close."""
+        for t in self.tools:
+            if t.on_close:
+                t.on_close()
 
     def specs(self) -> List[Dict[str, Any]]:
         """The OpenAI-style `tools` field, for a native call."""

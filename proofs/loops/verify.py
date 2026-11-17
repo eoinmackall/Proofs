@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,7 +17,7 @@ from ..core.dag import (
     _citation_closure, _dependency_order, describe_suspension, load_file,
     suspension_kinds, writer,
 )
-from ..tools.run_code import computations, execution
+from ..tools.run_code import computations, execution, files
 from ..validity import verdicts
 from ..validity.steps import VERIFIER_AGENTS, role_of, verifier_steps
 from ..workspace import layout as workspace
@@ -94,10 +95,20 @@ def _reexecute(
         answer = ""
     if answer.strip().lower() not in ("y", "yes"):
         return "inconclusive", "the operator declined to run the scripts", ""
+    # The re-runs' files go when the comparison is done: nothing cites them.
+    rerun_dir = files.loop_dir(ctx) / "rerun"
+    try:
+        return _rerun(ctx, scripts, rerun_dir, verbose)
+    finally:
+        shutil.rmtree(rerun_dir, ignore_errors=True)
+
+
+def _rerun(ctx, scripts, rerun_dir: Path, verbose: bool) -> Tuple[str, str, str]:
+    """_reexecute's re-runs, each in rerun_dir."""
     for e, text in scripts:
         sid = computations.short(e)
         try:
-            res = ctx.code.runner.run(e["lang"], text)
+            res = ctx.code.runner.run(e["lang"], text, rerun_dir, sid)
         except execution.HarnessError as ex:
             return "inconclusive", f"script {sid}: {ex}", ""
         found = ctx.code.runner.tools[e["lang"]]
@@ -126,7 +137,7 @@ def _reexecute(
         return ("mismatch",
                 f"Re-execution of script [code:{sid}] with {tool} "
                 f"({found.path}) does not reproduce the computation the proof "
-                f"rests on: {how}. Scratch run: {res.run_id}.", tool)
+                f"rests on: {how}.", tool)
     return "match", "", ""
 
 

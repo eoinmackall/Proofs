@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import copy
 import threading
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set, Tuple
 
@@ -94,8 +95,9 @@ class Code:
 
     # The runner every run_code call goes through.
     runner: Any = None
-    # The run_code tool for each role that is offered it ("prover",
-    # "reviser", "verifier").
+    # What makes the run_code tool for each role that is offered it
+    # ("prover", "reviser", "verifier"), given the agent's directory
+    # (tools/run_code/tool.py: run_code with all but scripts bound).
     tools: Dict[str, Any] = field(default_factory=dict)
     # How many proof loops may run code: the machine-wide job slots this
     # process holds.
@@ -165,6 +167,9 @@ class LoopState:
     # Whether this thread's loop may run code (the first code.loops loops
     # of a parallel run).
     code_loop: bool = True
+    # The code directory of the proof loop this thread is running
+    # (tools/run_code/files.py); None outside one.
+    code_dir: Optional[Path] = None
     # _fit_prompt's override of the lemma window's three sizes while it
     # rebuilds a prompt too large for the context window.
     window_override: Optional[Tuple[int, int, int]] = None

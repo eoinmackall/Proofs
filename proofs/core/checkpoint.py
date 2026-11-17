@@ -57,11 +57,17 @@ draws one again. An in-flight record is one loop's lemma:
     feedback, guidance, attempt_notes what the next prover round is told
     last_proof                        the last proof of it (what the reviser
                                       judges its difficulty by)
+    last_code_runs                    the script ids that proof cited (the
+                                      carry-over the next prover round is
+                                      shown)
+    code_dir                          the loop's code directory under the
+                                      run's scratch (tools/run_code/files.py)
     stage                             "prove", "verify" or "revise": the
                                       step the loop resumes at
     proof                             the prover's parsed output for this
                                       round (proof, cited_lemmas,
-                                      cited_references, code_runs), written
+                                      cited_references, code_runs: script
+                                      ids), written
                                       as soon as the prover returns
     prover_model                      the model that wrote proof, which the
                                       committed lemma names (a resumed run
@@ -407,6 +413,10 @@ def _validate_in_flight(ctx, raw: Any) -> Optional[Dict[str, Any]]:
             n for n in (raw.get("attempt_notes") or []) if isinstance(n, str)
         ],
         "last_proof": str(raw.get("last_proof") or ""),
+        "last_code_runs": [
+            r for r in (raw.get("last_code_runs") or []) if isinstance(r, str)
+        ],
+        "code_dir": str(raw.get("code_dir") or ""),
         "stage": stage,
         "proof": proof,
         "prover_model": str(raw.get("prover_model") or "") if proof else "",

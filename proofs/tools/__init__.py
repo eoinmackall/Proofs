@@ -30,6 +30,9 @@ class Call:
     # The agent's role: "planner", "parallel_planner",
     # "parallel_lemma_generator", "prover", "reviser", "verifier", ...
     role: str
+    # The agent's own name, when its role is shared ("verifier_1", …,
+    # "coding_verifier" for the role "verifier"); "" when it is the role.
+    agent: str = ""
     # The complete DAG's lemmas, when the agent is shown the lemma window;
     # None when it is not (a verifier sees only what the proof cites).
     lemmas: Optional[Mapping[str, Mapping[str, Any]]] = None

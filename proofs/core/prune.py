@@ -27,9 +27,9 @@ appends to a stream this prune rewrote, git reports a conflict in that
 file, resolved by hand (keep every record line both sides have).
 
 Prune also clears the machine's scratch: everything under scratch/ except a
-live run's, and, for a run that is not live, the executions its checkpoint
-still needs (the computations its in-flight proofs cite). Nothing is kept by
-age. The run directories under checkpoints/ with nothing to resume go too.
+live run's, and, for a run that is not live, the code directories its
+checkpoint's in-flight loops will resume in (tools/run_code/files.py).
+Nothing is kept by age. The run directories under checkpoints/ with nothing to resume go too.
 """
 
 from __future__ import annotations
@@ -59,8 +59,8 @@ def live_runs(root: Path) -> Set[Tuple[str, str]]:
 
 
 def _needed_scratch(checkpoint: Path) -> Set[str]:
-    """The executions a run's checkpoint still needs: the code_runs its
-    in-flight proofs cite (serial and parallel shapes alike)."""
+    """The code directories a run's checkpoint still needs: each in-flight
+    loop's (serial and parallel shapes alike)."""
     try:
         data = json.loads(checkpoint.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -73,18 +73,17 @@ def _needed_scratch(checkpoint: Path) -> Set[str]:
                 flights.append(loop.get("in_flight"))
     out: Set[str] = set()
     for f in flights:
-        proof = f.get("proof") if isinstance(f, dict) else None
-        runs = proof.get("code_runs") if isinstance(proof, dict) else None
-        for r in runs if isinstance(runs, list) else [runs]:
-            if isinstance(r, str) and r.strip():
-                out.add(r.strip())
+        name = f.get("code_dir") if isinstance(f, dict) else None
+        if isinstance(name, str) and name.strip():
+            out.add(name.strip())
     return out
 
 
 def _clear_scratch(root: Path, live: Set[Tuple[str, str]]) -> Tuple[int, int]:
     """Remove the scratch a run no longer needs (see the module
-    docstring). Returns (executions removed, run directories removed)."""
-    removed_execs = removed_runs = 0
+    docstring). Returns (code directories removed, run directories
+    removed)."""
+    removed_dirs = removed_runs = 0
     for user_id, run_id, directory in streams.run_dirs(root / workspace.SCRATCH_DIRNAME):
         if (user_id, run_id) in live:
             continue
@@ -101,8 +100,8 @@ def _clear_scratch(root: Path, live: Set[Tuple[str, str]]) -> Tuple[int, int]:
                 shutil.rmtree(d, ignore_errors=True)
             else:
                 d.unlink()
-            removed_execs += 1
-    return removed_execs, removed_runs
+            removed_dirs += 1
+    return removed_dirs, removed_runs
 
 
 def _clear_runs(root: Path, live: Set[Tuple[str, str]]) -> int:
@@ -292,7 +291,7 @@ def prune_entry(
                     and certified(lid)):
                 refutations.delete(path)
                 stale_refutations += 1
-        scratch_execs, scratch_runs = _clear_scratch(root, live)
+        scratch_dirs, scratch_runs = _clear_scratch(root, live)
         _clear_runs(root, live)
     except (OSError, streams.StreamError) as e:
         ctx.ui.log(f"Could not read or rewrite the conjecture's files: {e}")
@@ -323,7 +322,7 @@ def prune_entry(
                    f"{', '.join(dag.conflicts[first])}).")
     merged = len(duplicates)
     did = (remove or compact or stale_certs or merged or refutation_files
-           or stale_refutations or scratch_runs or scratch_execs)
+           or stale_refutations or scratch_runs or scratch_dirs)
     ctx.ui.log(
         f"Pruned {len(remove):,} lemma(s) ({len(remove & refuted):,} whose "
         f"refutation counts, {len(remove - refuted):,} depending on a removed "
@@ -332,7 +331,7 @@ def prune_entry(
         f"certificate(s) and merged {merged} duplicate(s); removed "
         f"{refutation_files} refutation file(s) with their lemmas and "
         f"{stale_refutations} stale; cleared {scratch_runs} scratch run(s) "
-        f"and {scratch_execs} execution(s)."
+        f"and {scratch_dirs} code director(ies)."
         if did else "Nothing to prune."
     )
     return 0

@@ -555,6 +555,23 @@ def reason(
     verbose: bool = True,
     tools: Optional["tools_mod.ToolSet"] = None,
 ) -> Tuple[str, str, Optional[Dict[str, str]]]:
+    """_reason, with the tools it was offered closed when the call ends
+    (ToolSet.close: a reviser's or a verifier's scripts go with it)."""
+    try:
+        return _reason(ctx, system_prompt, user_prompt, role, verbose, tools)
+    finally:
+        if tools:
+            tools.close()
+
+
+def _reason(
+    ctx,
+    system_prompt: str,
+    user_prompt: str,
+    role: str,
+    verbose: bool = True,
+    tools: Optional["tools_mod.ToolSet"] = None,
+) -> Tuple[str, str, Optional[Dict[str, str]]]:
     """Stage 1: free-form reasoning. No `format`, so thinking is preserved.
 
     Returns (content, status, partial). status is "" on success, or "ceiling"
@@ -622,6 +639,9 @@ def reason(
     """
     ctx.status(role=role_label(role))
     base_system = system_prompt
+    # The tools as offered, for the fold notes of a task re-sent without
+    # them (tools itself is dropped when they close).
+    offered_tools = tools
     num_ctx = ctx.reasoning_options["num_ctx"]
     reserve = _reserve(num_ctx)
     native = bool(tools) and _native_tools(ctx)
@@ -726,13 +746,17 @@ def reason(
 
     def _task_without_tools(then: str) -> str:
         """The task as a request that offers no tools re-sends it: without
-        the tools' hints, with the results of the calls made so far, and —
+        the tools' hints, with the results of the calls made so far and
+        what they led to (ToolSet.fold_notes: the agent's files), and —
         when tools were offered in this call — a line saying they are
         closed, ending with `then`."""
         task = user_prompt
         if tool_notes:
             task += ("\n\n---\nResults of the tool calls you made:\n\n"
                      + "\n\n".join(tool_notes))
+            notes = offered_tools.fold_notes() if offered_tools else ""
+            if notes:
+                task += "\n\n---\n" + notes
         if offered:
             task += f"\n\n---\nThe tools are closed now: {then}"
         return task

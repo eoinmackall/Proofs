@@ -1,21 +1,20 @@
 """Running an agent's script: one fresh, limited process tree per call.
 
-The run_code tool (tool.py) hands a complete script here — Pi-style: the
-model writes the whole program, never a REPL session, so no state carries
-from one call to the next and the script that ran is exactly the script on
-disk. Runner.run() writes it under the user's scratch directory, runs it
-inside the inner sandbox (sandbox.py) with an environment built from
-nothing, polices it with a watchdog, and returns what happened.
+The run_code tool (tool.py) hands a complete script here, never a REPL
+session, so no state carries from one run to the next and the script that
+ran is exactly the script on disk. Runner.run() writes it as a named file
+in a role's directory (files.py), runs it inside the inner sandbox
+(sandbox.py) with an environment built from nothing, polices it with a
+watchdog, and returns what happened. A run of a file that ran before
+replaces that run's files:
 
-Each call gets a run directory, gitignored:
+    <directory>/
+        <name>.sage | <name>.py   the script, exactly as it ran
+        <name>.stdout.txt, <name>.stderr.txt   its output, cut at code.output_cap
+        <name>.run.json           the run log (below)
 
-    conjectures/NAME/scratch/<user_id>/<run_id>/
-        script.sage | script.py   the script, exactly as it ran
-        stdout.txt, stderr.txt    its output, cut at code.output_cap
-        run.json                  the run log (below)
-
-and a work/ directory beside them — the one place the script may write,
-mounted as /work — which is deleted when the run ends.
+and a .<name>.work/ directory beside them — the one place the script may
+write, mounted as /work — which is deleted when the run ends.
 
 The script contract (agents/coding.md tells the agents): the script's
 asserts encode what it checks, so exit status 0 means the claim held, and
@@ -42,6 +41,7 @@ start is the harness's error, raised as HarnessError for the operator.
 from __future__ import annotations
 
 import atexit
+import glob
 import hashlib
 import json
 import os
@@ -239,6 +239,7 @@ def _usage(root: int) -> tuple:
 @dataclass
 class RunResult:
     run_id: str
+    name: str                         # the file, in its role's directory
     language: str
     script_sha256: str
     status: str                       # "ok" or "failed"
@@ -258,7 +259,7 @@ class RunResult:
     def to_text(self) -> str:
         """The run as the model reads it."""
         lines = [
-            f"run_id: {self.run_id}",
+            f"file: {self.name}  (edit it with base=\"{self.name}\")",
             f"script id: {self.script_sha256[:8]}  (refer to it as "
             f"[code:{self.script_sha256[:8]}])",
             f"status: {self.status}" + (f" — {self.failure}" if self.failure else ""),
@@ -388,7 +389,10 @@ class Runner:
             env["TMPDIR"] = str(work_dir / ".home")
         return env
 
-    def run(self, language: str, code: str) -> RunResult:
+    def run(self, language: str, code: str, directory: Path,
+            name: str) -> RunResult:
+        """Run code as the file name in directory (files.py), replacing
+        what an earlier run of that file left there."""
         found = self.tools.get(language)
         if found is None:
             raise ValueError(
@@ -407,31 +411,36 @@ class Runner:
         sha = hashlib.sha256(data).hexdigest()
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_id = f"{stamp}-{sha[:8]}-{uuid.uuid4().hex[:4]}"
-        run_dir = self.scratch_dir / run_id
-        work_dir = run_dir / "work"
-        work_dir.mkdir(parents=True)
-        name = "script" + found.spec.extension
-        (run_dir / name).write_bytes(data)
-        (work_dir / name).write_bytes(data)
+        directory.mkdir(parents=True, exist_ok=True)
+        for old in directory.glob(glob.escape(name) + ".*"):
+            old.unlink(missing_ok=True)
+        work_dir = directory / f".{name}.work"
+        shutil.rmtree(work_dir, ignore_errors=True)
+        work_dir.mkdir()
+        filename = name + found.spec.extension
+        (directory / filename).write_bytes(data)
+        (work_dir / filename).write_bytes(data)
         if self.backend is None or self.backend.name != "bwrap":
             (work_dir / ".home").mkdir()
 
-        script_path = (self.backend.script_path(work_dir, name) if self.backend
-                       else str(work_dir / name))
+        script_path = (self.backend.script_path(work_dir, filename) if self.backend
+                       else str(work_dir / filename))
         command = found.spec.command(found.path, script_path)
         if self.backend:
             command = self.backend.wrap(work_dir, [found.prefix], command)
+        out_path = directory / f"{name}.stdout.txt"
+        err_path = directory / f"{name}.stderr.txt"
         with self._slots:
             try:
-                outcome = self._execute(command, work_dir, run_dir)
+                outcome = self._execute(command, work_dir, out_path, err_path)
             finally:
                 shutil.rmtree(work_dir, ignore_errors=True)
-        return self._finish(run_id, language, sha, found, run_dir, outcome)
+        return self._finish(run_id, name, language, sha, found,
+                            directory, outcome)
 
     def _execute(self, command: Sequence[str], work_dir: Path,
-                 run_dir: Path) -> Dict[str, Any]:
+                 out_path: Path, err_path: Path) -> Dict[str, Any]:
         lim = self.limits
-        out_path, err_path = run_dir / "stdout.txt", run_dir / "stderr.txt"
         started = time.monotonic()
         started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         kill_reason = ""
@@ -505,10 +514,11 @@ class Runner:
             "peak_tasks": peak_tasks,
         }
 
-    def _finish(self, run_id: str, language: str, sha: str,
-                found: "codetools.Found", run_dir: Path,
+    def _finish(self, run_id: str, name: str, language: str, sha: str,
+                found: "codetools.Found", directory: Path,
                 outcome: Mapping[str, Any]) -> RunResult:
-        out_path, err_path = run_dir / "stdout.txt", run_dir / "stderr.txt"
+        out_path = directory / f"{name}.stdout.txt"
+        err_path = directory / f"{name}.stderr.txt"
         rc = outcome["returncode"]
         stderr_tail = _tail(err_path)
         if self.backend and rc != 0 and not outcome["kill_reason"] and \
@@ -552,11 +562,11 @@ class Runner:
             "stdout_sha256": _sha256_file(out_path),
             "stderr_sha256": _sha256_file(err_path),
         }
-        (run_dir / "run.json").write_text(
+        (directory / f"{name}.run.json").write_text(
             json.dumps(log, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
         return RunResult(
-            run_id=run_id, language=language, script_sha256=sha,
+            run_id=run_id, name=name, language=language, script_sha256=sha,
             status=status, failure=failure, exit_code=rc, result=result,
             limit_killed=bool(outcome["kill_reason"]),
             wall_seconds=outcome["wall_seconds"],

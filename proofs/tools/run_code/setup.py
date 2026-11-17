@@ -5,6 +5,7 @@ the run_code tool each role is offered.
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import signal
 import string
@@ -186,8 +187,8 @@ def setup_code(
     code.runner = runner
     for role in ("prover", "reviser", "verifier"):
         hint = shared + ("\n\n" + sections[role] if sections.get(role) else "")
-        code.tools[role] = run_code(
-            runner, hint,
+        code.tools[role] = functools.partial(
+            run_code, runner, hint,
             on_harness_error=lambda m: ui.log(f"run_code: {m}"),
             max_rounds=code_rounds,
         )

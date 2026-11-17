@@ -11,13 +11,13 @@ suffices — and the lemma record carries the computations it cites:
     ]
 
 produced_output is the harness's record of the RESULT line, never the
-model's: the prover names the executions it relies on by their scratch id,
-and from_runs() reads each one's run.json from the run's scratch directory.
-The Merkle hash takes the field in (merkle.py).
+model's: the prover names the scripts it relies on by their script id, and
+files.Scripts.resolve() reads each one's last run log from the prover's
+directory in scratch. The Merkle hash takes the field in (merkle.py).
 
 When the lemma is committed, its scripts are copied out of scratch into the
 conjecture, content-addressed, under the user and the run that ran them, and
-each execution that produced one is recorded in the run's computations
+the execution that produced each one is recorded in the run's computations
 stream (core/streams.py):
 
     conjectures/NAME/code/<user_id>/<run_id>/<sha256>.sage | .py      committed
@@ -50,9 +50,9 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-from . import codetools
+from . import codetools, files
 from ...core import certificates, streams
 
 CODE_DIRNAME = "code"
@@ -88,58 +88,6 @@ def result_hash(result: Any) -> str:
     ).hexdigest()
 
 
-# ----------------------------------------------------------------------------
-# From the prover's run ids to entries
-# ----------------------------------------------------------------------------
-
-def from_runs(
-    scratch_dir: Path, run_ids: Iterable[Any],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Path], List[str]]:
-    """(entries, sources, problems) for the runs a prover cites.
-
-    entries are the node's code field; sources maps each script hash to the
-    run directory it came from (what store() copies, and what context()
-    reads before the commit); problems are what is wrong, as feedback the
-    prover can act on — a run id that names no run of this user, a run
-    that failed, two runs of one script that disagree."""
-    out: List[Dict[str, Any]] = []
-    sources: Dict[str, Path] = {}
-    problems: List[str] = []
-    for raw in run_ids:
-        run_id = str(raw or "").strip()
-        if not run_id or "/" in run_id or run_id.startswith("."):
-            problems.append(f"{raw!r} is not a run_id")
-            continue
-        run_dir = scratch_dir / run_id
-        try:
-            log = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            problems.append(f"{run_id} names no run of yours (no such run_id)")
-            continue
-        if log.get("status") != "ok":
-            problems.append(
-                f"{run_id} did not succeed ({log.get('failure') or 'failed'}); "
-                f"cite only runs whose status is ok"
-            )
-            continue
-        sha = str(log.get("script_sha256") or "")
-        entry = {"hash": sha, "lang": str(log.get("language") or ""),
-                 "produced_output": log.get("result")}
-        if sha in sources:
-            prior = next(e for e in out if e["hash"] == sha)
-            if result_hash(prior["produced_output"]) != result_hash(entry["produced_output"]):
-                problems.append(
-                    f"two runs of script {short(sha)} gave different "
-                    f"RESULTs; make the script deterministic (sort its "
-                    f"output, seed its randomness) and cite one run"
-                )
-            continue
-        sources[sha] = run_dir
-        out.append(entry)
-    out.sort(key=lambda e: e["hash"])
-    return out, sources, problems
-
-
 _REFERENCE_RE = re.compile(r"\[code:([^\]\s]*)\]")
 
 
@@ -168,20 +116,16 @@ def script_path(conjecture_dir: Path, entry: Mapping[str, Any]) -> Optional[Path
     return Path(hits[0]) if hits else None
 
 
-def _source_script(run_dir: Path, lang: str) -> Path:
-    return run_dir / ("script" + _extension(lang))
-
-
 def load_script(
     conjecture_dir: Path, entry: Mapping[str, Any],
     sources: Optional[Mapping[str, Path]] = None,
 ) -> Optional[str]:
     """The script's text, if the bytes on disk still hash to entry's hash:
-    from the run directory when sources has it (before the commit), else
+    from its file in scratch when sources has it (before the commit), else
     from the committed copy. None when there is no intact copy."""
     candidates: List[Path] = []
     if sources and entry["hash"] in sources:
-        candidates.append(_source_script(sources[entry["hash"]], str(entry["lang"])))
+        candidates.append(sources[entry["hash"]])
     committed = script_path(conjecture_dir, entry)
     if committed is not None:
         candidates.append(committed)
@@ -200,12 +144,10 @@ def _tool_label(conjecture_dir: Path, entry: Mapping[str, Any],
     """"sage 10.4" for the tool a run of the script used: from its run log
     before the commit, else from any execution record of it."""
     if sources and entry["hash"] in sources:
-        try:
-            log = json.loads((sources[entry["hash"]] / "run.json").read_text(encoding="utf-8"))
+        log = files.read_log(sources[entry["hash"]])
+        if log is not None:
             tool = log.get("tool") or {}
             return f"{tool.get('name', '')} {tool.get('version', '')}".strip()
-        except (OSError, ValueError):
-            pass
     for line in load_runs(conjecture_dir):
         if line.get("script_sha256") == entry["hash"]:
             tool = line.get("tool") or {}
@@ -245,24 +187,19 @@ def store(
     again. Called before the lemma is written, so the lemma is never in a
     stream without its scripts."""
     for e in entries(node):
-        run_dir = sources.get(e["hash"])
-        if run_dir is None:
+        source = sources.get(e["hash"])
+        if source is None:
             continue
         if script_path(conjecture_dir, e) is None:
             dest_dir = conjecture_dir / CODE_DIRNAME / user_id / run_id
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / (e["hash"] + _extension(e["lang"]))
-            data = _source_script(run_dir, e["lang"]).read_bytes()
-            if hashlib.sha256(data).hexdigest() != e["hash"]:
-                raise ValueError(f"{run_dir}: the script no longer matches its hash")
             tmp = dest.with_name(f"{dest.name}.{os.getpid()}.tmp")
-            tmp.write_bytes(data)
+            tmp.write_bytes(source.read_bytes())
             os.replace(tmp, dest)
-        try:
-            log = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        record_run(writer, log)
+        log = files.read_log(source)
+        if log is not None:
+            record_run(writer, log)
 
 
 # ----------------------------------------------------------------------------

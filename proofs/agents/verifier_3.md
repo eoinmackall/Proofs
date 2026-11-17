@@ -10,7 +10,7 @@ Computations and completeness:
 - Whether the cited results that the proof relies on are applied with their
   hypotheses satisfied.
 
-Accept if the proof would satisfy a careful referee.
+Accept if the proof both validates the lemma statement and would satisfy a careful referee.
 
 If you reject, remember that your "justification" is the one thing a reviser
 agent will be given to understand why the proof failed. Name every problem

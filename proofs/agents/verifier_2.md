@@ -23,7 +23,7 @@ Logical soundness:
 - Whether the conclusion of any cited reference actually matches the exact
   statement of the target lemma (not a weaker or slightly different claim).
 
-Accept if the proof would satisfy a careful referee.
+Accept if the proof both validates the lemma statement and would satisfy a careful referee.
 
 If you reject, remember that your "justification" is the one thing a reviser
 agent will be given to understand why the proof failed. Name every problem

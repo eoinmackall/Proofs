@@ -71,12 +71,12 @@ def agent_tools(
     ))
 
 
-def verifier_tools(ctx) -> Optional["tools_mod.ToolSet"]:
+def verifier_tools(ctx, agent: str = "") -> Optional["tools_mod.ToolSet"]:
     """What a verifier is offered: it is shown no lemma window, so only a
     tool that needs none — run_code, under the verifier's hint (a
     computation may justify a rejection, never an acceptance), when the run
     was given --tools; else nothing."""
-    return tools_mod.offered(ctx, tools_mod.Call(role="verifier"))
+    return tools_mod.offered(ctx, tools_mod.Call(role="verifier", agent=agent))
 
 
 def rejected_block(ctx, rejected: List[Dict[str, str]]) -> str:

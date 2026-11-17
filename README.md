@@ -420,10 +420,12 @@ with the tool results and a line saying the tools are closed.
 ### Code tools (Sage, Python)
 
 With `--tools`, the prover and the reviser may call `run_code`: they write
-one complete script, it runs in a fresh sandboxed process, and they read
-back its status, its `RESULT` line and the end of its output. There is no
-REPL: nothing carries over from one call to the next, so the script on
-disk is exactly what ran. Every script ends by printing exactly one line
+a script, it runs in a fresh sandboxed process, and they read back its
+status, its `RESULT` line and the end of its output. The harness names
+each new script (`s1`, `s2`, …), and an agent changes one by passing its
+name as `base` with a list of `{old, new}` edits — in place, or as a new
+file with `new_file`. There is no REPL: nothing carries over from one run
+to the next, so the script on disk is exactly what ran. Every script ends by printing exactly one line
 `RESULT: <json>`, and puts what it checks in `assert`s, so exit status 0
 means the claim held on what it examined (`agents/coding.md` is the full
 contract the agents are given — a shared part and one section per role;
@@ -434,11 +436,14 @@ counterexample to a step), never an acceptance.
 **Proofs that rest on a computation.** Only an exact, decidable claim may
 rest on code. The proof stays prose: it says what the script checks and
 why that settles the step, and refers to the script as `[code:<id>]`, the
-id `run_code` reported. The prover lists the runs it relies on in one more
-field of its answer, `code_runs`, by `run_id`; the loop reads each run
-back from the scratch directory, so the recorded output is the harness's,
-never the model's, and sends the proof back before any verifier sees it
-when a run is unknown, failed, or a `[code:<id>]` names no cited script.
+id `run_code` reported. The prover lists the scripts it relies on in one
+more field of its answer, `code_runs`, by that id; the loop reads each
+script's last run back from the prover's scratch directory, so the recorded
+output is the harness's, never the model's, and sends the proof back before
+any verifier sees it when a script is unknown, has changed since it ran,
+failed, or a `[code:<id>]` names no cited script. When the verifiers reject
+a proof that cited scripts, the next prover attempt is shown them again, to
+cite unchanged or edit.
 The lemma then stores the computations it cites:
 
 ```json
@@ -557,10 +562,16 @@ yet been tested on a Mac. Where neither backend can run,
 `--unsandboxed-code` runs scripts with your own permissions — only for code
 you would run yourself.
 
-Every execution is kept, gitignored, in
-`conjectures/NAME/scratch/<user_id>/<run_id>/`: the script, its stdout and
-stderr, and `run.json` (tool version and path, platform, limits, wall
-time, peak memory, exit status, `RESULT`, output hashes).
+Scripts live, gitignored, in
+`conjectures/NAME/scratch/<user_id>/<run_id>/<loop dir>/<agent>/`: each
+script beside its last run's stdout, stderr and `<name>.run.json` (tool
+version and path, platform, limits, wall time, peak memory, exit status,
+`RESULT`, output hashes). A file lives only while its text is in a context
+that can edit it: a reviser's and a verifier's go when their call ends, the
+prover keeps only the scripts its last proof cited from one attempt to the
+next, and the loop directory goes when the lemma settles (proved, out of
+attempts, or given up). A stopped loop keeps its directory; the checkpoint
+names it, so the resumed loop continues in it.
 
 #### Limits
 
@@ -862,8 +873,8 @@ with a `count`. A refutation that no longer counts is deleted once the
 lemma's current version has a valid certificate. The computations and scripts are left alone. A stream a run on this machine is
 still writing to is never rewritten: a lemma with a record in one is neither
 removed nor compacted until the next prune. Prune also clears scratch — everything except a live run's, and
-the executions an interrupted run's checkpoint still needs — and the run
-directories with nothing to resume.
+the code directories an interrupted run's checkpoint will resume in — and
+the run directories with nothing to resume.
 
 Prune reports counts, not lemma ids, since one prune can touch tens of
 thousands of lemmas: how many it removed and why, compacted, kept for a
@@ -1062,8 +1073,9 @@ proofs/
       codetools.py     # the code tools (sage, python), tools.lock, finding them on PATH
       limits.py        # code limits: defaults, the per-machine files, the memory check
       sandbox.py       # bubblewrap: the outer sandbox around proofs, the inner one per script
-      execution.py     # running one script: scratch directory, watchdog, RESULT
-      computations.py  # computations in the DAG: code_runs, code/, computations/, what verifiers see
+      execution.py     # running one script: its files, watchdog, RESULT
+      files.py         # each agent's scripts: names, edits, citing by script id, the carry-over
+      computations.py  # computations in the DAG: code/, computations/, what verifiers see
   references/
     parsing.py         # standalone references/ → references.md parser
   export/
@@ -1098,7 +1110,7 @@ conjectures/
     flake.nix, flake.lock  # optional, committed: the maintainer's code tools
     tools.lock             # committed with them: the tools and versions runs may use
     limits.json            # optional, gitignored: this machine's code limits for this conjecture
-    scratch/<user_id>/<run_id>/  # gitignored: every code execution of a run (script, output, run.json)
+    scratch/<user_id>/<run_id>/  # gitignored: the scripts of a run's live proof loops, one directory per agent
     code/<user_id>/<run_id>/       # committed: the scripts that proofs rest on, named by hash
     computations/<user_id>/<run_id>/000001.jsonl  # committed: each run's executions of them
 ```
@@ -1243,7 +1255,7 @@ Every `proofs run` is a **run** with an id of its own (16 hex digits, shown
 in the banner) and a directory, `checkpoints/<user_id>/<run_id>/`, local and
 gitignored, holding its checkpoint and a lock the running process holds.
 `proofs verify` and `proofs repair` are runs too, with a lock and no
-checkpoint; a run's code executions go to `scratch/<user_id>/<run_id>/`.
+checkpoint; a run's scripts go to `scratch/<user_id>/<run_id>/`.
 
 Ctrl-C stops the run and leaves the checkpoint. If Ctrl-C lands while an
 accepted lemma is being committed and certified, the run finishes that step

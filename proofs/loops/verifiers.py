@@ -47,7 +47,8 @@ def _run_verifier(
     """
     review, review_status, _partial = reason(
         ctx,
-        system_prompt, user_prompt, role, verbose, tools=verifier_tools(ctx),
+        system_prompt, user_prompt, role, verbose,
+        tools=verifier_tools(ctx, role),
     )
     check_mode_toggle(ctx, verbose)
     unread = verdicts.unread_verdict(role, review_status, review)
