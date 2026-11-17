@@ -123,6 +123,29 @@ _DIR_HELP = (
 )
 
 
+def _positive(text: str) -> int:
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError(f"{n} is not a positive count")
+    return n
+
+
+def _add_parallel_flag(sp: argparse.ArgumentParser) -> None:
+    """--parallel N: how many of a lemma's verifiers verify and repair run
+    at once. Not args.parallel, which setup_code reads as a parallel run's
+    loop count."""
+    sp.add_argument(
+        "--parallel", type=_positive, default=1, metavar="N",
+        dest="parallel_verifiers",
+        help=(
+            "Run up to N of a lemma's verifier checks at once (there are 3, "
+            "or 4 for a proof that rests on a computation). The first "
+            "rejection ends the check without waiting for the rest; an "
+            "acceptance needs them all. Default: 1, one after another."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="proofs",
@@ -298,6 +321,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_backend_flags(p, help_for="the verification")
+    _add_parallel_flag(p)
     p.add_argument(
         "--run-code",
         action="store_true",
@@ -338,6 +362,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_backend_flags(p, help_for="the re-verification")
+    _add_parallel_flag(p)
     flags.add_lemma_window_flags(p)
     flags.add_tool_flags(p)
     code_setup.add_code_flags(p)
@@ -591,6 +616,7 @@ def _cmd_verify(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         num_ctx=args.num_ctx,
         verbose=args.verbose,
         parser=parser,
+        parallel=args.parallel_verifiers,
     )
     if args.uncertified:
         rc = verify.verify_uncertified_entry(**common)
@@ -634,6 +660,7 @@ def _cmd_repair(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
                                conjecture=str(p.parent.parent))
     rc = repair.repair_entry(
         code=code,
+        parallel=args.parallel_verifiers,
         lemmas_all=args.lemmas_all,
         my_lemmas=args.my_lemmas,
         tool_mode=args.tool_mode,
@@ -661,6 +688,7 @@ def _cmd_repair_all(args: argparse.Namespace, parser: argparse.ArgumentParser) -
                                  conjecture=str(root))
     rc = repair.repair_all_entry(
         code=code,
+        parallel=args.parallel_verifiers,
         lemmas_all=args.lemmas_all,
         my_lemmas=args.my_lemmas,
         tool_mode=args.tool_mode,

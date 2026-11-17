@@ -4,7 +4,9 @@
 
 from __future__ import annotations
 
+import email.utils
 import json
+import random
 import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,6 +18,60 @@ from .. import tools as tools_mod
 from .json_repair import _THINK_RE, clean_json_text
 
 REQUEST_TIMEOUT = 5400       # 90 minutes: thinking models are slow, but a
+
+
+class Cancelled(Exception):
+    """The caller stopped waiting for this call (a verifier whose verdict
+    no longer matters: another one rejected the proof first). Raised in
+    place of the next request, never in the middle of one."""
+
+
+def _chat(ctx, *args: Any, **kwargs: Any) -> "llm.Reply":
+    """backend.chat, unless the calling thread has been cancelled
+    (LoopState.cancel): every request of reason() and extract() goes
+    through here, so a cancelled verifier sends no further tool round,
+    retry or compaction pass."""
+    cancel = ctx.loop.cancel
+    if cancel is not None and cancel.is_set():
+        raise Cancelled()
+    return ctx.model.backend.chat(*args, **kwargs)
+
+
+def _retry_after(e: Exception) -> Optional[float]:
+    """The seconds an HTTP error's Retry-After header asks for, or None."""
+    response = getattr(e, "response", None)
+    value = response.headers.get("Retry-After") if response is not None else None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, when.timestamp() - time.time())
+
+
+def _retry_pause(ctx, attempt: int, e: Exception, label: str,
+                 verbose: bool) -> None:
+    """Wait before retry number attempt + 1 of a request that failed in
+    transport (see RETRY_BASE_SECONDS), saying so first. A cancelled
+    verifier (LoopState.cancel) stops waiting at once: its next request
+    raises Cancelled."""
+    delay = min(RETRY_CAP_SECONDS, RETRY_BASE_SECONDS * 2 ** (attempt - 1))
+    # Jitter: verifiers refused together do not retry together.
+    delay *= random.uniform(0.75, 1.25)
+    asked = _retry_after(e)
+    if asked is not None:
+        delay = max(delay, min(asked, RETRY_AFTER_CAP_SECONDS))
+    ctx.ui.log(f"  {label}: retrying in {delay:.0f}s.", verbose)
+    cancel = ctx.loop.cancel
+    if cancel is not None:
+        cancel.wait(delay)
+    else:
+        time.sleep(delay)
 
 
 def _native_tools(ctx) -> bool:
@@ -39,6 +95,16 @@ def _disable_native_tools(ctx, why: str, verbose: bool) -> None:
 # server is back — or the run is stopped (Ctrl-C, or a parallel stop),
 # with the round kept in the checkpoint.
 SERVER_WAIT_SECONDS = 60
+
+# The pause before retrying a request that failed in transport (a refused
+# connection, a 429 or a 503, a reply that was not JSON): RETRY_BASE_SECONDS,
+# doubling with each attempt up to RETRY_CAP_SECONDS, or longer when the
+# server's Retry-After asks for it, up to RETRY_AFTER_CAP_SECONDS. Retrying
+# at once only spends the attempts on a server that is still busy, and the
+# parallel verifiers would all come back at the same moment.
+RETRY_BASE_SECONDS = 2
+RETRY_CAP_SECONDS = 60
+RETRY_AFTER_CAP_SECONDS = 300
 
 
 # Per-role reasoning temperatures, sent with every call. Every role reason()
@@ -327,8 +393,8 @@ def _compact_pass(ctx, part: str, prev: str, tail: str,
         "num_predict": _headroom(ctx, messages, ctx.extract_options["num_ctx"]),
     }
     try:
-        reply = ctx.model.backend.chat(messages, think=None, schema=None,
-                             options=options)
+        reply = _chat(ctx, messages, think=None, schema=None,
+                      options=options)
     except (requests.RequestException, ValueError, KeyError) as e:
         ctx.ui.log(f"  compaction pass {part_no}/{n_parts} transport error: {e}",
             verbose)
@@ -456,8 +522,8 @@ def _resume_compacted(
             "num_predict": room,
         }
         try:
-            reply = ctx.model.backend.chat(messages, think=True, schema=None,
-                                 options=options)
+            reply = _chat(ctx, messages, think=True, schema=None,
+                          options=options)
         except (requests.RequestException, ValueError, KeyError) as e:
             ctx.ui.log(f"  {role} continuation transport error: {e}", verbose)
             return "", _partial()
@@ -853,13 +919,14 @@ def _reason(
             if native:
                 # Always offering: a native call whose lookups are closed
                 # has been folded above, and sends no tools.
-                reply = ctx.model.backend.chat(
+                reply = _chat(
+                    ctx,
                     outgoing, think=True, schema=None, options=options,
                     tools=tools.specs(),
                 )
             else:
-                reply = ctx.model.backend.chat(messages, think=True, schema=None,
-                                     options=options)
+                reply = _chat(ctx, messages, think=True, schema=None,
+                              options=options)
         except llm.ToolsUnsupported as e:
             # The server takes no native tools: the JSON protocol from here
             # on, for this call and every later one. Not an attempt spent.
@@ -879,10 +946,14 @@ def _reason(
                 continue
             attempt += 1
             ctx.ui.log(f"  {role} transport error (attempt {attempt}): {e}", verbose)
+            if attempt < ctx.settings.llm_max_retries:
+                _retry_pause(ctx, attempt, e, role, verbose)
             continue
         except (requests.RequestException, ValueError, KeyError) as e:
             attempt += 1
             ctx.ui.log(f"  {role} transport error (attempt {attempt}): {e}", verbose)
+            if attempt < ctx.settings.llm_max_retries:
+                _retry_pause(ctx, attempt, e, role, verbose)
             continue
 
         answered = True
@@ -1070,7 +1141,8 @@ def extract(
             # think is left as None throughout: whichever server we are on,
             # this stage wants the grammar honoured, and the backend knows
             # what that costs. No new mathematics happens here.
-            reply = ctx.model.backend.chat(
+            reply = _chat(
+                ctx,
                 call_messages,
                 think=None,
                 schema=schema if use_schema else None,
@@ -1111,6 +1183,8 @@ def extract(
             return parsed
         except (requests.RequestException, KeyError, TypeError) as e:
             ctx.ui.log(f"  {role} extraction transport error (attempt {attempt}): {e}", verbose)
+            if attempt < ctx.settings.llm_max_retries:
+                _retry_pause(ctx, attempt, e, f"{role} extraction", verbose)
         except json.JSONDecodeError as e:
             ctx.ui.log(f"  {role} extraction parse error (attempt {attempt}): {e}", verbose)
             if content is not None:

@@ -24,7 +24,7 @@ from ..workspace import layout as workspace
 from ..workspace import settings as settings_mod
 from .prompts import computations_block, verifier_context
 from .reasoning import REQUEST_TIMEOUT, _recorded_model
-from .verifiers import _run_verifier, verifier_prompt
+from .verifiers import _run_verifier, fan_out, verifier_prompt
 
 # proofs verify / proofs repair: the exit code when a verifier gave no
 # verdict (the server failed, or the reply could not be read). Distinct from
@@ -292,35 +292,61 @@ def verify_stored_lemma(
     )
     steps = verifier_steps(node)
     ctx.status(lemma=lemma_id, attempt="")
-    for step, agent in enumerate(steps, 1):
-        role = role_of(agent)
-        decision, justification = _run_verifier(
-            ctx,
-            role, verifier_prompt(ctx, verifier_sys, agent), verifier_user, verbose,
+    prompts = {agent: verifier_prompt(ctx, verifier_sys, agent) for agent in steps}
+
+    def run_step(step_ctx, agent: str) -> Tuple[str, str]:
+        return _run_verifier(
+            step_ctx, role_of(agent), prompts[agent], verifier_user, verbose,
         )
-        ctx.ui.log(
-            f"Verifier {step}/{len(steps)} ({role}): "
-            f"{decision.upper() or '???'} — {justification}",
-            verbose,
-        )
-        kind = verdicts.record_kind(decision)
-        if kind == verdicts.REFUTATION:
-            path = refutations.record(
-                ctx.paths.conjecture_root, lemma_id, h, ctx.user,
-                _recorded_model(ctx), "reject", justification, node["file"],
-            )
-            ctx.run.dag = ctx.dag.with_refutation(path, refutations.load(path))
-            ctx.ui.log(f"Refutation for {lemma_id} written: {path}", verbose)
-            ctx.status(event=f"verifier {step}/{len(steps)} rejected")
-            return "rejected", justification
-        if kind == verdicts.NOTHING:
+
+    # --parallel: the verifiers run at once. The first rejection settles
+    # it, as the first one does in step order, and the rest are not waited
+    # for; a missing verdict starts no further verifier but waits for the
+    # running ones, since a rejection among them is a verdict to record.
+    missing: Optional[Tuple[int, str, str]] = None
+    with fan_out(ctx, steps, run_step, ctx.settings.parallel_verifiers) as results:
+        if results.parallel:
+            ctx.status(role=f"{results.workers} verifiers")
             ctx.ui.log(
-                f"No verdict on {lemma_id} from {role}; no refutation is "
-                f"written and nothing is certified. Re-run once the server "
-                f"is answering.",
+                f"Running {len(steps)} verifier checks on {lemma_id}, "
+                f"{results.workers} at a time.",
                 verbose,
             )
-            return "no_verdict", justification
+        for agent, (decision, justification) in results:
+            step, role = steps.index(agent) + 1, role_of(agent)
+            ctx.ui.log(
+                f"Verifier {step}/{len(steps)} ({role}): "
+                f"{decision.upper() or '???'} — {justification}",
+                verbose,
+            )
+            kind = verdicts.record_kind(decision)
+            if kind == verdicts.REFUTATION:
+                rest = results.abandoned()
+                if rest:
+                    ctx.ui.log(
+                        f"Not waiting for {', '.join(role_of(a) for a in rest)}.",
+                        verbose,
+                    )
+                path = refutations.record(
+                    ctx.paths.conjecture_root, lemma_id, h, ctx.user,
+                    _recorded_model(ctx), "reject", justification, node["file"],
+                )
+                ctx.run.dag = ctx.dag.with_refutation(path, refutations.load(path))
+                ctx.ui.log(f"Refutation for {lemma_id} written: {path}", verbose)
+                ctx.status(event=f"verifier {step}/{len(steps)} rejected")
+                return "rejected", justification
+            if kind == verdicts.NOTHING and missing is None:
+                missing = (step, role, justification)
+                results.drain()
+    if missing is not None:
+        _step, role, justification = missing
+        ctx.ui.log(
+            f"No verdict on {lemma_id} from {role}; no refutation is "
+            f"written and nothing is certified. Re-run once the server "
+            f"is answering.",
+            verbose,
+        )
+        return "no_verdict", justification
     try:
         line = certificates.record(
             writer(ctx, certificates.DIR_NAME), lemma_id, h, ctx.user,
@@ -373,6 +399,7 @@ def _verify_session(
     num_ctx: Optional[int],
     verbose: bool,
     parser: argparse.ArgumentParser,
+    parallel: int = 1,
 ) -> None:
     """The shared setup of proofs verify and proofs repair: the backend
     and the conjecture's paths, the run's, minus the run's — no
@@ -384,7 +411,8 @@ def _verify_session(
     of record in any certificate issued and any refutation written.
 
     The certificates and refutations this session writes name the model
-    _recorded_model() reports, not the --model request.
+    _recorded_model() reports, not the --model request. parallel is
+    --parallel: how many of a lemma's verifiers run at once.
     """
     try:
         ctx.settings = settings_mod.resolve(
@@ -392,6 +420,7 @@ def _verify_session(
         )
     except settings_mod.SettingsError as e:
         parser.error(str(e))
+    ctx.settings.parallel_verifiers = parallel
     ctx.model.name = model
     try:
         connection = llm.connect(
@@ -428,6 +457,7 @@ def verify_entry(
     parser: argparse.ArgumentParser,
     run_code: bool = False,
     code: Optional[Code] = None,
+    parallel: int = 1,
 ) -> int:
     """proofs verify NAME LEMMA_ID [--full]: the three verifier checks on
     the stored proof of a lemma that is already in the DAG, with the
@@ -444,6 +474,8 @@ def verify_entry(
 
     run_code (--run-code, which needs --tools) re-executes each lemma's
     scripts before its verifiers read it (_reexecute), asking first.
+    parallel (--parallel) runs up to that many of a lemma's verifiers at
+    once; the first rejection ends its check.
     """
     ctx = Context(user=user_id, code=code if code is not None else Code())
     ctx.code.run_code = run_code
@@ -451,7 +483,7 @@ def verify_entry(
         ctx,
         conjecture_dir=root, user_id=user_id, model=model, host=host,
         api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
-        verbose=verbose, parser=parser,
+        verbose=verbose, parser=parser, parallel=parallel,
     )
     dag = ctx.dag
     if lemma_id not in dag.lemmas:
@@ -518,6 +550,7 @@ def verify_uncertified_entry(
     verbose: bool,
     parser: argparse.ArgumentParser,
     code: Optional[Code] = None,
+    parallel: int = 1,
 ) -> int:
     """proofs verify NAME --uncertified: bring back, from the roots up,
     every suspended lemma that only a verification stands between and the
@@ -545,7 +578,7 @@ def verify_uncertified_entry(
         ctx,
         conjecture_dir=root, user_id=user_id, model=model, host=host,
         api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
-        verbose=verbose, parser=parser,
+        verbose=verbose, parser=parser, parallel=parallel,
     )
     name = Path(ctx.paths.conjecture_root).name
     kinds = suspension_kinds(ctx.dag)

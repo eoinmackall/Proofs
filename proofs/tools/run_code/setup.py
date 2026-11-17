@@ -105,6 +105,9 @@ def setup_code(
     if args.tools is None:
         return code
     parallel = getattr(args, "parallel", None)
+    # proofs verify / repair --parallel: a slot for each verifier that may
+    # run a script at the same time as another (at most the four steps).
+    verifiers = min(max(1, getattr(args, "parallel_verifiers", 1)), 4)
     try:
         user = config.ensure_user_id()
         paths = workspace.resolve(conjecture or args.conjecture, user, root)
@@ -160,8 +163,10 @@ def setup_code(
     # The machine-wide job slots: one per loop that may run code, at most
     # code.jobs across every proofs process on this machine. A serial run
     # (or verify, or repair) needs its one; a parallel run takes what it
-    # can, and its other loops run without code.
-    wanted = max(1, parallel) if parallel is not None else 1
+    # can, and its other loops run without code. Parallel verifiers take
+    # what they can too, at least one: with fewer slots than verifiers,
+    # their scripts wait their turn (Runner's semaphore).
+    wanted = max(1, parallel) if parallel is not None else verifiers
     try:
         code.loops = execution.acquire_slots(lim.jobs, wanted)
     except OSError as e:
@@ -175,6 +180,7 @@ def setup_code(
     runner = execution.Runner(
         found, lim, lock.policy,
         paths.root / workspace.SCRATCH_DIRNAME / user, user, backend,
+        slots=code.loops,
     )
     text = string.Template(load_file(str(paths.prompts["coding.md"]))).safe_substitute(
         languages=", ".join(runner.languages),
@@ -197,6 +203,11 @@ def setup_code(
     if parallel is not None:
         tools_desc += (f"; {code.loops} of {max(1, parallel)} loop(s) may "
                        f"run code")
+    elif verifiers > 1:
+        tools_desc += (f"; {code.loops} script(s) at once across "
+                       f"{verifiers} parallel verifiers"
+                       + (f" (the slots free of code.jobs = {lim.jobs} on "
+                          f"this machine)" if code.loops < verifiers else ""))
     ui.log(
         f"code tools: {tools_desc} "
         f"({'sandboxed: ' + backend.name if backend else 'UNSANDBOXED'}; {lim.timeout} s, "

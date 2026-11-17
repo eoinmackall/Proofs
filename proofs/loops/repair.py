@@ -424,14 +424,14 @@ def _session(
     ctx, *, root: Path, user_id: str, model: str, host: Optional[str],
     api_key: Optional[str], backend: str, num_ctx: Optional[int],
     verbose: bool, parser: argparse.ArgumentParser, lemmas_all: int,
-    my_lemmas: int, tool_mode: str, lemmas_common: int,
+    my_lemmas: int, tool_mode: str, lemmas_common: int, parallel: int = 1,
 ) -> None:
     """The verify session, with the re-proof's lemma window and tool mode."""
     _verify_session(
         ctx,
         conjecture_dir=str(root), user_id=user_id, model=model, host=host,
         api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
-        verbose=verbose, parser=parser,
+        verbose=verbose, parser=parser, parallel=parallel,
     )
     ctx.settings.lemmas_all, ctx.settings.my_lemmas = lemmas_all, my_lemmas
     ctx.settings.lemmas_common = lemmas_common
@@ -454,6 +454,7 @@ def repair_entry(
     tool_mode: str = DEFAULT_TOOL_MODE,
     lemmas_common: int = DEFAULT_LEMMAS_COMMON,
     code: Optional[Code] = None,
+    parallel: int = 1,
 ) -> int:
     """proofs repair path_to_refutation (see refutations.py,
     repair_entry()): the refutation file supplies the lemma's id, so
@@ -501,6 +502,10 @@ def repair_entry(
     can be re-run; on a dependent, the named lemma's refutation is already
     dismissed, so the log counts the dependents still to check and points
     to proofs verify --uncertified.
+
+    parallel (--parallel) runs up to that many of a lemma's verifiers at
+    once — in the re-verifications and in the re-proof's rounds — and the
+    first rejection ends the check.
     """
     ctx = Context(user=user_id, code=code if code is not None else Code())
     # Resolved first, as cli/main.py resolves PATH: the conjecture root is the
@@ -532,7 +537,7 @@ def repair_entry(
         ctx, root=root, user_id=user_id, model=model, host=host,
         api_key=api_key, backend=backend, num_ctx=num_ctx, verbose=verbose,
         parser=parser, lemmas_all=lemmas_all, my_lemmas=my_lemmas,
-        tool_mode=tool_mode, lemmas_common=lemmas_common,
+        tool_mode=tool_mode, lemmas_common=lemmas_common, parallel=parallel,
     )
     dag = ctx.dag
     if lemma_id not in dag.lemmas:
@@ -584,6 +589,7 @@ def repair_all_entry(
     tool_mode: str = DEFAULT_TOOL_MODE,
     lemmas_common: int = DEFAULT_LEMMAS_COMMON,
     code: Optional[Code] = None,
+    parallel: int = 1,
 ) -> int:
     """proofs repair --all DIR: repair every lemma a refutation counts
     against, each the way proofs repair repairs the one its file names,
@@ -608,13 +614,17 @@ def repair_all_entry(
     list of ids. Returns 0 when nothing failed, 1 when a lemma could not
     be re-proved or was refused, EXIT_NO_VERDICT on a missing verdict, 130
     on Ctrl-C.
+
+    parallel (--parallel) runs up to that many of a lemma's verifiers at
+    once, as in proofs repair; the lemmas themselves are repaired one at a
+    time.
     """
     ctx = Context(user=user_id, code=code if code is not None else Code())
     _session(
         ctx, root=Path(root), user_id=user_id, model=model, host=host,
         api_key=api_key, backend=backend, num_ctx=num_ctx, verbose=verbose,
         parser=parser, lemmas_all=lemmas_all, my_lemmas=my_lemmas,
-        tool_mode=tool_mode, lemmas_common=lemmas_common,
+        tool_mode=tool_mode, lemmas_common=lemmas_common, parallel=parallel,
     )
     name = Path(ctx.paths.conjecture_root).name
     dag = ctx.dag

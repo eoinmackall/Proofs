@@ -348,6 +348,7 @@ class Runner:
         user_id: str,
         backend: Optional["sandbox.Backend"],
         log: Callable[[str], None] = lambda _m: None,
+        slots: Optional[int] = None,
     ):
         # Keyed by language, the name an agent passes to run_code.
         self.tools = {f.spec.language: f for f in tools.values()}
@@ -357,7 +358,11 @@ class Runner:
         self.user_id = user_id
         self.backend = backend        # None: unsandboxed (--unsandboxed-code)
         self.log = log
-        self._slots = threading.BoundedSemaphore(limits.jobs)
+        # At most this many scripts at once: the machine-wide slots the
+        # process holds (setup_code), so a loop's verifiers running in
+        # parallel queue for its one slot rather than overcommit it.
+        self._slots = threading.BoundedSemaphore(
+            max(1, slots if slots is not None else limits.jobs))
 
     @property
     def languages(self) -> List[str]:

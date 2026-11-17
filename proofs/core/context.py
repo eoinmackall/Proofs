@@ -173,6 +173,10 @@ class LoopState:
     # _fit_prompt's override of the lemma window's three sizes while it
     # rebuilds a prompt too large for the context window.
     window_override: Optional[Tuple[int, int, int]] = None
+    # Set (a threading.Event) on a verifier thread of a parallel
+    # verification (loops/verifiers.py, fan_out): once it fires, the
+    # thread's next model request raises reasoning.Cancelled instead.
+    cancel: Any = None
 
 
 @dataclass

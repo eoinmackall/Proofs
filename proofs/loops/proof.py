@@ -28,7 +28,7 @@ from .reasoning import (
     _wait_for_server, extract,
 )
 from .schemas import REVISER_SCHEMA
-from .verifiers import _run_verifier, verifier_prompt
+from .verifiers import _run_verifier, fan_out, stopping, verifier_prompt
 
 
 def _parse_reviser_decision(ctx, revision_text: str, verbose: bool) -> Dict[str, Any]:
@@ -869,54 +869,104 @@ def _proof_loop(
             )
         in_flight_state["verdicts"] = kept
         saved_verdicts = {v["agent"]: v for v in kept}
+        # A saved rejection (or missing verdict) settles the round as it
+        # did when it came in; any other saved verdict stands in for its
+        # verifier, and the rest run.
+        missing: Optional[Tuple[int, str]] = None
         for step, agent in enumerate(steps, 1):
-            role = role_of(agent)
             prior = saved_verdicts.get(agent)
-            if prior is not None:
-                decision, justification = prior["decision"], prior["justification"]
-                ctx.ui.log(
-                    f"Verifier {step}/{len(steps)} ({role}): "
-                    f"{decision.upper() or '???'} (saved) — {justification}",
-                    verbose,
-                )
-            # An unreachable server is waited out and the same step
-            # retried: the proof is not at fault, and keeping it saves
-            # re-running the prover.
-            while prior is None:
+            if prior is None:
+                continue
+            decision, justification = prior["decision"], prior["justification"]
+            ctx.ui.log(
+                f"Verifier {step}/{len(steps)} ({role_of(agent)}): "
+                f"{decision.upper() or '???'} (saved) — {justification}",
+                verbose,
+            )
+            if decision == verdicts.REJECT and reject_just is None:
+                reject_just = justification
+                ctx.status(event=f"verifier {step}/{len(steps)} rejected")
+            elif decision != verdicts.ACCEPT and missing is None:
+                missing = (step, justification)
+        to_run = [] if reject_just is not None or missing is not None else [
+            agent for agent in steps if agent not in saved_verdicts
+        ]
+        prompts = {agent: verifier_prompt(ctx, verifier_sys, agent)
+                   for agent in to_run}
+
+        def run_step(step_ctx, agent: str) -> Optional[Tuple[str, str]]:
+            """One verifier, the server's outages waited out: its verdict,
+            or None when should_stop fired while waiting. An unreachable
+            server is waited out and the same step retried: the proof is
+            not at fault, and keeping it saves re-running the prover."""
+            step, role = steps.index(agent) + 1, role_of(agent)
+            while True:
                 decision, justification = _run_verifier(
-                    ctx,
-                    role, verifier_prompt(ctx, verifier_sys, agent), verifier_user,
+                    step_ctx, role, prompts[agent], verifier_user, verbose,
+                )
+                if decision != verdicts.UNAVAILABLE:
+                    return decision, justification
+                step_ctx.ui.log(
+                    f"Verifier {step}/{len(steps)} ({role}): "
+                    f"{decision.upper()} — {justification}",
                     verbose,
                 )
+                if not _wait_for_server(
+                    step_ctx, role,
+                    lambda: stopping(step_ctx) or (
+                        should_stop is not None and should_stop()),
+                    verbose,
+                ):
+                    return None
+
+        # Parallel verifiers (ctx.settings.parallel_verifiers): the first
+        # rejection settles the round, as the first one does in step
+        # order, and the rest are not waited for; a missing verdict starts
+        # no further verifier but waits for the running ones, since a
+        # rejection among them is the better reason to give the reviser.
+        with fan_out(ctx, to_run, run_step, ctx.settings.parallel_verifiers) as results:
+            if results.parallel:
+                ctx.status(role=f"{results.workers} verifiers")
+            for agent, outcome in results:
+                if outcome is None:
+                    stopped = True
+                    break
+                decision, justification = outcome
+                step = steps.index(agent) + 1
                 ctx.ui.log(
-                    f"Verifier {step}/{len(steps)} ({role}): "
+                    f"Verifier {step}/{len(steps)} ({role_of(agent)}): "
                     f"{decision.upper() or '???'} — {justification}",
                     verbose,
                 )
-                if decision != verdicts.UNAVAILABLE:
-                    # Checkpoint: the verdict, as soon as it is in.
-                    in_flight_state["verdicts"].append({
-                        "agent": agent,
-                        "decision": decision,
-                        "justification": justification,
-                        "model": _recorded_model(ctx),
-                        "requested": ctx.model.name,
-                        "hash": verified_hash,
-                    })
-                    if decision != verdicts.ACCEPT:
-                        in_flight_state["stage"] = "revise"
-                    on_round(in_flight_state)
+                # Checkpoint: the verdict, as soon as it is in.
+                in_flight_state["verdicts"].append({
+                    "agent": agent,
+                    "decision": decision,
+                    "justification": justification,
+                    "model": _recorded_model(ctx),
+                    "requested": ctx.model.name,
+                    "hash": verified_hash,
+                })
+                if decision != verdicts.ACCEPT:
+                    in_flight_state["stage"] = "revise"
+                on_round(in_flight_state)
+                if decision == verdicts.REJECT:
+                    rest = results.abandoned()
+                    if rest:
+                        ctx.ui.log(
+                            f"Not waiting for "
+                            f"{', '.join(role_of(a) for a in rest)}.",
+                            verbose,
+                        )
+                    ctx.status(event=f"verifier {step}/{len(steps)} rejected")
+                    reject_just = justification
                     break
-                if not _wait_for_server(ctx, role, should_stop, verbose):
-                    stopped = True
-                    break
-            if stopped:
-                break
-            if decision != verdicts.ACCEPT:
-                ctx.status(event=f"verifier {step}/{len(steps)} "
-                                 f"{'rejected' if decision else 'gave no verdict'}")
-                reject_just = justification
-                break
+                if decision != verdicts.ACCEPT and missing is None:
+                    missing = (step, justification)
+                    results.drain()
+        if reject_just is None and missing is not None and not stopped:
+            step, reject_just = missing
+            ctx.status(event=f"verifier {step}/{len(steps)} gave no verdict")
         if stopped:
             # The top of the loop returns the published round as stopped.
             continue

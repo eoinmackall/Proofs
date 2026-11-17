@@ -103,6 +103,9 @@ class Settings:
     tool_mode: str = DEFAULT_TOOL_MODE
     # The context window in tokens: the probed server's, or --num-ctx.
     num_ctx: int = DEFAULT_NUM_CTX
+    # How many of a proof's verifiers run at once (proofs verify and
+    # proofs repair --parallel); 1 runs them one after another.
+    parallel_verifiers: int = 1
 
     def unlimited_iterations(self) -> bool:
         return self.max_iterations < 0
