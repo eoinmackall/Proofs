@@ -80,11 +80,9 @@ FIELDS: Dict[str, str] = {
 
 # The defaults of the settings that are flags only (proofs run, proofs
 # repair): how the lemma window is chosen (loops/strategies.py) and its
-# sizes (-1 is no limit), how agents call tools, and the context window
+# size (-1 is no limit), how agents call tools, and the context window
 # used when nothing is probed.
-DEFAULT_LEMMAS_ALL = 25
-DEFAULT_MY_LEMMAS = 25
-DEFAULT_WINDOW_SIZE = 50
+DEFAULT_WINDOW_SIZE = 30
 # The window's strategies; the two that take a dial (random's beta,
 # depth's jitter), a number from 0 to 1, after a comma: random,0.5.
 STRATEGIES = ("recent", "random", "depth", "breadth", "relevance", "popular")
@@ -110,12 +108,12 @@ class Settings:
     llm_max_retries: int = DEFAULTS["llm.max_retries"]
     max_compaction_passes: int = DEFAULTS["llm.max_compaction_passes"]
     # The lemma window (loops/strategies.py): the strategy and its dial,
-    # recent's two sizes, and every other strategy's one.
+    # its size, and recent's two sizes, None for half the window each.
     strategy: str = DEFAULT_STRATEGY[0]
     strategy_dial: float = DEFAULT_STRATEGY[1]
-    lemmas_all: int = DEFAULT_LEMMAS_ALL
-    my_lemmas: int = DEFAULT_MY_LEMMAS
     window_size: int = DEFAULT_WINDOW_SIZE
+    lemmas_all: Optional[int] = None
+    my_lemmas: Optional[int] = None
     # How agents call tools: "auto" or "json" (see --tool-mode).
     tool_mode: str = DEFAULT_TOOL_MODE
     # The context window in tokens: the probed server's, or --num-ctx.

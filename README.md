@@ -374,9 +374,9 @@ server options.
 | `--max-rejected-lemmas N` | `run.max_rejected_lemmas`, 4 | How many of the most recently rejected lemmas — ones that went through every prover round without being proved — the planning agents are shown, by statement only. `0` shows none. |
 | `--max-loop-restarts`, `--max-tool-rounds`, `--max-code-rounds`, `--max-lookup`, `--max-search`, `--max-retries`, `--max-compaction-passes` | see [Settings](#settings) | Override one setting for this run; `-1` for no limit. All but `--max-loop-restarts` are also taken by `proofs repair` and `proofs verify` (which does not take `--max-proof-attempts`). |
 | `--strategy NAME[,DIAL]` | `recent` | Which proved lemmas the agents see in full: `recent`, `random,BETA`, `depth,JITTER`, `breadth`, `relevance` or `popular`. See [The lemma window and tools](#the-lemma-window-and-tools). Also taken by `proofs repair`. |
-| `--window-size N` | 50 | How many lemmas every strategy but `recent` shows. `-1` shows all. Also taken by `proofs repair`. |
-| `--lemmas-all N` | 25 | `--strategy recent`: how many of the most recently proved lemmas (anyone's) the agents see. `-1` shows all. Also taken by `proofs repair`. |
-| `--my-lemmas N` | 25 | `--strategy recent`: how many of your own most recently proved lemmas the agents also see, overlap with `--lemmas-all` shown once. `-1` shows all. Also taken by `proofs repair`. |
+| `--window-size N` | 30 | How many lemmas the window shows; `recent` shows at most ⌊N/2⌋ from each of `--lemmas-all` and `--my-lemmas`. `-1` shows all. Also taken by `proofs repair`. |
+| `--lemmas-all N` | ⌊`--window-size`/2⌋ | `--strategy recent`: how many of the most recently proved lemmas (anyone's) the agents see. `-1` shows all. Also taken by `proofs repair`. |
+| `--my-lemmas N` | ⌊`--window-size`/2⌋ | `--strategy recent`: how many of your own most recently proved lemmas the agents also see, overlap with `--lemmas-all` shown once. `-1` shows all. Also taken by `proofs repair`. |
 | `--tool-mode {auto,json}` | `auto` | How agents call tools such as `search_lemmas`. `auto` uses the server's native tool calling and falls back to a JSON protocol the first time the server refuses it (llama-server needs `--jinja` for native calls); `json` uses the protocol from the start. Also taken by `proofs repair`. |
 | `--tools LIST` | off | Let the prover and the reviser run code: a comma-separated list of tools the conjecture's `tools.lock` declares (`sage`, `python`), or `all`. The whole run is then sandboxed. See [Code tools](#code-tools-sage-python); with `--parallel`, see [Coding loops](#coding-loops). |
 | `--code-timeout`, `--code-memory`, `--code-jobs`, `--code-threads`, `--code-max-tasks`, `--code-output-cap`, `--code-reserve-memory` | see `proofs limits` | Override one [code limit](#limits) for this run. |
@@ -401,14 +401,14 @@ built on it yet.
 
 | Strategy | Shows |
 |---|---|
-| `recent` (default) | the `--lemmas-all` most recently proved lemmas (anyone's) and the `--my-lemmas` most recently proved of your own, overlap shown once; recency is the `proved_at` stamp a lemma gets when it is committed or re-proved |
+| `recent` (default) | the `--lemmas-all` most recently proved lemmas (anyone's) and the `--my-lemmas` most recently proved of your own, half of `--window-size` (rounded down) each unless given, overlap shown once; recency is the `proved_at` stamp a lemma gets when it is committed or re-proved |
 | `random,BETA` | a sample weighted by depth, weight (depth + 1)^(β/(1−β)): β = 0 (the default) is uniform, β = 1 the deepest lemmas |
 | `depth,JITTER` | sinks by depth, the same weights with the dial reversed: jitter 0 (the default) is the deepest sinks, jitter 1 any sink, uniformly |
 | `breadth` | sinks whose ancestries (every lemma they rest on) overlap least, estimated with MinHash sketches: from the deepest sink, each next the one least like all those chosen; at most half of them sinks citing nothing |
 | `relevance` | what the search index finds for the agent's task: the lemma being proved (prover, reviser), the latest plan (planner), the conjecture before the first plan |
 | `popular` | the lemmas the most unsuspended lemmas cite |
 
-Every strategy but `recent` shows `--window-size` lemmas; ties go to the
+Every other strategy shows `--window-size` lemmas; ties go to the
 more recent. The lemmas are chosen when the planner starts and held until
 it next starts: the parallel lemma generator, and in a serial run the prover
 and the reviser, are shown the planner's choice. In a parallel run each

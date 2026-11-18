@@ -21,8 +21,7 @@ from ..core.interrupts import (
 )
 from ..validity import verdicts
 from ..workspace.settings import (
-    DEFAULT_LEMMAS_ALL, DEFAULT_MY_LEMMAS, DEFAULT_STRATEGY, DEFAULT_WINDOW_SIZE,
-    DEFAULT_TOOL_MODE,
+    DEFAULT_STRATEGY, DEFAULT_TOOL_MODE, DEFAULT_WINDOW_SIZE,
 )
 from .prompts import _build_reference_blocks
 from .proof import run_proof_loop
@@ -425,8 +424,8 @@ def _guarded(ctx, verbose: bool, body) -> int:
 def _session(
     ctx, *, root: Path, user_id: str, model: str, host: Optional[str],
     api_key: Optional[str], backend: str, num_ctx: Optional[int],
-    verbose: bool, parser: argparse.ArgumentParser, lemmas_all: int,
-    my_lemmas: int, tool_mode: str, strategy: Tuple[str, float],
+    verbose: bool, parser: argparse.ArgumentParser, lemmas_all: Optional[int],
+    my_lemmas: Optional[int], tool_mode: str, strategy: Tuple[str, float],
     window_size: int, parallel: int = 1,
     settings_flags: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -455,8 +454,8 @@ def repair_entry(
     num_ctx: Optional[int],
     verbose: bool,
     parser: argparse.ArgumentParser,
-    lemmas_all: int = DEFAULT_LEMMAS_ALL,
-    my_lemmas: int = DEFAULT_MY_LEMMAS,
+    lemmas_all: Optional[int] = None,
+    my_lemmas: Optional[int] = None,
     tool_mode: str = DEFAULT_TOOL_MODE,
     strategy: Tuple[str, float] = DEFAULT_STRATEGY,
     window_size: int = DEFAULT_WINDOW_SIZE,
@@ -594,8 +593,8 @@ def repair_all_entry(
     num_ctx: Optional[int],
     verbose: bool,
     parser: argparse.ArgumentParser,
-    lemmas_all: int = DEFAULT_LEMMAS_ALL,
-    my_lemmas: int = DEFAULT_MY_LEMMAS,
+    lemmas_all: Optional[int] = None,
+    my_lemmas: Optional[int] = None,
     tool_mode: str = DEFAULT_TOOL_MODE,
     strategy: Tuple[str, float] = DEFAULT_STRATEGY,
     window_size: int = DEFAULT_WINDOW_SIZE,

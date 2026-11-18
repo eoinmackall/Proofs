@@ -3,7 +3,8 @@ full (--strategy). Every other proved lemma is found with the tools
 (search_lemmas, lookup_lemmas); the prompt says only how many there are.
 
     recent      the --lemmas-all newest lemmas, anyone's, and the
-                --my-lemmas newest of the current user's own
+                --my-lemmas newest of the current user's own: half of
+                --window-size (rounded down) each unless they are given
     random      a sample of the lemmas, weighted by depth (the longest
                 citation chain beneath a lemma): weight (depth + 1) to the
                 power beta / (1 - beta), so beta 0 is uniform and beta 1
@@ -23,7 +24,7 @@ full (--strategy). Every other proved lemma is found with the tools
                 before there is one
     popular     the lemmas the most unsuspended lemmas cite
 
-Every strategy but recent shows --window-size lemmas; ties are broken by
+Every other strategy shows --window-size lemmas; ties are broken by
 recency (proved_at, then id). Suspended lemmas are never chosen.
 
 A window is chosen when a planning agent starts (for_planner): the parallel
@@ -144,16 +145,19 @@ def choose(ctx, dag: Any, suspended: Collection[str], query: str) -> Window:
     name, dial = ctx.settings.strategy, ctx.settings.strategy_dial
     lemmas = dag.lemmas
     eligible = [lid for lid in lemmas if lid not in suspended]
-    n = ctx.settings.window_size
-    n = len(eligible) if n < 0 else min(n, len(eligible))
+    size = ctx.settings.window_size
+    n = len(eligible) if size < 0 else min(size, len(eligible))
 
     def newest(lid: str) -> Tuple[str, str]:
         return (str(lemmas[lid].get("proved_at") or ""), lid)
 
     if name == "recent":
+        half = -1 if size < 0 else size // 2
+        n_all, n_mine = (half if k is None else k
+                         for k in (ctx.settings.lemmas_all, ctx.settings.my_lemmas))
         mine = [lid for lid in eligible if owner_of(lid) == ctx.user]
-        return Window((tuple(_top(eligible, ctx.settings.lemmas_all, newest)),
-                       tuple(_top(mine, ctx.settings.my_lemmas, newest))))
+        return Window((tuple(_top(eligible, n_all, newest)),
+                       tuple(_top(mine, n_mine, newest))))
     if name == "random":
         return Window((tuple(_sample(eligible, n, _exponent(dial), dag.depths(), newest)),))
     if name == "depth":

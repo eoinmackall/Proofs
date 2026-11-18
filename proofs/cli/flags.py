@@ -10,8 +10,7 @@ from typing import Iterable
 
 from ..workspace import settings as settings_mod
 from ..workspace.settings import (
-    DEFAULT_LEMMAS_ALL, DEFAULT_MY_LEMMAS, DEFAULT_NUM_CTX, DEFAULT_TOOL_MODE,
-    DEFAULT_WINDOW_SIZE,
+    DEFAULT_NUM_CTX, DEFAULT_TOOL_MODE, DEFAULT_WINDOW_SIZE,
 )
 
 # What each settings flag sets (workspace/settings.py), before its default.
@@ -133,7 +132,8 @@ def add_lemma_window_flags(parser: argparse.ArgumentParser) -> None:
         help=(
             "Which proved lemmas the agents are shown in full; the rest are "
             "found with the search_lemmas tool. recent (default): the "
-            "--lemmas-all newest lemmas and your --my-lemmas newest. "
+            "--lemmas-all newest lemmas and your --my-lemmas newest, half "
+            "of --window-size each by default. "
             "random,BETA: a sample weighted toward deep lemmas, BETA from 0 "
             "(uniform) to 1 (the deepest). depth,JITTER: lemmas nothing "
             "cites yet with the longest citation chains beneath them, "
@@ -142,7 +142,7 @@ def add_lemma_window_flags(parser: argparse.ArgumentParser) -> None:
             "least. relevance: the lemmas a search finds for the agent's "
             "task (the lemma being proved; the conjecture, or the latest "
             "plan, for the planner). popular: the most cited lemmas. "
-            "Every strategy but recent shows --window-size lemmas. The "
+            "Every other strategy shows --window-size lemmas. The "
             "lemmas are chosen when the planner starts and, in a parallel "
             "run or a repair, when a prover starts."
         ),
@@ -151,22 +151,25 @@ def add_lemma_window_flags(parser: argparse.ArgumentParser) -> None:
         "--window-size", type=_window_size, default=DEFAULT_WINDOW_SIZE,
         metavar="N",
         help=(
-            "How many lemmas every strategy but recent shows (default: "
-            f"{DEFAULT_WINDOW_SIZE}; -1 for all)."
+            "How many lemmas the window shows (default: "
+            f"{DEFAULT_WINDOW_SIZE}; -1 for all); recent shows at most half "
+            "of it, rounded down, from each of --lemmas-all and --my-lemmas."
         ),
     )
     parser.add_argument(
-        "--lemmas-all", type=_window_size, default=DEFAULT_LEMMAS_ALL, metavar="N",
+        "--lemmas-all", type=_window_size, default=None, metavar="N",
         help=(
             "--strategy recent: show the N most recently proved lemmas, "
-            f"anyone's (default: {DEFAULT_LEMMAS_ALL}; -1 for all)."
+            "anyone's (default: half of --window-size, rounded down; -1 "
+            "for all)."
         ),
     )
     parser.add_argument(
-        "--my-lemmas", type=_window_size, default=DEFAULT_MY_LEMMAS, metavar="N",
+        "--my-lemmas", type=_window_size, default=None, metavar="N",
         help=(
             "--strategy recent: also show the N most recently proved of "
-            f"your own lemmas (default: {DEFAULT_MY_LEMMAS}; -1 for all). "
+            "your own lemmas (default: half of --window-size, rounded "
+            "down; -1 for all). "
             "Overlap with --lemmas-all is shown once."
         ),
     )
