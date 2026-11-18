@@ -3,9 +3,8 @@ the workspace's .proofs-local.json.
 
 A setting is resolved key by key, the first of these that sets it winning:
 
-    flags                               this command only (--max-iterations,
-                                        --max-proof-attempts,
-                                        --max-rejected-lemmas)
+    flags                               this command only (FLAGS names
+                                        each key's; cli/flags.py adds them)
     <workspace>/.proofs-local.json      this machine
     DEFAULTS                            built in
 
@@ -24,22 +23,28 @@ the start. The keys:
     run.max_loop_restarts     parallel mode: restarts in a row of a crashed
                               thread before it is given up for the run
     tools.max_rounds          tool rounds one agent call may spend before it
-                              must answer (lookup_lemmas)
+                              must answer (lookup_lemmas, search_lemmas)
     tools.code_rounds         the same, for a call offered run_code: a
                               computation is written, run, read and
                               corrected, so it needs more
     tools.max_lookup          lemmas one lookup_lemmas call may return
+    tools.max_search          lemmas one search_lemmas call may return
     llm.max_retries           attempts at one model call
     llm.max_compaction_passes compaction-and-resume passes one truncated call
                               may get before its partial work is handed on
+
+Every key but run.max_rejected_lemmas also takes -1, for no limit (a tool
+call's rounds are then bounded by the context window alone). within,
+below, counts and of_limit read a limit that may be -1.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
 from ..tools.run_code import limits
 
@@ -50,9 +55,10 @@ DEFAULTS: Dict[str, int] = {
     "run.max_proof_attempts": 3,
     "run.max_rejected_lemmas": 4,
     "run.max_loop_restarts": 3,
-    "tools.max_rounds": 3,
+    "tools.max_rounds": 8,
     "tools.code_rounds": 8,
     "tools.max_lookup": 10,
+    "tools.max_search": 10,
     "llm.max_retries": 3,
     "llm.max_compaction_passes": 2,
 }
@@ -67,16 +73,23 @@ FIELDS: Dict[str, str] = {
     "tools.max_rounds": "max_tool_rounds",
     "tools.code_rounds": "code_tool_rounds",
     "tools.max_lookup": "max_lookup",
+    "tools.max_search": "max_search",
     "llm.max_retries": "llm_max_retries",
     "llm.max_compaction_passes": "max_compaction_passes",
 }
 
 # The defaults of the settings that are flags only (proofs run, proofs
-# repair): the lemma window's sizes (-1 is no limit), how agents call
-# tools, and the context window used when nothing is probed.
+# repair): how the lemma window is chosen (loops/strategies.py) and its
+# sizes (-1 is no limit), how agents call tools, and the context window
+# used when nothing is probed.
 DEFAULT_LEMMAS_ALL = 25
 DEFAULT_MY_LEMMAS = 25
-DEFAULT_LEMMAS_COMMON = 10
+DEFAULT_WINDOW_SIZE = 50
+# The window's strategies; the two that take a dial (random's beta,
+# depth's jitter), a number from 0 to 1, after a comma: random,0.5.
+STRATEGIES = ("recent", "random", "depth", "breadth", "relevance", "popular")
+DIALS = ("random", "depth")
+DEFAULT_STRATEGY: Tuple[str, float] = ("recent", 0.0)
 DEFAULT_TOOL_MODE = "auto"
 DEFAULT_NUM_CTX = 65536
 
@@ -93,12 +106,16 @@ class Settings:
     max_tool_rounds: int = DEFAULTS["tools.max_rounds"]
     code_tool_rounds: int = DEFAULTS["tools.code_rounds"]
     max_lookup: int = DEFAULTS["tools.max_lookup"]
+    max_search: int = DEFAULTS["tools.max_search"]
     llm_max_retries: int = DEFAULTS["llm.max_retries"]
     max_compaction_passes: int = DEFAULTS["llm.max_compaction_passes"]
-    # The lemma window (see loops.prompts.lemma_window).
+    # The lemma window (loops/strategies.py): the strategy and its dial,
+    # recent's two sizes, and every other strategy's one.
+    strategy: str = DEFAULT_STRATEGY[0]
+    strategy_dial: float = DEFAULT_STRATEGY[1]
     lemmas_all: int = DEFAULT_LEMMAS_ALL
     my_lemmas: int = DEFAULT_MY_LEMMAS
-    lemmas_common: int = DEFAULT_LEMMAS_COMMON
+    window_size: int = DEFAULT_WINDOW_SIZE
     # How agents call tools: "auto" or "json" (see --tool-mode).
     tool_mode: str = DEFAULT_TOOL_MODE
     # The context window in tokens: the probed server's, or --num-ctx.
@@ -111,8 +128,80 @@ class Settings:
         return self.max_iterations < 0
 
 
-# The smallest value each key takes; run.max_iterations also takes -1.
+# The flag that sets each key for one command (cli/flags.py,
+# add_settings_flags); its argparse dest is the name in snake case.
+FLAGS: Dict[str, str] = {
+    "run.max_iterations": "--max-iterations",
+    "run.max_proof_attempts": "--max-proof-attempts",
+    "run.max_rejected_lemmas": "--max-rejected-lemmas",
+    "run.max_loop_restarts": "--max-loop-restarts",
+    "tools.max_rounds": "--max-tool-rounds",
+    "tools.code_rounds": "--max-code-rounds",
+    "tools.max_lookup": "--max-lookup",
+    "tools.max_search": "--max-search",
+    "llm.max_retries": "--max-retries",
+    "llm.max_compaction_passes": "--max-compaction-passes",
+}
+
+
+def parse_strategy(text: str) -> Tuple[str, float]:
+    """--strategy's value: a strategy, and for random and depth a dial from
+    0 to 1 after a comma (random,0.5); a missing dial is 0. ValueError for
+    anything else."""
+    name, _, dial = (part.strip() for part in str(text).partition(","))
+    name = name.lower()
+    if name not in STRATEGIES:
+        raise ValueError(f"{name!r} is not a strategy; the strategies are "
+                         f"{', '.join(STRATEGIES)}")
+    if not dial:
+        return name, 0.0
+    if name not in DIALS:
+        raise ValueError(f"{name} takes no dial; only {' and '.join(DIALS)} do")
+    try:
+        value = float(dial)
+    except ValueError:
+        raise ValueError(f"{name}'s dial must be a number, not {dial!r}") from None
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name}'s dial must be from 0 to 1, not {value}")
+    return name, value
+
+
+def flag_dest(key: str) -> str:
+    return FLAGS[key][2:].replace("-", "_")
+
+
+def flag_values(args: Any) -> Dict[str, Any]:
+    """The settings flags of parsed args, as resolve() takes them: a key
+    for each flag the command has, None for one not passed."""
+    return {k: getattr(args, flag_dest(k), None) for k in KEYS}
+
+
+# The smallest value each key takes, -1 (no limit) aside.
 _MINIMUM: Dict[str, int] = {"run.max_rejected_lemmas": 0}
+# The keys that do not take -1: the reject list is written into the
+# planner's prompt and the checkpoint, so it stays bounded.
+BOUNDED = frozenset({"run.max_rejected_lemmas"})
+
+
+def within(count: int, limit: int) -> bool:
+    """count <= limit, for a limit that may be -1 (no limit)."""
+    return limit < 0 or count <= limit
+
+
+def below(count: int, limit: int) -> bool:
+    """count < limit, for a limit that may be -1 (no limit)."""
+    return limit < 0 or count < limit
+
+
+def counts(limit: int, start: int = 0) -> Iterable[int]:
+    """limit integers from start, or endlessly many for -1."""
+    return itertools.count(start) if limit < 0 else range(start, start + limit)
+
+
+def of_limit(n: int, limit: int) -> str:
+    """n against its limit, as the log shows it: "n/limit", or "n" when
+    there is none."""
+    return str(n) if limit < 0 else f"{n}/{limit}"
 
 
 class SettingsError(Exception):
@@ -126,11 +215,11 @@ def _parse(key: str, value: Any) -> int:
         n = int(value)
     except ValueError:
         raise ValueError(f"{key} must be an integer, not {value!r}") from None
-    if key == "run.max_iterations" and n == -1:
+    if n == -1 and key not in BOUNDED:
         return n
     low = _MINIMUM.get(key, 1)
     if n < low:
-        extra = " (or -1, for no limit)" if key == "run.max_iterations" else ""
+        extra = "" if key in BOUNDED else " (or -1, for no limit)"
         raise ValueError(f"{key} must be at least {low}{extra}, not {n}")
     return n
 

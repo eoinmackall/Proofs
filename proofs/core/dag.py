@@ -57,7 +57,10 @@ it and its own commits: what another process writes in the meantime is not
 seen. The in-memory DAG keeps every lemma's current version without its
 proof — the statement and its hash, the proof's hash, the citations, the
 computations, who wrote it, where — and every lemma's Merkle hash, computed
-at load; a proof is read back from its stream file when one is needed.
+at load; a proof is read back from its stream file when one is needed. Who
+cites each lemma, each lemma's depth and the sketches of the lemmas'
+ancestries (citations.py) are built from them the first time they are
+asked for, and carried across the command's commits.
 """
 
 from __future__ import annotations
@@ -72,7 +75,7 @@ from ..loops.json_repair import _FENCE_RE
 from ..loops.reasoning import _recorded_model
 from ..tools.run_code import computations
 from ..workspace import config
-from . import certificates, merkle, refutations, resolution, streams, suspension
+from . import certificates, citations, merkle, refutations, resolution, streams, suspension
 
 DIR_NAME = "dags"
 LEMMA = "lemma"
@@ -261,8 +264,9 @@ class Dag:
     hashes each id to its Merkle hash (None for a lemma of a citation
     cycle); references is references.md; certificates every certificate
     record, and refutations every refutation file as (path, record). The
-    suspension is computed from them (suspension()). warnings are what the
-    load found worth saying once (forks).
+    suspension is computed from them (suspension()), and so is who cites
+    each lemma (cited_by_map()). warnings are what the load found worth
+    saying once (forks).
 
     A Dag is never changed in place: the with_* methods return a new one,
     and the command's context swaps it in (Context.dag) under the DAG lock.
@@ -295,6 +299,9 @@ class Dag:
         self.conflicts: Dict[str, List[str]] = dict(conflicts or {})
         self._suspension: Optional[suspension.Suspension] = None
         self._tree: Optional[merkle.Merkle] = None
+        self._cited_by: Optional[Dict[str, List[str]]] = None
+        self._depth: Optional[Dict[str, int]] = None
+        self._ancestry: Optional[citations.Ancestry] = None
 
     @classmethod
     def load(cls, ctx) -> "Dag":
@@ -335,10 +342,16 @@ class Dag:
                    forked, conflicts)
 
     def _replace(self, susp: Optional["suspension.Suspension"] = None,
+                 cited_by: Optional[Dict[str, List[str]]] = None,
+                 depth: Optional[Dict[str, int]] = None,
+                 ancestry: Optional["citations.Ancestry"] = None,
                  **changes: Any) -> "Dag":
         """A new Dag with changes; susp, when given, is its suspension —
         one the caller knows is still right — and otherwise it is computed
-        when first asked for."""
+        when first asked for. What is read off the citations (who cites
+        whom, depths, ancestries) is carried over when the lemmas are
+        unchanged; when they change it is the caller's, for the new
+        lemmas, or built when first asked for."""
         fields = dict(
             lemmas=self.lemmas, hashes=self.hashes, references=self.references,
             certificate_lines=self.certificates,
@@ -348,6 +361,11 @@ class Dag:
         fields.update(changes)
         dag = Dag(**fields)
         dag._suspension = susp
+        if "lemmas" in changes:
+            dag._cited_by, dag._depth, dag._ancestry = cited_by, depth, ancestry
+        else:
+            dag._cited_by, dag._depth, dag._ancestry = (
+                self._cited_by, self._depth, self._ancestry)
         return dag
 
     # -- reading -------------------------------------------------------------
@@ -358,8 +376,36 @@ class Dag:
             self._suspension = suspension.compute(
                 self.lemmas, self.hashes, self.certificates,
                 [ref for _path, ref in self.refutations], self.conflicts,
+                citers=self.cited_by_map(),
             )
         return self._suspension
+
+    def cited_by_map(self) -> Dict[str, List[str]]:
+        """Every cited id, with the lemmas citing it (citations.py), built
+        once. Shared with the Dags this one's commits make, so it is not
+        to be changed."""
+        if self._cited_by is None:
+            self._cited_by = citations.build_cited_by(self.lemmas)
+        return self._cited_by
+
+    def cited_by(self, lemma_id: str) -> List[str]:
+        """The lemmas that cite lemma_id directly, suspended or not; [] for
+        a lemma nothing cites."""
+        return list(self.cited_by_map().get(lemma_id, ()))
+
+    def depths(self) -> Dict[str, int]:
+        """Every lemma's depth (citations.depths), built once; a lemma of a
+        citation cycle has none. Not to be changed."""
+        if self._depth is None:
+            self._depth = citations.depths(self.lemmas, self.cited_by_map())
+        return self._depth
+
+    def ancestry(self) -> "citations.Ancestry":
+        """The sketches of every lemma's ancestry (citations.Ancestry),
+        built once."""
+        if self._ancestry is None:
+            self._ancestry = citations.Ancestry.build(self.lemmas, self.cited_by_map())
+        return self._ancestry
 
     def hash(self, lemma_id: str) -> str:
         """The lemma's Merkle hash. KeyError for a lemma the DAG does not
@@ -440,7 +486,11 @@ class Dag:
         A new lemma changes no other lemma's suspension — nothing cites it
         yet — so the suspension is carried over with the lemma's own status
         added (suspension.with_lemma), not recomputed. After a reproof it is
-        recomputed when next asked for."""
+        recomputed when next asked for.
+
+        Who cites whom, once built, is carried over: the lists of the
+        lemmas the version stopped or started citing are replaced, every
+        other list is shared."""
         node = _version(record, path, line, prover, run_id, self.root)
         lid = node["id"]
         lemmas = dict(self.lemmas)
@@ -464,12 +514,51 @@ class Dag:
                      if str(r.get("lemma_id") or "").strip() == lid],
                     self.conflicts,
                 )
-            return self._replace(susp, lemmas=lemmas, hashes=hashes)
+            # Nothing cites a new lemma: its depth and ancestry are its
+            # own, and no other lemma's moves.
+            depth = ancestry = None
+            if self._depth is not None:
+                depth = dict(self._depth)
+                depth[lid] = citations.depth_of(lemmas, depth, node)
+            if self._ancestry is not None:
+                ancestry = self._ancestry.with_lemma(lemmas, node)
+            return self._replace(susp, self._carried_cited_by(lid, old, node),
+                                 depth, ancestry, lemmas=lemmas, hashes=hashes)
         if old["statement_hash"] != node["statement_hash"]:
-            for k, v in lemmas.items():
-                if lid in v["cited_lemmas"] and hashes.get(k) is not None:
-                    hashes[k] = tree.node_hash(v, clean=True)
-        return self._replace(lemmas=lemmas, hashes=hashes)
+            # A reproof changes what lid cites, never who cites lid.
+            for k in self.cited_by_map().get(lid, ()):
+                if hashes.get(k) is not None:
+                    hashes[k] = tree.node_hash(lemmas[k], clean=True)
+        # A reproof citing what its old version cited moves no depth and
+        # no ancestry; one citing something else moves those of everything
+        # above it, so they are built again when next asked for.
+        same = set(old["cited_lemmas"]) == set(node["cited_lemmas"])
+        return self._replace(cited_by=self._carried_cited_by(lid, old, node),
+                             depth=self._depth if same else None,
+                             ancestry=self._ancestry if same else None,
+                             lemmas=lemmas, hashes=hashes)
+
+    def _carried_cited_by(self, lid: str, old: Optional[Dict[str, Any]],
+                          node: Dict[str, Any]) -> Optional[Dict[str, List[str]]]:
+        """This DAG's map of who cites whom with lid's version old replaced
+        by node (old None for a new lemma); None when the map was never
+        built, so the new DAG builds its own when asked."""
+        if self._cited_by is None:
+            return None
+        before = set(old["cited_lemmas"]) if old is not None else set()
+        after = set(node["cited_lemmas"])
+        if before == after:
+            return self._cited_by
+        out = dict(self._cited_by)
+        for c in before - after:
+            kept = [x for x in out.get(c, ()) if x != lid]
+            if kept:
+                out[c] = kept
+            else:
+                out.pop(c, None)
+        for c in after - before:
+            out[c] = [*out.get(c, ()), lid]
+        return out
 
     def with_certificate(self, line: Dict[str, Any]) -> "Dag":
         """This DAG with a certificate added. A commit certifies its lemma
@@ -570,7 +659,14 @@ def _append_version(ctx, record: Dict[str, Any]) -> None:
     path = writer(ctx, DIR_NAME).append(record)
     with open(path, "rb") as f:
         line = f.read().count(b"\n")       # the record is the file's last line
+    lid = str(record.get("id") or "")
+    statement = str(record.get("statement") or "")
+    old = ctx.dag.lemmas.get(lid)
     ctx.run.dag = ctx.dag.with_version(record, path, line, ctx.user, ctx.run_id)
+    # Under the DAG lock, like the swap: the index sees the commits in the
+    # order the DAG does. A reproof that keeps its statement changes no word.
+    if ctx.run.search_index is not None and (old is None or old["statement"] != statement):
+        ctx.run.search_index.put(lid, statement)
 
 
 def commit_lemma_to_dag(
@@ -834,10 +930,7 @@ def _citation_closure(dag: "Dag", lemma_id: str) -> List[str]:
 
 def dependents(dag: "Dag", start: Iterable[str]) -> Set[str]:
     """Every lemma that cites one of start, directly or transitively."""
-    cited_by: Dict[str, List[str]] = {}
-    for lid, node in dag.lemmas.items():
-        for cited in node.get("cited_lemmas", []):
-            cited_by.setdefault(cited, []).append(lid)
+    cited_by = dag.cited_by_map()
     out: Set[str] = set()
     queue = list(start)
     while queue:

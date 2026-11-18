@@ -145,6 +145,18 @@ class RunState:
     # command started from, plus its own commits. Here rather than on the
     # Context so every thread's copy shares it.
     dag: Any = None
+    # The search index over the DAG's statements (tools/search_lemmas),
+    # started the first time search_lemmas is offered and kept up to date
+    # by the commits; None until then.
+    search_index: Any = None
+    # The lemma window the planning agents were last shown
+    # (loops/strategies.py), chosen when the planner starts: the parallel
+    # lemma generator is shown the same one, and so, in a serial run, are
+    # the prover and the reviser (window_from_planner).
+    planning_window: Any = None
+    window_from_planner: bool = False
+    # The once-a-run notes already given (by what each is about).
+    said: Set[str] = field(default_factory=set)
     # The run's stream writers, by kind (core.dag.writer), and every lemma id
     # the run has handed out (core.dag.new_lemma_id), committed or not.
     writers: Dict[str, Any] = field(default_factory=dict)
@@ -170,9 +182,12 @@ class LoopState:
     # The code directory of the proof loop this thread is running
     # (tools/run_code/files.py); None outside one.
     code_dir: Optional[Path] = None
-    # _fit_prompt's override of the lemma window's three sizes while it
-    # rebuilds a prompt too large for the context window.
-    window_override: Optional[Tuple[int, int, int]] = None
+    # The lemma window this thread's agents are shown (loops/strategies.py,
+    # Window), chosen when its planner or prover starts; and _fit_prompt's
+    # smaller sizes for its parts while it rebuilds a prompt too large for
+    # the context window.
+    window: Any = None
+    window_override: Optional[Tuple[int, ...]] = None
     # Set (a threading.Event) on a verifier thread of a parallel
     # verification (loops/verifiers.py, fan_out): once it fires, the
     # thread's next model request raises reasoning.Cancelled instead.

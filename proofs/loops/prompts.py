@@ -4,7 +4,6 @@ references, and fitting a prompt into the context window.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import random
 import textwrap
@@ -13,8 +12,9 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Tu
 
 from .. import tools as tools_mod
 from ..core import resolution
-from ..core.dag import load_file, new_lemma_id, owner_of
+from ..core.dag import load_file, new_lemma_id
 from ..tools.run_code import computations
+from . import strategies
 from .reasoning import (
     COMPACT_MIN_ROOM, _estimate_tokens, _lookup_room, _native_tools, _reserve,
     _room,
@@ -41,18 +41,6 @@ PLANNER_CANDIDATES = 5
 PLANNER_REFERENCE_LIMIT = 100
 
 
-_TIEBREAK_SEED = random.getrandbits(64)
-
-
-def _window_sizes(ctx) -> Tuple[int, int, int]:
-    """(lemmas_all, my_lemmas, lemmas_common) as this call should see them:
-    _fit_prompt's override when it is rebuilding a prompt, else the
-    module's (the flags')."""
-    override = ctx.loop.window_override
-    return override if override is not None else (
-        ctx.settings.lemmas_all, ctx.settings.my_lemmas, ctx.settings.lemmas_common)
-
-
 def agent_tools(
     ctx,
     role: str,
@@ -60,14 +48,14 @@ def agent_tools(
     suspended: Optional[Collection[str]] = None,
 ) -> Optional["tools_mod.ToolSet"]:
     """The tools an agent shown the lemma window is offered (tools/): today
-    lookup_lemmas, over the same lemmas the window chose from, when the
-    window leaves some out; and run_code under the role's hint, when the
-    run was given --tools and the role has one. None when no tool offers
-    itself, so a small DAG's prompts carry no tools."""
-    _shown, _common, index = lemma_window(ctx, dag, suspended)
+    lookup_lemmas and search_lemmas, over the same lemmas the window chose
+    from, when the window leaves some out; and run_code under the role's
+    hint, when the run was given --tools and the role has one. None when no
+    tool offers itself, so a small DAG's prompts carry no tools."""
+    shown, hidden = lemma_window(ctx, dag, suspended)
     return tools_mod.offered(ctx, tools_mod.Call(
         role=role, lemmas=dag.lemmas, suspended=set(suspended or ()),
-        index=index,
+        dag=dag, window=set(shown), hidden=hidden,
     ))
 
 
@@ -84,7 +72,9 @@ def rejected_block(ctx, rejected: List[Dict[str, str]]) -> str:
     statements = [e["statement"] for e in rejected]
     return (
         f"Rejected lemmas (the most recent; each went through all "
-        f"{ctx.settings.max_proof_attempts} prover rounds without a proof the verifiers "
+        + ("its" if ctx.settings.max_proof_attempts < 0
+           else str(ctx.settings.max_proof_attempts))
+        + f" prover rounds without a proof the verifiers "
         f"accepted — do not propose these again unchanged):\n"
         + (json.dumps(statements, indent=2) if statements else "(none)")
     )
@@ -105,100 +95,57 @@ def lemma_window(
     ctx,
     dag: Any,
     suspended: Optional[Collection[str]] = None,
-) -> Tuple[List[str], List[str], List[str]]:
-    """Which proved lemmas the agents see in full, and the index of the rest.
+) -> Tuple[List[str], int]:
+    """Which proved lemmas the agent is shown in full, and how many it is
+    not: the window its planner or prover chose (strategies.py,
+    ctx.loop.window) — chosen here, for the agent alone, when none was —
+    with each part cut to _fit_prompt's sizes while it rebuilds a prompt to
+    fit (ctx.loop.window_override), and without a lemma suspended since.
 
-    The window is chosen from the lemmas that are not suspended — choosing
-    first and filtering after would fill it with lemmas no agent may use.
-    Newest first by proved_at, id breaking ties: the lemmas_all newest
-    lemmas, anyone's, and the my_lemmas newest of the current user's own,
-    deduplicated, so the two can show fewer than their sum. -1 for either
-    is no limit.
-
-    Then the common lemmas: of the eligible lemmas not already shown,
-    the lemmas_common cited most often by the shown ones, counting direct
-    citations only, ties broken by _tiebreak. A lemma no shown lemma
-    cites does not rank, so the group can be smaller than lemmas_common.
-
-    Returns (the shown ids, oldest first — the order the proof grew in;
-    the common ids, most cited first; every other eligible lemma's id,
-    sorted). The index is empty when everything is shown.
+    The agents reach the lemmas not shown through the tools (search_lemmas,
+    lookup_lemmas), never through a list in the prompt: a list that grows
+    with the DAG would outgrow any context window.
     """
-    hidden = set(suspended or ())
-    eligible = [lid for lid in dag.lemmas if lid not in hidden]
-    newest = sorted(
-        eligible,
-        key=lambda lid: (str(dag.lemmas[lid].get("proved_at") or ""), lid),
-        reverse=True,
-    )
-
-    def take(ids: List[str], n: int) -> List[str]:
-        return ids if n < 0 else ids[:n]
-
-    # The flags' sizes, or _fit_prompt's smaller ones while it rebuilds a
-    # prompt to fit the window (ctx.loop.window_override).
-    lemmas_all, my_lemmas, lemmas_common = _window_sizes(ctx)
-    chosen = set(take(newest, lemmas_all))
-    chosen.update(take([lid for lid in newest if owner_of(lid) == ctx.user], my_lemmas))
-    shown = [lid for lid in reversed(newest) if lid in chosen]
-
-    eligible_set = set(eligible)
-    counts: Dict[str, int] = {}
-    for lid in shown:
-        for dep in dag.lemmas[lid].get("cited_lemmas", []):
-            if dep in eligible_set and dep not in chosen:
-                counts[dep] = counts.get(dep, 0) + 1
-    common = take(sorted(counts, key=lambda d: (-counts[d], _tiebreak(d))),
-                  lemmas_common)
-    chosen.update(common)
-    index = sorted(lid for lid in eligible if lid not in chosen)
-    return shown, common, index
+    suspended = set(suspended or ())
+    if ctx.loop.window is None:
+        ctx.loop.window = strategies.choose(ctx, dag, suspended, "")
+    shown = ctx.loop.window.shown(dag, suspended, ctx.loop.window_override)
+    eligible = len(dag.lemmas) - sum(1 for lid in suspended if lid in dag.lemmas)
+    return shown, max(eligible - len(shown), 0)
 
 
-def _tiebreak(lemma_id: str) -> bytes:
-    """A lemma's place among equally cited lemmas: random, from the run's
-    seed, but the same for the whole run — so a tie does not reshuffle the
-    prompt from one call to the next."""
-    return hashlib.sha256(f"{_TIEBREAK_SEED}:{lemma_id}".encode("utf-8")).digest()
+def _index_note(hidden: int) -> str:
+    """What an agent is told about the lemma window, beside it in the view.
+    It names no tool — a tool's own hint does that, and only while the
+    tool is offered (tools/) — and says nothing of how the lemmas shown
+    were chosen."""
+    return (f"{hidden:,} other proved lemma(s) are not listed here; they are "
+            "proved lemmas all the same and may be cited, as may every lemma "
+            "a cited_lemmas list names.")
 
 
-def _index_note(common: List[str], index: List[str]) -> str:
-    """What an agent is told about the lemma window, beside it in the view:
-    one sentence per list the view holds. It names no tool — a tool's own
-    hint does that, and only while the tool is offered (tools/)."""
-    parts = ["proved_lemmas gives the statements of the most recently "
-             "proved lemmas."]
-    if common:
-        parts.append("common_lemmas gives the statements of older lemmas "
-                     "that those cite most often.")
-    if index:
-        parts.append("other_proved_lemmas lists the ids of every other "
-                     "proved lemma, without statements; they are proved "
-                     "lemmas all the same and may be cited.")
-    return " ".join(parts)
-
-
-def _entry(dag: Any, lemma_id: str, with_citations: bool = False) -> Dict[str, Any]:
+def _entry(dag: Any, lemma_id: str, with_references: bool = False) -> Dict[str, Any]:
+    """A lemma as the window shows it: its id, its statement and the ids of
+    the lemmas it cites; with_references, the references it cites too."""
     node = dag.lemmas[lemma_id]
-    entry: Dict[str, Any] = {"id": lemma_id, "statement": str(node.get("statement", ""))}
-    if with_citations:
-        entry["cited_lemmas"] = list(node.get("cited_lemmas", []))
+    entry: Dict[str, Any] = {
+        "id": lemma_id,
+        "statement": str(node.get("statement", "")),
+        "cited_lemmas": list(node.get("cited_lemmas", [])),
+    }
+    if with_references:
         entry["cited_references"] = list(node.get("cited_references", []))
     return entry
 
 
 def _view(ctx, dag: Any, suspended: Optional[Collection[str]],
-          with_citations: bool) -> Dict[str, Any]:
-    shown, common, index = lemma_window(ctx, dag, suspended)
+          with_references: bool) -> Dict[str, Any]:
+    shown, hidden = lemma_window(ctx, dag, suspended)
     view: Dict[str, Any] = {
-        "proved_lemmas": [_entry(dag, lid, with_citations) for lid in shown]
+        "proved_lemmas": [_entry(dag, lid, with_references) for lid in shown]
     }
-    if common:
-        view["common_lemmas"] = [_entry(dag, lid) for lid in common]
-    if index:
-        view["other_proved_lemmas"] = index
-    if common or index:
-        view["note"] = _index_note(common, index)
+    if hidden:
+        view["note"] = _index_note(hidden)
     return view
 
 
@@ -212,24 +159,25 @@ def planner_dag_view(
 
     The suspended lemmas are not in the view: a refuted or uncertified
     lemma is not a proved lemma, and the planner must not be told it is
-    one (see suspension.py). Only the lemma window is listed in full; the
-    rest of the proved lemmas are in other_proved_lemmas by id."""
-    return _view(ctx, dag, suspended, with_citations=True)
+    one (see suspension.py). Only the lemma window is listed; the rest of
+    the proved lemmas are found with the tools."""
+    return _view(ctx, dag, suspended, with_references=True)
 
 
 def prover_context(
     ctx, dag: Any, suspended: Optional[Collection[str]] = None,
 ) -> Dict[str, Any]:
-    """Everything the prover is allowed to cite: every proved statement, by
-    the id it is cited by — never a proof (the prover sees that a lemma
-    holds, not how), since shipping every proof would grow without bound
-    against the context window.
+    """What the prover sees of what it may cite: the lemma window's
+    statements, each by the id it is cited by, with the ids it cites —
+    never a proof (the prover sees that a lemma holds, not how), since
+    shipping every proof would grow without bound against the context
+    window.
 
     The suspended lemmas are not in the view: the prover may not build on
     a lemma that is not to be built on, and a proof that cites one would
     inherit its suspension (see suspension.py). Only the lemma window is
-    listed in full; the rest are in other_proved_lemmas by id."""
-    return _view(ctx, dag, suspended, with_citations=False)
+    listed; the rest of the proved lemmas are found with the tools."""
+    return _view(ctx, dag, suspended, with_references=False)
 
 
 def verifier_context(
@@ -282,8 +230,6 @@ def _fit_prompt(
     system_prompt: str,
     build: Callable[[], Tuple[str, Optional["tools_mod.ToolSet"]]],
     verbose: bool,
-    dag: Any,
-    suspended: Optional[Collection[str]] = None,
     parts: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, Optional["tools_mod.ToolSet"]]:
     """An agent's (user prompt, tools), fitted to the context window.
@@ -291,15 +237,17 @@ def _fit_prompt(
     build() makes the prompt and the tools for the window sizes in effect:
     it calls planner_dag_view or prover_context, and agent_tools, so the
     prompt and the tools always see the same window (agent_tools offers
-    lookup_lemmas once anything is left out of it). The lemma window is the
-    part of a prompt that can give way without losing anything: a lemma
-    moved from the full listing into the id index is one lookup away.
+    lookup_lemmas and search_lemmas once anything is left out of it). The
+    lemma window is the part of a prompt that can give way without losing
+    anything: a lemma left out of it is one search away, and its id stays
+    in the cited_lemmas of the lemmas shown.
 
-    The configured sizes are tried first, and a prompt that fits is
+    The window's own sizes are tried first, and a prompt that fits is
     returned exactly as built. One whose estimate leaves less than the
-    reply's reserve plus LOOKUP_ROOM is rebuilt with all three sizes
-    halved (15 -> 7 -> 3 -> 1 -> 0; -1, no limit, halves from the DAG's
-    size) under ctx.loop.window_override, which is per thread, until one fits; the
+    reply's reserve plus LOOKUP_ROOM is rebuilt with each of the window's
+    parts halved (50 -> 25 -> 12 -> ... -> 0), keeping the lemmas its
+    strategy preferred, under ctx.loop.window_override, which is per
+    thread, until one fits; the
     last build is kept when none does — reason() then closes the tools if
     the prompt leaves only the reserve, and returns "too_large", unsent,
     if it leaves less than COMPACT_MIN_ROOM. In that case the parts of the
@@ -322,7 +270,7 @@ def _fit_prompt(
             {"content": extra},
         ])
 
-    def build_with(sizes: Tuple[int, int, int]):
+    def build_with(sizes: Tuple[int, ...]):
         saved = ctx.loop.window_override
         ctx.loop.window_override = sizes
         try:
@@ -330,40 +278,26 @@ def _fit_prompt(
         finally:
             ctx.loop.window_override = saved
 
-    configured = _window_sizes(ctx)
-    sizes = configured
     user_prompt, tools = build()
     used = estimate(user_prompt, tools)
-    total = len(dag.lemmas)
+    # The window build() was shown (lemma_window chooses one if none was).
+    configured = ctx.loop.window.sizes() if ctx.loop.window is not None else ()
+    sizes = configured
     while used > limit and any(sizes):
-        sizes = tuple((total if n < 0 else n) // 2 for n in sizes)
+        sizes = tuple(n // 2 for n in sizes)
         user_prompt, tools = build_with(sizes)
         used = estimate(user_prompt, tools)
-
-    def shown(n: int) -> str:
-        return "all" if n < 0 else str(n)
-
     if sizes != configured:
         ctx.ui.log(
-            f"  {role}: showing {shown(sizes[0])}+{shown(sizes[1])} lemmas "
-            f"in full and {shown(sizes[2])} common instead of "
-            f"{shown(configured[0])}+{shown(configured[1])} and "
-            f"{shown(configured[2])} to fit the {num_ctx:,}-token window "
-            f"(the rest stay available by lookup).",
+            f"  {role}: showing at most {sum(sizes)} lemmas instead of "
+            f"{sum(configured)} to fit the {num_ctx:,}-token window (the "
+            f"rest stay available by search and lookup).",
             verbose,
         )
     if _room(used, num_ctx) < COMPACT_MIN_ROOM:
         # Only reached with every size at 0: the room limit is below
         # half the window, so the loop above ran to the end.
-        saved = ctx.loop.window_override
-        ctx.loop.window_override = sizes
-        try:
-            _shown, _common, index = lemma_window(ctx, dag, suspended)
-        finally:
-            ctx.loop.window_override = saved
         sized = {"the system prompt": system_prompt, **(parts or {})}
-        if index:
-            sized["the id index"] = json.dumps(index, indent=2)
         ratio = max(ctx.model.backend.chars_per_token(), 1.0)
         largest = sorted(
             ((label, int(len(text) / ratio)) for label, text in sized.items()

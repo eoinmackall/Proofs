@@ -117,7 +117,8 @@ def setup_code(
         workspace_root = workspace.find_root(paths.root) or paths.root
         lim = limits_mod.resolve(workspace_root, paths.root,
                                  code_limit_flags(args))
-        code_rounds = settings_mod.resolve(workspace_root).code_tool_rounds
+        code_rounds = settings_mod.resolve(
+            workspace_root, settings_mod.flag_values(args)).code_tool_rounds
     except (config.UserConfigError, workspace.ConjectureNotFound,
             codetools.ToolError, limits_mod.LimitsError,
             settings_mod.SettingsError) as e:

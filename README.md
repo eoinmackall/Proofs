@@ -223,7 +223,10 @@ so `nix run . -- --help` works without cloning. Outside Nix, `pip install .`
 installs the `proofs` command; otherwise any Python 3 install with
 `requests` works, with this repository on `PYTHONPATH`:
 `PYTHONPATH=/path/to/Proofs python -m proofs ...`, run from inside your
-workspace. If [`orjson`](https://github.com/ijl/orjson) is installed, the
+workspace. With numpy installed (it is in the Nix environment; `pip install
+'.[fast]'` otherwise), `--strategy breadth` compares every candidate lemma
+with finer sketches; without it, a sample of them with coarser ones. If
+[`orjson`](https://github.com/ijl/orjson) is installed, the
 DAG is read with it — it reads the streams about twice as fast, and reading
 them is most of a large DAG's load — and with the standard library otherwise;
 both read the same records the same way.
@@ -352,8 +355,8 @@ to the tool unchanged. `parse` shares `run`'s server options (`--host`,
 `--api-key`, `--backend`, `--model`, `--num-ctx`) and its DIR / `--verbose`
 pair; it has no proving options, because it has no loop. `verify` and
 `repair` take the same server options too, and `repair` also takes the
-lemma-window and tool options (`--lemmas-all`, `--my-lemmas`,
-`--lemmas-common`, `--tool-mode`), since its re-proof runs the prover and
+lemma-window and tool options (`--strategy`, `--window-size`,
+`--lemmas-all`, `--my-lemmas`, `--tool-mode`), since its re-proof runs the prover and
 reviser. `prune`, `status` and `export` talk to no model and take no
 server options.
 
@@ -367,12 +370,14 @@ server options.
 | `--api-key KEY` | none | Sent as `Authorization: Bearer <key>`. Needed for a hosted API; leave unset for a plain local llama-server. |
 | `--backend {auto,llamacpp,openai}` | `auto` | Which dialect of the OpenAI-compatible endpoint to speak: the full llama.cpp option set (with thinking suppressed for schema calls), or the standard OpenAI set. `auto` takes the probe's answer; the other two force it, for when the probe can't see the real server. |
 | `--max-iterations N` | `run.max_iterations`, -1 | Loop iterations before the run stops (per loop in a parallel run). `-1` runs until the conjecture is settled or you interrupt it. See [Settings](#settings). |
-| `--max-proof-attempts N` | `run.max_proof_attempts`, 3 | Prover rounds per lemma before it is given up. |
+| `--max-proof-attempts N` | `run.max_proof_attempts`, 3 | Prover rounds per lemma before it is given up. `-1` never gives a lemma up. |
 | `--max-rejected-lemmas N` | `run.max_rejected_lemmas`, 4 | How many of the most recently rejected lemmas — ones that went through every prover round without being proved — the planning agents are shown, by statement only. `0` shows none. |
-| `--lemmas-all N` | 25 | How many of the most recently proved lemmas (anyone's) the agents see in full; every other proved lemma is listed by id only. `-1` shows all. Also taken by `proofs repair`. |
-| `--my-lemmas N` | 25 | How many of your own most recently proved lemmas the agents also see in full, overlap with `--lemmas-all` shown once. `-1` shows all. Also taken by `proofs repair`. |
-| `--lemmas-common K` | 10 | How many *common lemmas* the agents also see, statement only: the lemmas outside the two recency windows that the shown lemmas cite most often (direct citations only). Ties are broken in a random order fixed for the run. A lemma nothing shown cites never ranks. `-1` shows every cited lemma. Also taken by `proofs repair`. |
-| `--tool-mode {auto,json}` | `auto` | How agents call tools such as `lookup_lemmas`. `auto` uses the server's native tool calling and falls back to a JSON protocol the first time the server refuses it (llama-server needs `--jinja` for native calls); `json` uses the protocol from the start. Also taken by `proofs repair`. |
+| `--max-loop-restarts`, `--max-tool-rounds`, `--max-code-rounds`, `--max-lookup`, `--max-search`, `--max-retries`, `--max-compaction-passes` | see [Settings](#settings) | Override one setting for this run; `-1` for no limit. All but `--max-loop-restarts` are also taken by `proofs repair` and `proofs verify` (which does not take `--max-proof-attempts`). |
+| `--strategy NAME[,DIAL]` | `recent` | Which proved lemmas the agents see in full: `recent`, `random,BETA`, `depth,JITTER`, `breadth`, `relevance` or `popular`. See [The lemma window and tools](#the-lemma-window-and-tools). Also taken by `proofs repair`. |
+| `--window-size N` | 50 | How many lemmas every strategy but `recent` shows. `-1` shows all. Also taken by `proofs repair`. |
+| `--lemmas-all N` | 25 | `--strategy recent`: how many of the most recently proved lemmas (anyone's) the agents see. `-1` shows all. Also taken by `proofs repair`. |
+| `--my-lemmas N` | 25 | `--strategy recent`: how many of your own most recently proved lemmas the agents also see, overlap with `--lemmas-all` shown once. `-1` shows all. Also taken by `proofs repair`. |
+| `--tool-mode {auto,json}` | `auto` | How agents call tools such as `search_lemmas`. `auto` uses the server's native tool calling and falls back to a JSON protocol the first time the server refuses it (llama-server needs `--jinja` for native calls); `json` uses the protocol from the start. Also taken by `proofs repair`. |
 | `--tools LIST` | off | Let the prover and the reviser run code: a comma-separated list of tools the conjecture's `tools.lock` declares (`sage`, `python`), or `all`. The whole run is then sandboxed. See [Code tools](#code-tools-sage-python); with `--parallel`, see [Coding loops](#coding-loops). |
 | `--code-timeout`, `--code-memory`, `--code-jobs`, `--code-threads`, `--code-max-tasks`, `--code-output-cap`, `--code-reserve-memory` | see `proofs limits` | Override one [code limit](#limits) for this run. |
 | `--code-overcommit` | off | Run even when `code.jobs` × `code.memory` + `code.reserve_memory` exceeds this machine's memory. |
@@ -388,29 +393,63 @@ server options.
 
 ### The lemma window and tools
 
-Agents are not shown every proved lemma. They see in full the
-`--lemmas-all` most recently proved lemmas (anyone's) and the `--my-lemmas`
-most recently proved of your own, chosen after suspended lemmas are removed
-and with the overlap shown once; recency is the `proved_at` stamp a lemma
-gets when it is committed or re-proved. They also see, statement only, up
-to `--lemmas-common` older lemmas that the shown lemmas cite most often,
-counting direct citations, with ties broken in a random order that is fixed
-for the run (so prompts do not change from call to call for no reason). The
-prompt therefore holds a bounded number of statements however large the DAG
-grows; only the ID index grows with it. Every other proved lemma is listed
-by id only, and the agent can read any of them with
-the `lookup_lemmas` tool (statement and citations, never a suspended
-lemma). When the window holds every lemma, no index and no tool are sent
-and the prompts carry neither.
+Agents are not shown every proved lemma. `--strategy` chooses which ones
+they see in full (`proofs/loops/strategies.py`), never a suspended one. A
+lemma's *depth* is the longest citation chain beneath it (0 for a lemma
+citing nothing); a *sink* is a lemma no unsuspended lemma cites — nobody has
+built on it yet.
+
+| Strategy | Shows |
+|---|---|
+| `recent` (default) | the `--lemmas-all` most recently proved lemmas (anyone's) and the `--my-lemmas` most recently proved of your own, overlap shown once; recency is the `proved_at` stamp a lemma gets when it is committed or re-proved |
+| `random,BETA` | a sample weighted by depth, weight (depth + 1)^(β/(1−β)): β = 0 (the default) is uniform, β = 1 the deepest lemmas |
+| `depth,JITTER` | sinks by depth, the same weights with the dial reversed: jitter 0 (the default) is the deepest sinks, jitter 1 any sink, uniformly |
+| `breadth` | sinks whose ancestries (every lemma they rest on) overlap least, estimated with MinHash sketches: from the deepest sink, each next the one least like all those chosen; at most half of them sinks citing nothing |
+| `relevance` | what the search index finds for the agent's task: the lemma being proved (prover, reviser), the latest plan (planner), the conjecture before the first plan |
+| `popular` | the lemmas the most unsuspended lemmas cite |
+
+Every strategy but `recent` shows `--window-size` lemmas; ties go to the
+more recent. The lemmas are chosen when the planner starts and held until
+it next starts: the parallel lemma generator, and in a serial run the prover
+and the reviser, are shown the planner's choice. In a parallel run each
+loop's prover chooses again when it starts, as a repair's does, and its
+reviser is shown the same lemmas; a serial run's prover chooses for itself
+only under `relevance`, once per lemma. Every lemma shown carries the ids
+of the lemmas it cites. The prompt therefore holds a bounded number of
+statements however large the DAG grows: of every other proved lemma it says
+only how many there are, and nothing of how the shown ones were chosen.
+
+Agents reach those through two tools, offered whenever the window leaves
+lemmas out:
+
+* `search_lemmas` searches every proved lemma by words or phrases from its
+  statement, best match first, and finds the lemmas that cite a given
+  lemma (`cites`) or that it cites (`cited_by`), newest first unless a
+  query ranks them. It returns whole statements with their citations, at
+  most `tools.max_search` (10) per call, and pages on with `offset`. Its
+  index is SQLite's full-text index (FTS5), held in memory, built in the
+  background the first time the tool is offered and kept up to date by
+  the run's commits; it is never written to disk. A query's words are
+  matched with any of them sufficing and the rarer ones counting for more
+  (BM25), and a word found in more than a fifth of all statements is
+  dropped from the query, keeping its three rarest words, since it does
+  little for the ranking and a great deal for the cost.
+* `lookup_lemmas` reads lemmas by id — ids from a `cited_lemmas` list or
+  from search results.
+
+Neither returns a suspended lemma, and search leaves out the lemmas the
+prompt already shows in full. When the window holds every lemma, no tool
+is sent.
 
 Each tool is a plug-in in its own package under `proofs/tools/`
-(`lookup_lemmas/`, `run_code/`), listed in a registry in
+(`lookup_lemmas/`, `search_lemmas/`, `run_code/`), listed in a registry in
 `proofs/tools/__init__.py`; for every agent call each one decides whether
 to offer itself. A tool is a name, a JSON Schema for its arguments, a
 handler, a hint (what the prompt tells the model about it) and its own
 round limit (`proofs/tools/base.py`). `reason()` runs the loop — at most
-`tools.max_rounds` (3) rounds per call unless a tool asks for more,
-`tools.max_lookup` (10) lemmas per lookup (see [Settings](#settings)) —
+`tools.max_rounds` (8) rounds per call unless a tool asks for more,
+`tools.max_lookup` (10) lemmas per lookup and `tools.max_search` (10) per
+search (see [Settings](#settings)) —
 using native tool calls where the server supports them and a JSON protocol
 otherwise (`--tool-mode`). The tools' hints are added to the
 task only while the tools are offered: once they are closed (rounds spent,
@@ -1032,6 +1071,7 @@ proofs/
     checkpoint.py      # runs (ids, locks) and their checkpoints
     interrupts.py      # Ctrl-C: commit sections, the checkpoint on the way out
     merkle.py          # the Merkle hash of every lemma
+    citations.py       # who cites each lemma, each lemma's depth, ancestry sketches
     certificates.py    # certificate records: recording, validity, counting
     refutations.py     # refutation files: recording, loading, dismissal
     suspension.py      # which lemmas are not to be built on, computed from the files
@@ -1047,6 +1087,7 @@ proofs/
     reasoning.py       # reason() and extract(): one model call, the context-wall rescue
     json_repair.py     # reclaiming JSON from a reply that is not clean JSON
     prompts.py         # prompt assembly: the lemma window, the agents' views, fitting the window
+    strategies.py      # --strategy: which proved lemmas the agents are shown, and when
     schemas.py         # response schemas
     proof.py           # the proof loop: prover -> verifiers -> reviser
     verifiers.py       # one verification step
@@ -1066,7 +1107,8 @@ proofs/
   tools/
     __init__.py        # the registry: which tools an agent call is offered
     base.py            # Tool, ToolSet and the two tool-calling protocols
-    lookup_lemmas/     # reading a proved lemma the lemma window lists by id only
+    lookup_lemmas/     # reading a proved lemma by id
+    search_lemmas/     # finding proved lemmas by words or citations; index.py, the search index
     run_code/
       tool.py          # the run_code tool
       setup.py         # --tools: checking tools and limits, the sandbox relaunch
@@ -1297,19 +1339,24 @@ reported and kept — raise the budget and re-run to continue from it.
 
 The run's tunables live beside the code limits in the workspace's
 gitignored `.proofs-local.json` (`proofs init` writes every key at its
-default). A flag, where there is one, beats the file for one run.
+default). Each key's flag beats the file for one command. `proofs run`
+takes them all; `proofs verify` takes the `tools.*` and `llm.*` ones, and
+`proofs repair` those and `--max-proof-attempts`. Every key but
+`run.max_rejected_lemmas` takes `-1` for no limit, in the file or a flag
+(tool rounds are then bounded by the context window alone).
 
 | Key | Default | Flag | Meaning |
 | --- | --- | --- | --- |
 | `run.max_iterations` | -1 | `--max-iterations` | Loop iterations before the run stops; per loop in a parallel run. `-1` runs until the conjecture is settled or the run is interrupted. |
 | `run.max_proof_attempts` | 3 | `--max-proof-attempts` | Prover rounds one iteration may spend on a lemma. |
 | `run.max_rejected_lemmas` | 4 | `--max-rejected-lemmas` | Rejected lemmas the planning agents are shown. |
-| `run.max_loop_restarts` | 3 | | Parallel mode: restarts in a row of a crashed thread before it is given up. |
-| `tools.max_rounds` | 3 | | Tool rounds one agent call may spend before it must answer. |
-| `tools.code_rounds` | 8 | | The same, for a call offered `run_code`. |
-| `tools.max_lookup` | 10 | | Lemmas one `lookup_lemmas` call may return. |
-| `llm.max_retries` | 3 | | Attempts at one model call. |
-| `llm.max_compaction_passes` | 2 | | Compaction-and-resume passes one truncated call may get. |
+| `run.max_loop_restarts` | 3 | `--max-loop-restarts` | Parallel mode: restarts in a row of a crashed thread before it is given up. |
+| `tools.max_rounds` | 8 | `--max-tool-rounds` | Tool rounds one agent call may spend before it must answer. |
+| `tools.code_rounds` | 8 | `--max-code-rounds` | The same, for a call offered `run_code`. |
+| `tools.max_lookup` | 10 | `--max-lookup` | Lemmas one `lookup_lemmas` call may return. |
+| `tools.max_search` | 10 | `--max-search` | Lemmas one `search_lemmas` call may return. |
+| `llm.max_retries` | 3 | `--max-retries` | Attempts at one model call. |
+| `llm.max_compaction_passes` | 2 | `--max-compaction-passes` | Compaction-and-resume passes one truncated call may get. |
 
 ### References
 

@@ -29,6 +29,7 @@
           requests
           rich
           orjson
+          numpy     # optional: finer, faster ancestry sketches for --strategy breadth
         ]);
 
         # The installed package: the proofs/ module copied into a Python home,

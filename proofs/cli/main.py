@@ -98,6 +98,7 @@ from ..tools.run_code import setup as code_setup
 from ..tools.run_code import limits as limits_mod
 from ..workspace import config
 from ..workspace import layout as workspace
+from ..workspace import settings as settings_mod
 
 # Argument errors exit 2, argparse's convention; a command's own exit
 # code is what its entry returns (0 accepted, 1 rejected, and so on).
@@ -116,6 +117,11 @@ def _add_backend_flags(sp: argparse.ArgumentParser, help_for: str) -> None:
         help=f"log {help_for} to stdout (default: on; --no-verbose silences it)",
     )
 
+
+# The settings keys proofs verify takes a flag for: its verifiers' tool
+# use and model calls (proofs repair adds its re-proof's prover rounds).
+_VERIFY_SETTINGS = tuple(k for k in settings_mod.KEYS
+                         if k.startswith(("tools.", "llm.")))
 
 _DIR_HELP = (
     "The conjecture directory: a NAME under the workspace root's "
@@ -332,6 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Needs --tools. Read other people's code before you run it."
         ),
     )
+    flags.add_settings_flags(p, _VERIFY_SETTINGS)
     code_setup.add_code_flags(p)
     p.set_defaults(func=_cmd_verify, parser=p)
 
@@ -365,6 +372,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_parallel_flag(p)
     flags.add_lemma_window_flags(p)
     flags.add_tool_flags(p)
+    flags.add_settings_flags(p, ("run.max_proof_attempts",) + _VERIFY_SETTINGS)
     code_setup.add_code_flags(p)
     p.set_defaults(func=_cmd_repair, parser=p)
 
@@ -617,6 +625,7 @@ def _cmd_verify(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         verbose=args.verbose,
         parser=parser,
         parallel=args.parallel_verifiers,
+        settings_flags=settings_mod.flag_values(args),
     )
     if args.uncertified:
         rc = verify.verify_uncertified_entry(**common)
@@ -661,10 +670,12 @@ def _cmd_repair(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
     rc = repair.repair_entry(
         code=code,
         parallel=args.parallel_verifiers,
+        settings_flags=settings_mod.flag_values(args),
         lemmas_all=args.lemmas_all,
         my_lemmas=args.my_lemmas,
         tool_mode=args.tool_mode,
-        lemmas_common=args.lemmas_common,
+        strategy=args.strategy,
+        window_size=args.window_size,
         path=args.path,
         user_id=args.user_id,
         model=args.model,
@@ -689,10 +700,12 @@ def _cmd_repair_all(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     rc = repair.repair_all_entry(
         code=code,
         parallel=args.parallel_verifiers,
+        settings_flags=settings_mod.flag_values(args),
         lemmas_all=args.lemmas_all,
         my_lemmas=args.my_lemmas,
         tool_mode=args.tool_mode,
-        lemmas_common=args.lemmas_common,
+        strategy=args.strategy,
+        window_size=args.window_size,
         root=str(root),
         user_id=args.user_id,
         model=args.model,

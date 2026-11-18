@@ -35,7 +35,7 @@ from typing import (
     Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Set, Tuple,
 )
 
-from . import certificates, refutations
+from . import certificates, citations, refutations
 
 __all__ = ["Suspension", "compute"]
 
@@ -160,6 +160,7 @@ def compute(
     certificate_lines: Iterable[Mapping[str, Any]],
     refutation_records: Iterable[Mapping[str, Any]],
     conflicts: Optional[Mapping[str, List[str]]] = None,
+    citers: Optional[Mapping[str, List[str]]] = None,
 ) -> Suspension:
     """The suspension of lemmas, from plain data: the DAG's lemmas, keyed by
     id with each node's cited_lemmas a list of ids; each
@@ -167,6 +168,8 @@ def compute(
     has none); every certificate line; every refutation record; and the
     lemmas whose versions state different things, with where those versions
     are. The in-memory DAG (core/dag.py, Dag.suspension) holds them all.
+    citers is who cites each lemma (citations.build_cited_by of lemmas),
+    built here when not given.
     """
     certificates_by_lemma = _index(certificate_lines)
     refutations_by_lemma = _index(refutation_records)
@@ -186,10 +189,8 @@ def compute(
     # The last rule is transitive: a lemma that cites a suspended lemma is
     # suspended itself, and so is one citing that one. Spread it once along
     # who-cites-whom, so each citation is followed once.
-    citers: Dict[str, List[str]] = {}
-    for lemma_id, node in lemmas.items():
-        for c in node.get("cited_lemmas") or []:
-            citers.setdefault(c, []).append(lemma_id)
+    if citers is None:
+        citers = citations.build_cited_by(lemmas)
     suspended: Set[str] = set(reasons)
     queue = list(suspended)
     while queue:

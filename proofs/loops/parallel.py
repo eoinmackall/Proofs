@@ -27,6 +27,7 @@ from typing import Any, Callable, Collection, Dict, List, Optional, Set, Tuple
 from .. import llm
 from .. import tools as tools_mod
 from ..core import merkle, resolution
+from ..workspace import settings as settings_mod
 from ..core.checkpoint import (
     _atomic_write_checkpoint_file, clean_rejected, discard_checkpoint,
     drop_rejection, load_parallel_checkpoint, note_rejection,
@@ -40,6 +41,7 @@ from ..validity.steps import VERIFIER_AGENTS
 from .human import _operator_citation_check, _verify_operator_proof, choose
 from .json_repair import parse_json_or_none
 from .mode import check_mode_toggle
+from . import strategies
 from .prompts import (
     _build_comments_block, _build_reference_blocks, _fit_prompt, agent_tools,
     candidate, planner_dag_view, rejected_block, replan_note,
@@ -702,6 +704,10 @@ def _parallel_planner(
         # the new one is written from the DAG alone.
         operator_note = state.take_operator_note()
         rejected = rejected_block(ctx, state.rejected_snapshot())
+        # The window for this plan, and for the generator working from it
+        # (strategies.py): chosen now, held until the next pass.
+        strategies.for_planner(ctx, dag, susp.suspended,
+                               strategies.plan_query(conjecture, state.plan_snapshot()))
 
         def build_plan() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
             return (
@@ -714,8 +720,7 @@ def _parallel_planner(
             )
         plan_user, plan_tools = _fit_prompt(
             ctx,
-            "parallel_planner", planner_sys, build_plan, verbose, dag,
-            susp.suspended,
+            "parallel_planner", planner_sys, build_plan, verbose,
             parts={
                 "the conjecture": conjecture,
                 "the references block": ref_block,
@@ -819,6 +824,8 @@ def _parallel_generator(
         susp = dag.suspension()
         buffer_snapshot = state.buffer.snapshot()
         rejected = rejected_block(ctx, state.rejected_snapshot())
+        strategies.for_generator(ctx, dag, susp.suspended,
+                                 strategies.plan_query(conjecture, plan))
 
         def build_gen() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
             return (
@@ -837,7 +844,6 @@ def _parallel_generator(
         gen_user, gen_tools = _fit_prompt(
             ctx,
             "parallel_lemma_generator", generator_sys, build_gen, verbose,
-            dag, susp.suspended,
             parts={
                 "the conjecture": conjecture,
                 "the plan": json.dumps(plan, indent=2),
@@ -1118,7 +1124,7 @@ def _parallel_proof_loop(
             fresh_target = None
             ctx.ui.log(
                 f"{loop_id} resumes {pending['lemma_id']} at prover round "
-                f"{pending['attempt']}/{ctx.settings.max_proof_attempts}, "
+                f"{settings_mod.of_limit(pending['attempt'], ctx.settings.max_proof_attempts)}, "
                 f"{pending['stage']} step.",
                 verbose,
             )
@@ -1346,7 +1352,7 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
                 )
                 if state.steering_rounds_done(name) > rounds_at_start:
                     restarts = 0
-                if restarts >= ctx.settings.max_loop_restarts:
+                if not settings_mod.below(restarts, ctx.settings.max_loop_restarts):
                     ctx.ui.log(
                         f"The parallel {name} crashed {restarts + 1} "
                         f"times in a row without completing a round; "
@@ -1359,8 +1365,9 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
                 restarts += 1
                 rounds_at_start = state.steering_rounds_done(name)
                 ctx.ui.log(
-                    f"The parallel {name}: restart {restarts}/"
-                    f"{ctx.settings.max_loop_restarts} in {LOOP_RESTART_DELAY}s."
+                    f"The parallel {name}: restart "
+                    f"{settings_mod.of_limit(restarts, ctx.settings.max_loop_restarts)} "
+                    f"in {LOOP_RESTART_DELAY}s."
                 )
                 if state.stop_event.wait(LOOP_RESTART_DELAY):
                     return
@@ -1414,7 +1421,7 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
                     # so this crash starts the count again.
                     if state.lemmas_finished(lid) > finished_at_start:
                         restarts = 0
-                    if restarts >= ctx.settings.max_loop_restarts:
+                    if not settings_mod.below(restarts, ctx.settings.max_loop_restarts):
                         lctx.ui.log(
                             f"{lid} crashed {restarts + 1} times in a row "
                             f"without finishing a lemma; giving it "
@@ -1436,7 +1443,8 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
                     )
                     released = state.buffer.release_claims(lid, keep=keep)
                     lctx.ui.log(
-                        f"{lid}: restart {restarts}/{ctx.settings.max_loop_restarts} in "
+                        f"{lid}: restart "
+                        f"{settings_mod.of_limit(restarts, ctx.settings.max_loop_restarts)} in "
                         f"{LOOP_RESTART_DELAY}s"
                         + (f", resuming {pending['lemma_id']}"
                            if pending is not None else "")

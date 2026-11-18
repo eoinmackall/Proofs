@@ -21,7 +21,7 @@ from ..core.interrupts import (
 )
 from ..validity import verdicts
 from ..workspace.settings import (
-    DEFAULT_LEMMAS_ALL, DEFAULT_LEMMAS_COMMON, DEFAULT_MY_LEMMAS,
+    DEFAULT_LEMMAS_ALL, DEFAULT_MY_LEMMAS, DEFAULT_STRATEGY, DEFAULT_WINDOW_SIZE,
     DEFAULT_TOOL_MODE,
 )
 from .prompts import _build_reference_blocks
@@ -192,8 +192,10 @@ class _Repairer:
         )
         if not result["proved"]:
             ctx.ui.log(
-                f"{lid} could not be re-proved after "
-                f"{ctx.settings.max_proof_attempts} prover round(s); the stored "
+                f"{lid} could not be re-proved"
+                + ("" if ctx.settings.max_proof_attempts < 0
+                   else f" after {ctx.settings.max_proof_attempts} prover round(s)")
+                + "; the stored "
                 f"proof stays, with its refutation counting against "
                 f"it.",
                 verbose,
@@ -424,7 +426,9 @@ def _session(
     ctx, *, root: Path, user_id: str, model: str, host: Optional[str],
     api_key: Optional[str], backend: str, num_ctx: Optional[int],
     verbose: bool, parser: argparse.ArgumentParser, lemmas_all: int,
-    my_lemmas: int, tool_mode: str, lemmas_common: int, parallel: int = 1,
+    my_lemmas: int, tool_mode: str, strategy: Tuple[str, float],
+    window_size: int, parallel: int = 1,
+    settings_flags: Optional[Dict[str, Any]] = None,
 ) -> None:
     """The verify session, with the re-proof's lemma window and tool mode."""
     _verify_session(
@@ -432,9 +436,11 @@ def _session(
         conjecture_dir=str(root), user_id=user_id, model=model, host=host,
         api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
         verbose=verbose, parser=parser, parallel=parallel,
+        settings_flags=settings_flags,
     )
     ctx.settings.lemmas_all, ctx.settings.my_lemmas = lemmas_all, my_lemmas
-    ctx.settings.lemmas_common = lemmas_common
+    ctx.settings.strategy, ctx.settings.strategy_dial = strategy
+    ctx.settings.window_size = window_size
     ctx.settings.tool_mode = tool_mode
 
 
@@ -452,9 +458,11 @@ def repair_entry(
     lemmas_all: int = DEFAULT_LEMMAS_ALL,
     my_lemmas: int = DEFAULT_MY_LEMMAS,
     tool_mode: str = DEFAULT_TOOL_MODE,
-    lemmas_common: int = DEFAULT_LEMMAS_COMMON,
+    strategy: Tuple[str, float] = DEFAULT_STRATEGY,
+    window_size: int = DEFAULT_WINDOW_SIZE,
     code: Optional[Code] = None,
     parallel: int = 1,
+    settings_flags: Optional[Dict[str, Any]] = None,
 ) -> int:
     """proofs repair path_to_refutation (see refutations.py,
     repair_entry()): the refutation file supplies the lemma's id, so
@@ -537,7 +545,9 @@ def repair_entry(
         ctx, root=root, user_id=user_id, model=model, host=host,
         api_key=api_key, backend=backend, num_ctx=num_ctx, verbose=verbose,
         parser=parser, lemmas_all=lemmas_all, my_lemmas=my_lemmas,
-        tool_mode=tool_mode, lemmas_common=lemmas_common, parallel=parallel,
+        tool_mode=tool_mode, strategy=strategy, window_size=window_size,
+        parallel=parallel,
+        settings_flags=settings_flags,
     )
     dag = ctx.dag
     if lemma_id not in dag.lemmas:
@@ -587,9 +597,11 @@ def repair_all_entry(
     lemmas_all: int = DEFAULT_LEMMAS_ALL,
     my_lemmas: int = DEFAULT_MY_LEMMAS,
     tool_mode: str = DEFAULT_TOOL_MODE,
-    lemmas_common: int = DEFAULT_LEMMAS_COMMON,
+    strategy: Tuple[str, float] = DEFAULT_STRATEGY,
+    window_size: int = DEFAULT_WINDOW_SIZE,
     code: Optional[Code] = None,
     parallel: int = 1,
+    settings_flags: Optional[Dict[str, Any]] = None,
 ) -> int:
     """proofs repair --all DIR: repair every lemma a refutation counts
     against, each the way proofs repair repairs the one its file names,
@@ -624,7 +636,9 @@ def repair_all_entry(
         ctx, root=Path(root), user_id=user_id, model=model, host=host,
         api_key=api_key, backend=backend, num_ctx=num_ctx, verbose=verbose,
         parser=parser, lemmas_all=lemmas_all, my_lemmas=my_lemmas,
-        tool_mode=tool_mode, lemmas_common=lemmas_common, parallel=parallel,
+        tool_mode=tool_mode, strategy=strategy, window_size=window_size,
+        parallel=parallel,
+        settings_flags=settings_flags,
     )
     name = Path(ctx.paths.conjecture_root).name
     dag = ctx.dag

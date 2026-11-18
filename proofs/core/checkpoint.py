@@ -395,7 +395,9 @@ def _validate_in_flight(ctx, raw: Any) -> Optional[Dict[str, Any]]:
         lemma_id
         and statement
         and isinstance(attempt, int)
-        and 1 <= attempt <= ctx.settings.max_proof_attempts
+        and 1 <= attempt
+        and (ctx.settings.max_proof_attempts < 0
+             or attempt <= ctx.settings.max_proof_attempts)
     ):
         return None
     stage = raw.get("stage") if raw.get("stage") in STAGES else "prove"

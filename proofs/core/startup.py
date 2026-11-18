@@ -111,8 +111,8 @@ only the max_tokens reason() asks for, so the room for thinking and
 answering is kept here. Every agent prompt that shows the lemma window is
 fitted before it is sent (_fit_prompt): one that would leave less than the
 reply's reserve (RESERVE_TOKENS) plus room for lookups (LOOKUP_ROOM) is
-rebuilt with a smaller window — the lemmas moved out of it are listed by
-id, one lookup away. Inside a call, the prompt is sized from the server's
+rebuilt with a smaller window — the lemmas moved out of it are one search
+away. Inside a call, the prompt is sized from the server's
 own count of the last one plus what was appended since; lookups close once
 the prompt reaches the reserve, a result that would cut into it is trimmed
 to fit, and each result tells the model how much room is left. A prompt
@@ -206,7 +206,8 @@ from typing import List, Optional
 
 from .. import llm
 from ..cli.flags import (
-    add_backend_flags, add_lemma_window_flags, add_tool_flags,
+    add_backend_flags, add_lemma_window_flags, add_settings_flags,
+    add_tool_flags,
 )
 from ..loops.mode import DEFAULT_MODE, HOTKEY_KEYS
 from ..loops.parallel import run_parallel
@@ -259,32 +260,7 @@ def main(
              f"root's {workspace.CONJECTURES_ROOT}/, or a path to it "
              "(required)",
     )
-    parser.add_argument(
-        "--max-iterations", type=int, default=None,
-        help=(
-            "Loop iterations before the run stops, per loop in a parallel "
-            "run; -1 runs until the conjecture is settled or you interrupt "
-            "it (default: run.max_iterations in .proofs-local.json, "
-            f"{settings_mod.DEFAULTS['run.max_iterations']} built in)"
-        ),
-    )
-    parser.add_argument(
-        "--max-proof-attempts", type=int, default=None,
-        help=(
-            "How many prover rounds the proof loop may spend on one lemma "
-            "per iteration (default: run.max_proof_attempts, "
-            f"{settings_mod.DEFAULTS['run.max_proof_attempts']} built in)"
-        ),
-    )
-    parser.add_argument(
-        "--max-rejected-lemmas", type=int, default=None,
-        help=(
-            "How many of the most recently rejected lemmas (lemmas that "
-            "went through every prover round unproved) the planner is shown "
-            "(default: run.max_rejected_lemmas, "
-            f"{settings_mod.DEFAULTS['run.max_rejected_lemmas']} built in)"
-        ),
-    )
+    add_settings_flags(parser)
     which = parser.add_mutually_exclusive_group()
     which.add_argument(
         "--fresh",
@@ -344,11 +320,7 @@ def main(
         ctx.ui.log(f"note: {ui_note}", err=True)
     # The settings first: flags over .proofs-local.json over the defaults.
     try:
-        ctx.settings = settings_mod.resolve(root, {
-            "run.max_iterations": args.max_iterations,
-            "run.max_proof_attempts": args.max_proof_attempts,
-            "run.max_rejected_lemmas": args.max_rejected_lemmas,
-        })
+        ctx.settings = settings_mod.resolve(root, settings_mod.flag_values(args))
     except settings_mod.SettingsError as e:
         parser.error(str(e))
     # Before the backend probe: with --tools this re-execs the command
@@ -356,7 +328,8 @@ def main(
     ctx.code = setup_code(args, parser, root, ui=ctx.ui)
     ctx.settings.lemmas_all = args.lemmas_all
     ctx.settings.my_lemmas = args.my_lemmas
-    ctx.settings.lemmas_common = args.lemmas_common
+    ctx.settings.strategy, ctx.settings.strategy_dial = args.strategy
+    ctx.settings.window_size = args.window_size
     ctx.settings.tool_mode = args.tool_mode
 
     ctx.model.name = args.model

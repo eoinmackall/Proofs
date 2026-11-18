@@ -18,6 +18,7 @@ from ..core.dag import (
 )
 from ..core.interrupts import _commit_section
 from ..validity.steps import VERIFIER_AGENTS
+from ..workspace import settings as settings_mod
 from .human import _operator_citation_check, _verify_operator_proof, choose
 from .json_repair import parse_json_or_none
 from .mode import check_mode_toggle
@@ -26,6 +27,7 @@ from .prompts import (
     log_candidates, planner_candidates, planner_dag_view, rejected_block,
     replan_note, select_lemma,
 )
+from . import strategies
 from .proof import run_proof_loop
 from .reasoning import extract, reason
 from .schemas import PLANNER_SCHEMA
@@ -34,9 +36,7 @@ from .schemas import PLANNER_SCHEMA
 def _of_budget(ctx, iteration: int) -> str:
     """An iteration as the log shows it: against the budget, when there is
     one."""
-    if ctx.settings.unlimited_iterations():
-        return str(iteration)
-    return f"{iteration}/{ctx.settings.max_iterations}"
+    return settings_mod.of_limit(iteration, ctx.settings.max_iterations)
 
 
 def _serial_on_round(
@@ -86,6 +86,9 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
     if not conjecture:
         ctx.ui.log(f"{ctx.paths.conjecture_file} is empty — write your conjecture there first.", verbose)
         return ctx.dag
+    # The prover and the reviser are shown the lemmas the planner was
+    # (strategies.py).
+    ctx.run.window_from_planner = True
 
     planner_sys = load_file(ctx.paths.prompt_paths["planner.md"])
     prover_sys = load_file(ctx.paths.prompt_paths["prover.md"])
@@ -140,7 +143,7 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
             ctx.ui.log(
                 f"Resuming at iteration {_of_budget(ctx, start_iteration)}, "
                 f"in-flight {in_flight['lemma_id']} at prover round "
-                f"{in_flight['attempt']}/{ctx.settings.max_proof_attempts}, "
+                f"{settings_mod.of_limit(in_flight['attempt'], ctx.settings.max_proof_attempts)}, "
                 f"{in_flight['stage']} step.",
                 verbose,
             )
@@ -245,7 +248,7 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
         if resuming:
             ctx.ui.log(
                 f"In-flight {in_flight['lemma_id']}: resuming prover round "
-                f"{in_flight['attempt']}/{ctx.settings.max_proof_attempts} at its "
+                f"{settings_mod.of_limit(in_flight['attempt'], ctx.settings.max_proof_attempts)} at its "
                 f"{in_flight['stage']} step (what the round had finished is "
                 f"kept; only the interrupted call is re-run).",
                 verbose,
@@ -277,6 +280,12 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
                 candidates = list(saved["candidate_lemmas"])
                 ctx.ui.log("Using the plan saved in the run's checkpoint.", verbose)
             else:
+                # The window for this plan and the proofs that follow it:
+                # chosen now, held until the next planning call.
+                strategies.for_planner(
+                    ctx, dag, suspended,
+                    strategies.plan_query(conjecture, ctx.run.live_state.get("plan")))
+
                 def build_planner() -> Tuple[str, Optional["tools_mod.ToolSet"]]:
                     return (
                         f"Conjecture:\n{conjecture}\n\n"
@@ -288,8 +297,7 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
                     )
                 planner_user, planner_tools = _fit_prompt(
                     ctx,
-                    "planner", planner_sys, build_planner, verbose, dag,
-                    suspended,
+                    "planner", planner_sys, build_planner, verbose,
                     parts={
                         "the conjecture": conjecture,
                         "the references block": planner_ref_block,

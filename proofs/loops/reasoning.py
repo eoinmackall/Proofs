@@ -15,6 +15,7 @@ import requests
 
 from .. import llm
 from .. import tools as tools_mod
+from ..workspace import settings as settings_mod
 from .json_repair import _THINK_RE, clean_json_text
 
 REQUEST_TIMEOUT = 5400       # 90 minutes: thinking models are slow, but a
@@ -426,6 +427,13 @@ def _compact_trace(ctx, role: str, thinking: str, tail: str, verbose: bool,
     return summary
 
 
+def compaction_passes(ctx, noun: str = "compaction passes") -> str:
+    """The passes an overflowed call was given, as a message names them:
+    "2 compaction passes", or "its compaction passes" with no limit."""
+    n = ctx.settings.max_compaction_passes
+    return f"its {noun}" if n < 0 else f"{n} {noun}"
+
+
 def _resume_compacted(
     ctx,
     role: str,
@@ -466,7 +474,7 @@ def _resume_compacted(
         # latest (not-yet-compacted) trace, and the verbatim answer.
         return {"summary": summary, "thinking": thinking, "answer": answer}
 
-    for _pass in range(max_passes):
+    for _pass in settings_mod.counts(max_passes):
         tail = answer[-COMPACT_TAIL_CHARS:]
         summary = _compact_trace(ctx, role, thinking, tail, verbose, summary)
 
@@ -581,7 +589,7 @@ def _incomplete_report(
     )
     parts = [
         "The prover ran out of its context window and did not finish: after "
-        f"{ctx.settings.max_compaction_passes} compaction-and-resume passes the proof was "
+        f"{compaction_passes(ctx, 'compaction-and-resume passes')} the proof was "
         "still incomplete. Read its work below and choose a smaller lemma it "
         "should try instead — or a corrected statement, if its work shows "
         "the statement is false or badly posed.",
@@ -869,9 +877,9 @@ def _reason(
     # Whether the server ever answered this call: if not, the empty result
     # is an outage ("unavailable"), not the model's.
     answered = False
-    while attempt < ctx.settings.llm_max_retries:
+    while settings_mod.below(attempt, ctx.settings.llm_max_retries):
         offer = (bool(tools) and not folded
-                 and rounds < max_rounds)
+                 and settings_mod.below(rounds, max_rounds))
         outgoing = _outgoing() if native else messages
         # As much room as the window has left, recomputed for this prompt:
         # the prompt differs every iteration and every role — and grows
@@ -946,13 +954,13 @@ def _reason(
                 continue
             attempt += 1
             ctx.ui.log(f"  {role} transport error (attempt {attempt}): {e}", verbose)
-            if attempt < ctx.settings.llm_max_retries:
+            if settings_mod.below(attempt, ctx.settings.llm_max_retries):
                 _retry_pause(ctx, attempt, e, role, verbose)
             continue
         except (requests.RequestException, ValueError, KeyError) as e:
             attempt += 1
             ctx.ui.log(f"  {role} transport error (attempt {attempt}): {e}", verbose)
-            if attempt < ctx.settings.llm_max_retries:
+            if settings_mod.below(attempt, ctx.settings.llm_max_retries):
                 _retry_pause(ctx, attempt, e, role, verbose)
             continue
 
@@ -1020,7 +1028,7 @@ def _reason(
                     # The room line and the last-call test both read the
                     # prompt with this result in it.
                     line = _room_line()
-                    last = (rounds >= max_rounds
+                    last = (not settings_mod.below(rounds, max_rounds)
                             or _spare() - _RESULT_FRAME_TOKENS
                             < _MIN_RESULT_TOKENS)
                     messages[-1]["content"] = (
@@ -1115,7 +1123,7 @@ def extract(
     # discovered it's remembered for the rest of the run.
     use_schema = not ctx.model.schema_mode_broken
 
-    for attempt in range(1, ctx.settings.llm_max_retries + 1):
+    for attempt in settings_mod.counts(ctx.settings.llm_max_retries, start=1):
         options = dict(ctx.extract_options)
         call_messages = messages
         if not use_schema:
@@ -1183,7 +1191,7 @@ def extract(
             return parsed
         except (requests.RequestException, KeyError, TypeError) as e:
             ctx.ui.log(f"  {role} extraction transport error (attempt {attempt}): {e}", verbose)
-            if attempt < ctx.settings.llm_max_retries:
+            if settings_mod.below(attempt, ctx.settings.llm_max_retries):
                 _retry_pause(ctx, attempt, e, f"{role} extraction", verbose)
         except json.JSONDecodeError as e:
             ctx.ui.log(f"  {role} extraction parse error (attempt {attempt}): {e}", verbose)

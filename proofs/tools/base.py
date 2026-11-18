@@ -27,15 +27,15 @@ There are two ways a model asks, and the loop speaks both:
     lets parse_json_call tell a call from an answer.
 
 The tools themselves are plug-ins, each in its own package
-(lookup_lemmas/, run_code/), and which of them an agent call is offered is
-theirs to say (tools/__init__.py).
+(lookup_lemmas/, search_lemmas/, run_code/), and which of them an agent
+call is offered is theirs to say (tools/__init__.py).
 
 Every result lands in a prompt that shares one context window with the
 answer still to come, so run() takes the room left for it, in characters
 (reason() works it out before each call, keeping its reply reserve out of
 it). A tool that knows its own structure trims to whole entries
-(lookup_lemmas returns whole statements); any other result is cut at a line
-boundary, with a marker saying so.
+(fit_entries: lookup_lemmas and search_lemmas return whole statements); any
+other result is cut at a line boundary, with a marker saying so.
 """
 
 from __future__ import annotations
@@ -94,6 +94,25 @@ def cut_to_budget(text: str, budget: Optional[int]) -> str:
     return text[:end] + marker
 
 
+def fit_entries(entries: List[Any], render: Callable[[List[Any], int], str],
+                budget: Optional[int]) -> str:
+    """The trim of a tool that returns whole entries (lookup_lemmas,
+    search_lemmas): render(entries, 0) when it fits the budget, or there is
+    none; else render(the first k, how many were left out) for the largest
+    k that fits; NO_ROOM when not even one does. Half a statement is worse
+    than none — the model would build on a hypothesis list cut short."""
+    text = render(entries, 0)
+    if budget is None or len(text) <= budget:
+        return text
+    best = NO_ROOM
+    for k in range(1, len(entries)):
+        trial = render(entries[:k], len(entries) - k)
+        if len(trial) > budget:
+            break
+        best = trial
+    return best
+
+
 @dataclass
 class ToolSet:
     tools: List[Tool] = field(default_factory=list)
@@ -112,9 +131,11 @@ class ToolSet:
 
     def max_rounds(self) -> int:
         """The rounds one agent call offered these tools may spend: the
-        most any of them asks for."""
-        return max((t.max_rounds or self.default_rounds for t in self.tools),
-                   default=self.default_rounds)
+        most any of them asks for, -1 (no limit) when one asks for that."""
+        rounds = [t.max_rounds or self.default_rounds for t in self.tools]
+        if not rounds:
+            return self.default_rounds
+        return -1 if min(rounds) < 0 else max(rounds)
 
     def prompt_hints(self) -> str:
         """The block reason() adds to the task while the tools are offered:
@@ -188,9 +209,12 @@ class ToolSet:
         lines = [
             "You have tools. To call one, reply with ONLY a JSON object of "
             'the form {"tool": "<name>", "arguments": {...}} and nothing '
-            "else; the result comes back in the next message. Call at most "
-            f"{self.max_rounds()} times, then give your answer in the format "
-            "asked for above. The tools:",
+            "else; the result comes back in the next message. "
+            + ("Call as many times as you need"
+               if self.max_rounds() < 0
+               else f"Call at most {self.max_rounds()} times")
+            + ", then give your answer in the format asked for above. "
+            "The tools:",
         ]
         for t in self.tools:
             lines.append(

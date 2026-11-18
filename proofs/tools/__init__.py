@@ -1,6 +1,7 @@
 """Tools the agents can call, and which of them an agent call is offered.
 
-Each tool is a plug-in in a package of its own (lookup_lemmas/, run_code/):
+Each tool is a plug-in in a package of its own (lookup_lemmas/,
+search_lemmas/, run_code/):
 an object with a name and an offer(ctx, call) that returns the Tool to offer
 the call described by call (Call), or None. The registry below lists them;
 offered() asks each in turn, and a call offered nothing carries no tools at
@@ -16,6 +17,7 @@ from typing import Any, Dict, List, Mapping, Optional, Protocol, Set
 from .base import NO_ROOM, Tool, ToolSet, cut_to_budget
 from .lookup_lemmas import LookupLemmas
 from .run_code.tool import RunCode
+from .search_lemmas import SearchLemmas
 
 __all__ = [
     "Call", "NO_ROOM", "Tool", "ToolPlugin", "ToolSet", "cut_to_budget",
@@ -38,8 +40,13 @@ class Call:
     lemmas: Optional[Mapping[str, Mapping[str, Any]]] = None
     # The lemmas no agent may build on (suspension.py).
     suspended: Set[str] = field(default_factory=set)
-    # The lemmas the window lists by id only.
-    index: List[Any] = field(default_factory=list)
+    # The DAG snapshot (core.dag.Dag) the agent's prompt was built from,
+    # when it is shown the lemma window.
+    dag: Any = None
+    # The lemmas the window shows in full, and how many eligible lemmas it
+    # leaves out (those the tools are for).
+    window: Set[str] = field(default_factory=set)
+    hidden: int = 0
 
 
 class ToolPlugin(Protocol):
@@ -73,4 +80,5 @@ def offered(ctx: Any, call: Call) -> Optional[ToolSet]:
 
 
 register(LookupLemmas())
+register(SearchLemmas())
 register(RunCode())

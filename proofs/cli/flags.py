@@ -6,10 +6,45 @@ from __future__ import annotations
 
 import argparse
 
+from typing import Iterable
+
+from ..workspace import settings as settings_mod
 from ..workspace.settings import (
-    DEFAULT_LEMMAS_ALL, DEFAULT_LEMMAS_COMMON, DEFAULT_MY_LEMMAS,
-    DEFAULT_NUM_CTX, DEFAULT_TOOL_MODE,
+    DEFAULT_LEMMAS_ALL, DEFAULT_MY_LEMMAS, DEFAULT_NUM_CTX, DEFAULT_TOOL_MODE,
+    DEFAULT_WINDOW_SIZE,
 )
+
+# What each settings flag sets (workspace/settings.py), before its default.
+_SETTINGS_HELP = {
+    "run.max_iterations":
+        "Loop iterations before the run stops, per loop in a parallel run; "
+        "-1 runs until the conjecture is settled or you interrupt it. Counted "
+        "from the run's checkpoint, so a resumed run goes on toward the same "
+        "total",
+    "run.max_proof_attempts":
+        "How many prover rounds the proof loop may spend on one lemma per "
+        "iteration",
+    "run.max_rejected_lemmas":
+        "How many of the most recently rejected lemmas (lemmas that went "
+        "through every prover round unproved) the planner is shown",
+    "run.max_loop_restarts":
+        "Parallel mode: restarts in a row of a crashed loop before it is "
+        "given up for the run",
+    "tools.max_rounds":
+        "Tool rounds (lookup_lemmas, search_lemmas) one agent call may "
+        "spend before it must answer",
+    "tools.code_rounds":
+        "Tool rounds one agent call offered run_code may spend",
+    "tools.max_lookup":
+        "Lemmas one lookup_lemmas call may return",
+    "tools.max_search":
+        "Lemmas one search_lemmas call may return",
+    "llm.max_retries":
+        "Attempts at one model call",
+    "llm.max_compaction_passes":
+        "Compaction-and-resume passes one truncated call may get before its "
+        "partial work is handed on",
+}
 
 
 def _window_size(text: str) -> int:
@@ -72,7 +107,7 @@ def add_tool_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--tool-mode", choices=("auto", "json"), default=DEFAULT_TOOL_MODE,
         help=(
-            "How agents call tools such as lookup_lemmas. auto (default): "
+            "How agents call tools such as search_lemmas. auto (default): "
             "the server's native tool calling, falling back to a JSON "
             "protocol if the server refuses it (llama-server needs --jinja "
             "for native calls). json: the JSON protocol from the start."
@@ -80,32 +115,76 @@ def add_tool_flags(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _strategy(text: str):
+    """--strategy's value (settings_mod.parse_strategy)."""
+    try:
+        return settings_mod.parse_strategy(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def add_lemma_window_flags(parser: argparse.ArgumentParser) -> None:
-    """--lemmas-all and --my-lemmas, the lemma window's two sizes: taken by
-    proofs run and by proofs repair, the two commands whose agents are
-    shown the proved lemmas."""
+    """--strategy and the lemma window's sizes: taken by proofs run and by
+    proofs repair, the two commands whose agents are shown the proved
+    lemmas (loops/strategies.py)."""
     parser.add_argument(
-        "--lemmas-all", type=_window_size, default=DEFAULT_LEMMAS_ALL, metavar="N",
+        "--strategy", type=_strategy, default=settings_mod.DEFAULT_STRATEGY,
+        metavar="NAME[,DIAL]",
         help=(
-            "Show the agents the N most recently proved lemmas, anyone's, "
-            f"in full (default: {DEFAULT_LEMMAS_ALL}; -1 for all). The rest are "
-            "listed by id."
+            "Which proved lemmas the agents are shown in full; the rest are "
+            "found with the search_lemmas tool. recent (default): the "
+            "--lemmas-all newest lemmas and your --my-lemmas newest. "
+            "random,BETA: a sample weighted toward deep lemmas, BETA from 0 "
+            "(uniform) to 1 (the deepest). depth,JITTER: lemmas nothing "
+            "cites yet with the longest citation chains beneath them, "
+            "JITTER from 0 (the deepest only) to 1 (any of them, uniformly). "
+            "breadth: lemmas nothing cites yet whose ancestries overlap "
+            "least. relevance: the lemmas a search finds for the agent's "
+            "task (the lemma being proved; the conjecture, or the latest "
+            "plan, for the planner). popular: the most cited lemmas. "
+            "Every strategy but recent shows --window-size lemmas. The "
+            "lemmas are chosen when the planner starts and, in a parallel "
+            "run or a repair, when a prover starts."
         ),
     )
     parser.add_argument(
-        "--lemmas-common", type=_window_size, default=DEFAULT_LEMMAS_COMMON,
-        metavar="K",
+        "--window-size", type=_window_size, default=DEFAULT_WINDOW_SIZE,
+        metavar="N",
         help=(
-            "Also show the K lemmas the shown lemmas cite most often, "
-            f"statement only (default: {DEFAULT_LEMMAS_COMMON}; -1 for every cited "
-            "lemma). Ties are broken randomly, fixed for the run."
+            "How many lemmas every strategy but recent shows (default: "
+            f"{DEFAULT_WINDOW_SIZE}; -1 for all)."
+        ),
+    )
+    parser.add_argument(
+        "--lemmas-all", type=_window_size, default=DEFAULT_LEMMAS_ALL, metavar="N",
+        help=(
+            "--strategy recent: show the N most recently proved lemmas, "
+            f"anyone's (default: {DEFAULT_LEMMAS_ALL}; -1 for all)."
         ),
     )
     parser.add_argument(
         "--my-lemmas", type=_window_size, default=DEFAULT_MY_LEMMAS, metavar="N",
         help=(
-            "Also show the N most recently proved of your own lemmas in "
-            f"full (default: {DEFAULT_MY_LEMMAS}; -1 for all). Overlap with "
-            "--lemmas-all is shown once."
+            "--strategy recent: also show the N most recently proved of "
+            f"your own lemmas (default: {DEFAULT_MY_LEMMAS}; -1 for all). "
+            "Overlap with --lemmas-all is shown once."
         ),
     )
+
+
+def add_settings_flags(parser: argparse.ArgumentParser,
+                       keys: Iterable[str] = settings_mod.KEYS) -> None:
+    """A flag for each of keys (settings_mod.FLAGS), overriding
+    .proofs-local.json for this command; settings_mod.flag_values reads
+    them back. Every one but --max-rejected-lemmas takes -1, no limit."""
+    for key in keys:
+        parser.add_argument(
+            settings_mod.FLAGS[key], dest=settings_mod.flag_dest(key),
+            type=int, default=None, metavar="N",
+            help=f"{_SETTINGS_HELP[key]}"
+                 + ("" if key in settings_mod.BOUNDED or key == "run.max_iterations"
+                    else "; -1 for no limit")
+                 + f" (default: {key} in "
+                 f"{settings_mod.LOCAL_FILENAME}, "
+                 f"{settings_mod.DEFAULTS[key]} built in)",
+        )

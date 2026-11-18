@@ -1,9 +1,10 @@
-"""lookup_lemmas: how an agent reads a proved lemma the lemma window lists by
-id only.
+"""lookup_lemmas: how an agent reads a proved lemma it has only the id of.
 
 The lemma window (loops/prompts.py, lemma_window) shows the agents the most
-recently proved lemmas in full and lists the rest by id only; an agent shown
-the window is offered this tool whenever it leaves some out.
+recently proved lemmas in full, each with the ids of the lemmas it cites;
+search_lemmas returns lemmas the same way. A cited lemma not shown in full
+is one lookup away. An agent shown the window is offered this tool
+whenever the window leaves some lemmas out.
 """
 
 from __future__ import annotations
@@ -11,8 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Mapping, Optional, Set
 
-from ..base import NO_ROOM, Tool
-
+from ..base import Tool, fit_entries
 
 
 def lemma_lookup(
@@ -33,7 +33,7 @@ def lemma_lookup(
         if not isinstance(wanted, list) or not wanted:
             return 'error: pass "lemmas", a non-empty list of lemma ids'
         found: List[Dict[str, Any]] = []
-        for entry in wanted[:max_lookup]:
+        for entry in (wanted if max_lookup < 0 else wanted[:max_lookup]):
             if isinstance(entry, dict):
                 entry = entry.get("id")
             lid = str(entry or "").strip()
@@ -51,38 +51,29 @@ def lemma_lookup(
                 })
         note = (
             f" (only the first {max_lookup} were looked up)"
-            if len(wanted) > max_lookup else ""
+            if 0 <= max_lookup < len(wanted) else ""
         )
-        text = json.dumps({"lemmas": found}, indent=2) + note
-        if budget is None or len(text) <= budget:
-            return text
-        # Not all of it fits the room left: whole statements, as many as
+
+        # Not all of it may fit the room left: whole statements, as many as
         # fit, in the order asked for, and a line saying what was left out.
-        # Half a statement is worse than none — the model would build on a
-        # hypothesis list cut short.
-        def left_out(n: int) -> str:
-            return (
-                f"\n({n} of the {len(found)} lemmas found were left out: "
-                "room in the context window is running out. Look up fewer "
-                "at a time, or answer with what you have.)"
-            )
-        kept: List[Dict[str, Any]] = []
-        for entry in found:
-            trial = json.dumps({"lemmas": kept + [entry]}, indent=2)
-            if len(trial) + len(note) + len(left_out(len(found))) > budget:
-                break
-            kept.append(entry)
-        if not kept:
-            return NO_ROOM
-        return (json.dumps({"lemmas": kept}, indent=2) + note
-                + left_out(len(found) - len(kept)))
+        def render(kept: List[Dict[str, Any]], left_out: int) -> str:
+            text = json.dumps({"lemmas": kept}, indent=2) + note
+            if left_out:
+                text += (
+                    f"\n({left_out} of the {len(found)} lemmas found were left "
+                    "out: room in the context window is running out. Look up "
+                    "fewer at a time, or answer with what you have.)"
+                )
+            return text
+
+        return fit_entries(found, render, budget)
 
     return Tool(
         name="lookup_lemmas",
         description=(
-            "Read the statements of proved lemmas listed in "
-            "other_proved_lemmas by id only. Give each by its id. At most "
-            f"{max_lookup} lemmas per call."
+            "Read the statements of proved lemmas by id: ids from a "
+            "cited_lemmas list, or from search results."
+            + ("" if max_lookup < 0 else f" At most {max_lookup} lemmas per call.")
         ),
         parameters={
             "type": "object",
@@ -94,21 +85,21 @@ def lemma_lookup(
         handler=handler,
         takes_budget=True,
         hint=(
-            "other_proved_lemmas lists proved lemmas by id only. Call "
-            "lookup_lemmas to read the statement of any of them before "
-            "relying on it."
+            "Lemmas not shown in full appear by id only, in cited_lemmas "
+            "lists. Call lookup_lemmas to read the statement of any of them "
+            "before relying on it."
         ),
     )
 
 
 class LookupLemmas:
     """The plug-in: offered to an agent shown the lemma window, when the
-    window lists some lemmas by id only."""
+    window leaves some lemmas out."""
 
     name = "lookup_lemmas"
 
     def offer(self, ctx: Any, call: Any) -> Optional[Tool]:
-        if call.lemmas is None or not call.index:
+        if call.lemmas is None or not call.hidden:
             return None
         return lemma_lookup(
             call.lemmas, call.suspended, max_lookup=ctx.settings.max_lookup,

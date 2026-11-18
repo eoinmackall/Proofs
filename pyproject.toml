@@ -11,6 +11,10 @@ requires-python = ">=3.9"
 license = "GPL-3.0-or-later"
 dependencies = ["requests", "rich", "orjson"]
 
+[project.optional-dependencies]
+# Faster, finer ancestry sketches for --strategy breadth (core/citations.py).
+fast = ["numpy"]
+
 [project.scripts]
 proofs = "proofs.cli.main:main"
 

@@ -18,6 +18,8 @@ from ..tools.run_code import computations, files
 from ..validity import verdicts
 from ..validity.citations import check_citations, scan_citations
 from ..validity.steps import role_of, verifier_steps
+from ..workspace import settings as settings_mod
+from . import strategies
 from .json_repair import parse_json_or_none
 from .prompts import (
     _fit_prompt, agent_tools, computations_block, planner_dag_view,
@@ -25,7 +27,7 @@ from .prompts import (
 )
 from .reasoning import (
     _incomplete_report, _reason_until_answered, _recorded_model, _same_model,
-    _wait_for_server, extract,
+    _wait_for_server, compaction_passes, extract,
 )
 from .schemas import REVISER_SCHEMA
 from .verifiers import _run_verifier, fan_out, stopping, verifier_prompt
@@ -250,7 +252,7 @@ def _proof_loop(
     # `attempt` is a while-loop counter rather than a for-range because the
     # reviser can reset it: a lemma it decomposes into a smaller one starts
     # its own prover rounds from 1 (see the new_lemma branch below).
-    while attempt <= ctx.settings.max_proof_attempts:
+    while settings_mod.within(attempt, ctx.settings.max_proof_attempts):
         if should_stop is not None and should_stop():
             return {
                 "proved": False,
@@ -270,6 +272,10 @@ def _proof_loop(
         # land, changes it between rounds, and a lemma suspended since the
         # last round must not be offered to the prover in this one.
         suspended = dag.suspension().suspended
+        # The lemmas this prover round, and the reviser after it, are shown
+        # (strategies.py): the planner's in a serial run, chosen now in a
+        # parallel loop or a repair.
+        strategies.for_prover(ctx, dag, suspended, str(target.get("statement") or ""))
         # Checkpoint: this prover round is now the resumable position, and
         # every step of it below publishes where it got to (stage, the
         # prover's output, each verdict). If the run is cancelled inside
@@ -296,10 +302,12 @@ def _proof_loop(
         on_round(in_flight_state)
         ctx.status(
             lemma=lemma_id,
-            attempt=f"{attempt}/{ctx.settings.max_proof_attempts}",
+            attempt=settings_mod.of_limit(attempt, ctx.settings.max_proof_attempts),
         )
         ctx.ui.log(
-            f"Proof attempt {attempt}/{ctx.settings.max_proof_attempts} for {lemma_id}.",
+            f"Proof attempt "
+            f"{settings_mod.of_limit(attempt, ctx.settings.max_proof_attempts)} "
+            f"for {lemma_id}.",
             verbose,
         )
 
@@ -357,7 +365,7 @@ def _proof_loop(
                 )
             prover_user, prover_tools = _fit_prompt(
                 ctx,
-                "prover", prover_sys, build_prover, verbose, dag, suspended,
+                "prover", prover_sys, build_prover, verbose,
                 parts={
                     "the conjecture": conjecture,
                     "the references block": reference_block,
@@ -434,7 +442,7 @@ def _proof_loop(
                 break
             ctx.ui.log(
                 f"Lemma {lemma_id} overflowed the context window after "
-                f"{ctx.settings.max_compaction_passes} compaction passes; asking the "
+                f"{compaction_passes(ctx)}; asking the "
                 f"reviser to pick a smaller lemma or revise the statement "
                 f"from the partial proof.",
                 verbose,
@@ -450,8 +458,7 @@ def _proof_loop(
                 )
             overflow_user, overflow_tools = _fit_prompt(
                 ctx,
-                "reviser", reviser_sys, build_overflow, verbose, dag,
-                suspended,
+                "reviser", reviser_sys, build_overflow, verbose,
                 parts={
                     "the conjecture": conjecture,
                     "the references block": reviser_ref_block,
@@ -485,7 +492,7 @@ def _proof_loop(
             new_stmt = str(revision_res.get("new_statement") or "").strip()
             overflow_feedback = [
                 f"Prover: the proof of {lemma_id} overflowed the context "
-                f"window after {ctx.settings.max_compaction_passes} compaction passes; "
+                f"window after {compaction_passes(ctx)}; "
                 f"the reviser is choosing a smaller lemma or a corrected "
                 f"statement from the partial work."
             ]
@@ -1003,7 +1010,7 @@ def _proof_loop(
             )
         reviser_user, reviser_tools = _fit_prompt(
             ctx,
-            "reviser", reviser_sys, build_reviser, verbose, dag, suspended,
+            "reviser", reviser_sys, build_reviser, verbose,
             parts={
                 "the conjecture": conjecture,
                 "the references block": reviser_ref_block,
@@ -1153,7 +1160,8 @@ def _proof_loop(
         "proved": proved,
         # The while condition is the only exit that leaves attempt past
         # the budget: a proof, an overflow give-up, or a stop leaves it.
-        "exhausted": not proved and attempt > ctx.settings.max_proof_attempts,
+        "exhausted": (not proved and not settings_mod.within(
+            attempt, ctx.settings.max_proof_attempts)),
         "lemma_id": lemma_id,
         "committed_id": committed_id,
         "claimed_id": claimed_id,

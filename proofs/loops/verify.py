@@ -400,6 +400,7 @@ def _verify_session(
     verbose: bool,
     parser: argparse.ArgumentParser,
     parallel: int = 1,
+    settings_flags: Optional[Dict[str, Any]] = None,
 ) -> None:
     """The shared setup of proofs verify and proofs repair: the backend
     and the conjecture's paths, the run's, minus the run's — no
@@ -412,11 +413,14 @@ def _verify_session(
 
     The certificates and refutations this session writes name the model
     _recorded_model() reports, not the --model request. parallel is
-    --parallel: how many of a lemma's verifiers run at once.
+    --parallel: how many of a lemma's verifiers run at once. settings_flags
+    is settings_mod.flag_values of the command's args: the settings flags
+    passed, over .proofs-local.json.
     """
     try:
         ctx.settings = settings_mod.resolve(
             workspace.find_root(Path(conjecture_dir).resolve()),
+            settings_flags,
         )
     except settings_mod.SettingsError as e:
         parser.error(str(e))
@@ -458,6 +462,7 @@ def verify_entry(
     run_code: bool = False,
     code: Optional[Code] = None,
     parallel: int = 1,
+    settings_flags: Optional[Dict[str, Any]] = None,
 ) -> int:
     """proofs verify NAME LEMMA_ID [--full]: the three verifier checks on
     the stored proof of a lemma that is already in the DAG, with the
@@ -484,6 +489,7 @@ def verify_entry(
         conjecture_dir=root, user_id=user_id, model=model, host=host,
         api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
         verbose=verbose, parser=parser, parallel=parallel,
+        settings_flags=settings_flags,
     )
     dag = ctx.dag
     if lemma_id not in dag.lemmas:
@@ -551,6 +557,7 @@ def verify_uncertified_entry(
     parser: argparse.ArgumentParser,
     code: Optional[Code] = None,
     parallel: int = 1,
+    settings_flags: Optional[Dict[str, Any]] = None,
 ) -> int:
     """proofs verify NAME --uncertified: bring back, from the roots up,
     every suspended lemma that only a verification stands between and the
@@ -579,6 +586,7 @@ def verify_uncertified_entry(
         conjecture_dir=root, user_id=user_id, model=model, host=host,
         api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
         verbose=verbose, parser=parser, parallel=parallel,
+        settings_flags=settings_flags,
     )
     name = Path(ctx.paths.conjecture_root).name
     kinds = suspension_kinds(ctx.dag)
