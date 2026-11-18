@@ -1,0 +1,9 @@
+KaTeX 0.19.1 (https://katex.org), unmodified, from the npm package:
+dist/katex.min.js, dist/katex.min.css and the woff2 fonts.
+
+katex.min.js and katex.min.css: MIT License (LICENSE).
+fonts/*.woff2: SIL Open Font License 1.1 (fonts/OFL.txt), as each font's
+own metadata states; the fonts are not modified.
+
+export/html.py inlines all of it into every exported page, with both
+notices in a comment at the top of the page.

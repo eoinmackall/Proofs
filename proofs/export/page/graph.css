@@ -1,0 +1,202 @@
+/* The interactive citation graph (export/html.py). Colours are tokens:
+   light by default, dark under the viewer's OS setting unless the page's
+   toggle stamped data-theme="light", and dark whenever it stamped "dark". */
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --ink: #0b0b0b;
+  --ink2: #52514e;
+  --muted: #898781;
+  --hairline: rgba(11, 11, 11, 0.10);
+  --edge-ink: #0b0b0b;
+  --edge-alpha: 0.10;
+  --wash: rgba(252, 252, 251, 0.82);
+  --hl: rgba(11, 11, 11, 0.85);
+  --chip: #f0efec;
+  --u0: #2a78d6; --u1: #eb6834; --u2: #1baf7a; --u3: #eda100;
+  --u4: #e87ba4; --u5: #008300; --u6: #4a3aa7; --u7: #e34948;
+  --other: #898781;
+  --shadow: 0 6px 24px rgba(11, 11, 11, 0.12);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink2: #c3c2b7;
+    --muted: #898781;
+    --hairline: rgba(255, 255, 255, 0.10);
+    --edge-ink: #ffffff;
+    --edge-alpha: 0.12;
+    --wash: rgba(26, 26, 25, 0.84);
+    --hl: rgba(255, 255, 255, 0.85);
+    --chip: #2c2c2a;
+    --u0: #3987e5; --u1: #d95926; --u2: #199e70; --u3: #c98500;
+    --u4: #d55181; --u5: #008300; --u6: #9085e9; --u7: #e66767;
+    --shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --ink: #ffffff;
+  --ink2: #c3c2b7;
+  --muted: #898781;
+  --hairline: rgba(255, 255, 255, 0.10);
+  --edge-ink: #ffffff;
+  --edge-alpha: 0.12;
+  --wash: rgba(26, 26, 25, 0.84);
+  --hl: rgba(255, 255, 255, 0.85);
+  --chip: #2c2c2a;
+  --u0: #3987e5; --u1: #d95926; --u2: #199e70; --u3: #c98500;
+  --u4: #d55181; --u5: #008300; --u6: #9085e9; --u7: #e66767;
+  --shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--hairline);
+  background: var(--surface);
+  flex-wrap: wrap;
+}
+header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+header .scope { color: var(--ink2); font-size: 13px; }
+header .spacer { flex: 1; }
+header input, header button {
+  font: inherit;
+  color: var(--ink);
+  background: var(--page);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  padding: 5px 10px;
+}
+header input { width: min(320px, 60vw); }
+header button { cursor: pointer; }
+header button:hover { background: var(--chip); }
+
+main { position: relative; flex: 1; min-height: 0; }
+#stage { position: absolute; inset: 0; background: var(--surface); touch-action: none; }
+#stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+#stage.grab { cursor: grabbing; }
+#stage.point { cursor: pointer; }
+
+#legend {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  pointer-events: none;
+  font-size: 13px;
+  background: var(--wash);
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+#legend div { display: flex; align-items: center; gap: 8px; }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.dot.hollow { background: transparent !important; border: 2px solid var(--ink2); }
+#legend .note { color: var(--ink2); margin-top: 4px; }
+
+#tip {
+  position: absolute;
+  max-width: min(440px, 90vw);
+  max-height: 45vh;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+  padding: 10px 12px;
+  pointer-events: none;
+  z-index: 3;
+}
+#tip .meta, #panel .meta { color: var(--ink2); font-size: 12px; }
+#tip .tex { margin-top: 6px; }
+#tip .more { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+#panel {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(480px, 100%);
+  overflow-y: auto;
+  background: var(--surface);
+  border-left: 1px solid var(--hairline);
+  box-shadow: var(--shadow);
+  padding: 16px 18px 32px;
+  z-index: 4;
+}
+#panel[hidden], #tip[hidden] { display: none; }
+#panel .head { display: flex; align-items: flex-start; gap: 8px; }
+#panel .head .id { font-size: 13px; word-break: break-all; flex: 1; }
+#panel .close {
+  font: inherit; font-size: 18px; line-height: 1; cursor: pointer;
+  background: none; border: none; color: var(--ink2); padding: 2px 6px;
+}
+#panel h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin: 18px 0 6px;
+  font-weight: 600;
+}
+#panel label { display: flex; gap: 6px; align-items: center; color: var(--ink2); margin-top: 10px; }
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--ink2);
+  color: var(--ink2);
+  margin-left: 6px;
+}
+.links { display: flex; flex-wrap: wrap; gap: 4px; }
+.links button, .links span {
+  font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  border: 1px solid var(--hairline);
+  background: var(--page);
+  color: var(--ink);
+  border-radius: 4px;
+  padding: 2px 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.links button { cursor: pointer; }
+.links button:hover { background: var(--chip); }
+.links span { color: var(--muted); }
+.links .dot { width: 8px; height: 8px; }
+
+.tex { overflow-wrap: anywhere; }
+.tex .katex-display { overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+.tex .pb { display: block; height: 0.6em; }
+.tex ul, .tex ol { margin: 4px 0; padding-left: 22px; }
+.tex .env { margin: 6px 0; }
+.tex .env-name { font-weight: 600; }
+.tex .env-proof > .env-name { font-weight: normal; font-style: italic; }
+.tex code { font-size: 0.92em; }
+.tex hr { border: none; border-top: 1px solid var(--hairline); margin: 10px 0; }
+.empty { color: var(--muted); font-style: italic; }
+
+@media (max-width: 640px) {
+  #panel { top: auto; height: 60%; width: 100%; border-left: none; border-top: 1px solid var(--hairline); }
+  header .scope { display: none; }
+}

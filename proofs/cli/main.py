@@ -10,8 +10,8 @@
     proofs prune DIR                  remove refuted lemmas [--with-dependents]
     proofs migrate [DIR]              convert a format-1 workspace to streams
     proofs status DIR LEMMA_ID        a lemma's closure: hashes, certificates
-    proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR
-                                    write a LaTeX document of the DAG
+    proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR --format latex|html|png
+                                    write the DAG as LaTeX, an interactive graph or an image
     proofs limits DIR                 show the code limits in effect, and their sources
     proofs tools lock DIR             write DIR's tools.lock from its flake (maintainer)
     proofs tools check DIR            check DIR's declared tools and the sandbox
@@ -427,13 +427,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "export",
-        help="Write a LaTeX document of the DAG, in dependency order.",
+        help="Write the DAG as a LaTeX document, an interactive graph or an image.",
         description=(
-            "Write the DAG as a LaTeX document, in dependency order "
-            "(dependencies first): the complete DAG; with --user, the "
-            "lemmas that user's runs proved; with a lemma id, that lemma "
-            "and everything it cites. The document is written into the "
-            "-o/--out directory (created if it is not there yet)."
+            "Write the DAG — the complete DAG; with --user, the lemmas "
+            "that user's runs proved; with a lemma id, that lemma and "
+            "everything it cites — as a LaTeX document in dependency order "
+            "(--format latex), an interactive citation graph "
+            "in one self-contained HTML file (--format html), or a static "
+            "image of that graph (--format png, needs matplotlib). The file "
+            "is written into the -o/--out directory (created if it is not "
+            "there yet)."
         ),
     )
     p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
@@ -447,9 +450,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "-o", "--out", dest="out", required=True, metavar="OUT_DIR",
-        help="The directory the .tex file is written to, created if it is "
-             "not there yet. The document never lands in the project on "
+        help="The directory the file is written to, created if it is "
+             "not there yet. The export never lands in the project on "
              "its own.",
+    )
+    p.add_argument(
+        "--format", dest="fmt", choices=export_command.FORMATS, required=True,
+        help="latex: the document, in dependency order; html: the "
+             "interactive citation graph; png: a static image of the graph.",
+    )
+    p.add_argument(
+        "--theme", choices=("light", "dark"), default=None,
+        help="The image's colours, for --format png (default light). The "
+             "HTML page follows the viewer's setting, with a toggle.",
     )
     p.set_defaults(func=_cmd_export, parser=p)
     return parser
@@ -814,6 +827,9 @@ def _cmd_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         )
     if args.lemma_id is not None and args.user is not None:
         parser.error("give a LEMMA_ID or --user, not both")
+    if args.theme is not None and args.fmt != "png":
+        parser.error("--theme is for --format png; the HTML page follows "
+                     "the viewer's setting, with a toggle")
     root = _require_conjecture_dir(args.dir, args.user_id, args.workspace_root, parser)
     rc = export_command.export_entry(
         lemma_id=args.lemma_id,
@@ -822,6 +838,8 @@ def _cmd_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         root=str(root),
         user_id=args.user_id,
         parser=parser,
+        fmt=args.fmt,
+        theme=args.theme or "light",
     )
     sys.exit(rc)
 

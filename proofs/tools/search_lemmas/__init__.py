@@ -37,7 +37,7 @@ def lemma_search(
     dag: Any,
     window: Set[str],
     suspended: Optional[Set[str]] = None,
-    max_search: int = 10,
+    max_search: int = 5,
 ) -> Tool:
     """search_lemmas over index, for an agent shown dag (the snapshot its
     prompt was built from) with the lemmas in window shown in full. One call

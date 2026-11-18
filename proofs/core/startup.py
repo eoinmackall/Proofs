@@ -145,8 +145,8 @@ Usage
     proofs verify algebra_example alice/3f9a2c1b4d5e6f70/42 --full
     proofs repair conjectures/algebra_example/refutations/alice--3f9a2c1b4d5e6f70--42--bob--20250102T030405Z.json
     proofs status algebra_example alice/3f9a2c1b4d5e6f70/42
-    proofs export algebra_example -o ~/tex
-    proofs export algebra_example alice/3f9a2c1b4d5e6f70/42 -o ~/tex
+    proofs export algebra_example --format latex -o ~/tex
+    proofs export algebra_example alice/3f9a2c1b4d5e6f70/42 --format html -o ~/graphs
 
 proofs run calls main() with DIR as --conjecture; verify, repair, prune,
 status and export call the *_entry functions below.

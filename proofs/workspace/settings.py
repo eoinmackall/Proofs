@@ -58,7 +58,7 @@ DEFAULTS: Dict[str, int] = {
     "tools.max_rounds": 8,
     "tools.code_rounds": 8,
     "tools.max_lookup": 10,
-    "tools.max_search": 10,
+    "tools.max_search": 5,
     "llm.max_retries": 3,
     "llm.max_compaction_passes": 2,
 }

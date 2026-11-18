@@ -132,7 +132,9 @@ TEMPERATURES = {
 # _resume_compacted, between _headroom and reason below). A truncated
 # continuation is not a failure but the next pass; the passes run until the
 # answer completes, nothing is left to build on, or llm.max_compaction_passes is
-# spent. COMPACT_CHUNK_TOKENS bounds one compaction pass's input,
+# spent. COMPACT_SUMMARY_TOKENS is the room a compaction call keeps for the
+# summary it writes; the trace fills the rest of the window (_compact_budget),
+# so a trace is split into chunks only when it cannot fit one call.
 # COMPACT_TAIL_CHARS is what the compactor sees of the answer-so-far,
 # COMPACT_MIN_ROOM is the smallest headroom a continuation is worth attempting.
 #
@@ -152,7 +154,7 @@ COMPACT_ENABLED = True
 COMPACT_THRESHOLD = 0.99
 
 
-COMPACT_CHUNK_TOKENS = 24000
+COMPACT_SUMMARY_TOKENS = 16384
 
 
 COMPACT_TAIL_CHARS = 2000
@@ -343,36 +345,18 @@ def _split_inline_thinking(content: str, thinking: str) -> Tuple[str, str]:
     return content, thinking
 
 
-def _split_trace_chunks(ctx, text: str, max_tokens: int) -> List[str]:
-    """Split a trace into line-aligned chunks of at most ~max_tokens, so a
-    compaction pass never needs more than a fraction of the window. Breaking
-    on newlines keeps no LaTeX display cut mid-line; a chunk may still exceed
-    the limit by one very long line, which the pass's headroom absorbs."""
-    ratio = ctx.model.backend.chars_per_token()
-    max_chars = max(int(max_tokens * ratio), 1000)
-    chunks: List[str] = []
-    cur = ""
-    for line in text.split("\n"):
-        if cur and len(cur) + len(line) + 1 > max_chars:
-            chunks.append(cur)
-            cur = line
-        else:
-            cur = f"{cur}\n{line}" if cur else line
-    if cur:
-        chunks.append(cur)
-    return chunks
+def _summary_room(num_ctx: int) -> int:
+    """The room a compaction call keeps for its summary, clamped like
+    _reserve so a small window still leaves most of itself for the trace."""
+    return min(COMPACT_SUMMARY_TOKENS, num_ctx // 4)
 
 
-def _compact_pass(ctx, part: str, prev: str, tail: str,
-                  part_no: int, n_parts: int, verbose: bool) -> str:
-    """One summarisation pass over part of the cut-off trace.
-
-    Returns the folded summary, or `prev` unchanged on any failure: the
-    compaction must never lose what it already had, and it is a rescue, not a
-    new stage that can fail the call.
-    """
+def _compact_messages(part: str, prev: str, tail: str, part_no: int,
+                      last: bool) -> List[Dict[str, str]]:
+    """The messages of one compaction call over part of the trace."""
+    which = "the last part" if last else "more parts follow"
     user = (
-        f"Part {part_no} of {n_parts} of the cut-off reasoning trace:\n"
+        f"Part {part_no} of the cut-off reasoning trace ({which}):\n"
         f"[Thinking trace]:\n{part}"
     )
     if prev:
@@ -385,10 +369,45 @@ def _compact_pass(ctx, part: str, prev: str, tail: str,
             "\n\n[The answer written before the cut, its tail — the work "
             f"ends here, mid-sentence]:\n{tail}"
         )
-    messages = [
+    return [
         {"role": "system", "content": COMPACT_SYSTEM},
         {"role": "user", "content": user},
     ]
+
+
+def _compact_budget(ctx, prev: str, tail: str) -> int:
+    """Tokens of trace one compaction call can take: the window left after
+    the call's fixed text (system prompt, framing, the summary so far, the
+    answer's tail) and the room kept for the summary it writes."""
+    num_ctx = ctx.extract_options["num_ctx"]
+    fixed = _estimate_tokens(ctx, _compact_messages("", prev, tail, 1, False))
+    return _room(fixed, num_ctx) - _summary_room(num_ctx)
+
+
+def _take_lines(lines: List[str], start: int, max_chars: int) -> int:
+    """The end of the longest run of lines from `start` that fits max_chars.
+    Breaking on newlines keeps no LaTeX display cut mid-line; the run is at
+    least one line, so one very long line still moves the split on, and the
+    summary's room absorbs the overshoot."""
+    end, size = start, 0
+    while end < len(lines):
+        add = len(lines[end]) + (end > start)
+        if end > start and size + add > max_chars:
+            break
+        size += add
+        end += 1
+    return end
+
+
+def _compact_pass(ctx, part: str, prev: str, tail: str,
+                  part_no: int, last: bool, verbose: bool) -> str:
+    """One summarisation pass over part of the cut-off trace.
+
+    Returns the folded summary, or `prev` unchanged on any failure: the
+    compaction must never lose what it already had, and it is a rescue, not a
+    new stage that can fail the call.
+    """
+    messages = _compact_messages(part, prev, tail, part_no, last)
     options = {
         **ctx.extract_options,
         "num_predict": _headroom(ctx, messages, ctx.extract_options["num_ctx"]),
@@ -397,12 +416,12 @@ def _compact_pass(ctx, part: str, prev: str, tail: str,
         reply = _chat(ctx, messages, think=None, schema=None,
                       options=options)
     except (requests.RequestException, ValueError, KeyError) as e:
-        ctx.ui.log(f"  compaction pass {part_no}/{n_parts} transport error: {e}",
+        ctx.ui.log(f"  compaction chunk {part_no} transport error: {e}",
             verbose)
         return prev
     summary = (reply.content or "").strip()
     if reply.truncated or not summary:
-        ctx.ui.log(f"  compaction pass {part_no}/{n_parts} was truncated or "
+        ctx.ui.log(f"  compaction chunk {part_no} was truncated or "
             f"empty; keeping the previous summary.", verbose)
         return prev
     return summary
@@ -410,20 +429,33 @@ def _compact_pass(ctx, part: str, prev: str, tail: str,
 
 def _compact_trace(ctx, role: str, thinking: str, tail: str, verbose: bool,
                    prev_summary: str = "") -> str:
-    """Summarise a cut-off reasoning trace in pi-style passes: chunked, each
-    pass folding the previous summary in. prev_summary carries an earlier
+    """Summarise a cut-off reasoning trace in pi-style passes: in one call
+    when it fits the window, else in chunks, each sized to what the window
+    leaves beside the summary so far and folding that summary in. prev_summary carries an earlier
     compaction round's result across, so a trace compacted in several rounds
     (a continuation that itself hit the wall) never loses what the first
     rounds established. Returns the summary, or prev_summary unchanged when
     the trace was empty or nothing survived the passes."""
     if not thinking.strip():
         return prev_summary
-    parts = _split_trace_chunks(ctx, thinking, COMPACT_CHUNK_TOKENS)
-    ctx.ui.log(f"  {role} trace too big to re-send; compacting in "
-        f"{len(parts)} pass(es).", verbose)
+    ratio = ctx.model.backend.chars_per_token()
+    ctx.ui.log(f"  {role} trace (~{int(len(thinking) / ratio)} tokens) too "
+        f"big to re-send; summarising it.", verbose)
+    lines = thinking.split("\n")
     summary = prev_summary
-    for i, part in enumerate(parts, 1):
-        summary = _compact_pass(ctx, part, summary, tail, i, len(parts), verbose)
+    start, part_no = 0, 0
+    while start < len(lines):
+        # Sized per chunk: the summary folded into the next call grows.
+        budget = _compact_budget(ctx, summary, tail)
+        end = _take_lines(lines, start, max(int(budget * ratio), 1000))
+        part = "\n".join(lines[start:end])
+        part_no += 1
+        last = end == len(lines)
+        ctx.ui.log(f"  compaction chunk {part_no}: ~{int(len(part) / ratio)} "
+            f"tokens of trace{' (last)' if last else ''}.", verbose)
+        summary = _compact_pass(ctx, part, summary, tail, part_no, last,
+                                verbose)
+        start = end
     return summary
 
 
@@ -474,7 +506,9 @@ def _resume_compacted(
         # latest (not-yet-compacted) trace, and the verbatim answer.
         return {"summary": summary, "thinking": thinking, "answer": answer}
 
-    for _pass in settings_mod.counts(max_passes):
+    for _pass in settings_mod.counts(max_passes, start=1):
+        ctx.ui.log(f"  {role} compaction pass "
+            f"{settings_mod.of_limit(_pass, max_passes)}.", verbose)
         tail = answer[-COMPACT_TAIL_CHARS:]
         summary = _compact_trace(ctx, role, thinking, tail, verbose, summary)
 

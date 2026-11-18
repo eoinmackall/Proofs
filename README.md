@@ -273,7 +273,7 @@ One command, twelve subcommands:
 | `proofs status DIR LEMMA_ID` | a conjecture, a lemma id | Lists the lemma's citation closure: each lemma's hash, stream file, valid certificates with how many times each was issued, and suspension; then whether the conjecture is settled. |
 | `proofs limits DIR` | a conjecture directory | Prints the [code limits](#limits) in effect on this machine and where each comes from. |
 | `proofs tools lock\|check DIR` | a conjecture directory | `lock`: the maintainer's tool — writes `tools.lock` from the conjecture's `flake.nix`. `check`: whether each declared tool is on PATH at its version, and whether the sandbox starts. See [Code tools](#code-tools-sage-python). |
-| `proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR` | a conjecture, an optional lemma id or user, the output directory | Writes a LaTeX document of the DAG, in dependency order, into OUT_DIR. |
+| `proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR --format latex\|html\|png [--theme light\|dark]` | a conjecture, an optional lemma id or user, the output directory, the format | Writes the DAG into OUT_DIR as a LaTeX document in dependency order, an interactive citation graph, or a static image of it. |
 
 Every command works inside a **workspace**, the directory `proofs init`
 marks with a `.proofs` file. A bare `NAME` always means `conjectures/NAME`
@@ -284,13 +284,32 @@ path is taken relative to the current directory, as usual. See
 `DIR` is a conjecture directory: a bare `NAME`, looked up in the
 workspace's `conjectures/`, or a path to one. `LEMMA_ID` is a lemma's id,
 `<user_id>/<run_id>/<6 hex digits>` — the user and the run that proposed it,
-and a random part — as the run's log and `proofs status` show it. `export` writes the DAG's LaTeX document — the
+and a random part — as the run's log and `proofs status` show it. `export` writes the
 complete DAG, the lemmas one user's runs proved (`--user`), or a lemma and
-everything it cites — in dependency order (dependencies first), into the
-directory `-o`/`--out` names (created if it is not there yet — the document is
-the user's artifact, and never lands in the project on its own): `proof.tex`,
-`<user_id>_proof.tex`, or the lemma's id with its slashes as `--`, plus
-`_proof.tex`.
+everything it cites, into the directory `-o`/`--out` names (created if it is
+not there yet — the export is the user's artifact, and never lands in the
+project on its own): `proof.<ext>`, `<user_id>_proof.<ext>`, or the lemma's
+id with its slashes as `--`, plus `_proof.<ext>`. `--format` (required)
+picks what it writes:
+
+- `latex` (`.tex`): the LaTeX document, in dependency order
+  (dependencies first).
+- `html` (`.html`): the interactive citation graph, in one self-contained
+  file that opens offline. Lemmas sit in rows by the longest citation chain
+  beneath them — so everything a lemma cites is below it and everything
+  citing it above — coloured by user, sized by how often they are cited,
+  hollow when suspended. Hovering a lemma highlights its edges and shows its
+  statement; clicking pins it in a side panel with its proof, what it cites
+  and what cites it, and can highlight its full chain. Wheel or pinch to
+  zoom, drag to pan, search by id. Light and dark themes follow the
+  viewer's setting, with a toggle. KaTeX renders the math: it is vendored,
+  unmodified, in `proofs/export/vendor/katex` (script and stylesheet MIT,
+  fonts SIL OFL 1.1) and inlined into the file, with both licences in a
+  comment at the top of the page.
+- `png` (`.png`): the same picture as a static image, sized to the graph
+  up to 3840×2160 and scaled down to fit past that, light unless
+  `--theme dark`. It needs matplotlib — in the Nix environment, `pip
+  install '.[png]'` otherwise.
 
 Every run acts as a **user**, named by a `user.id` that names its streams,
 begins the ids of the lemmas it commits, and is recorded in its certificates
@@ -335,9 +354,13 @@ proofs parse algebra_example
 # the DAG as a LaTeX document, in dependency order: the complete DAG, or
 # one user's lemmas, or a single lemma with everything it cites, written
 # into the directory -o names (created if it is not there yet)
-proofs export algebra_example -o ~/tex
-proofs export algebra_example --user alice -o ~/tex
-proofs export algebra_example alice/3f9a2c1b4d5e6f70/a41c07 -o ~/tex
+proofs export algebra_example --format latex -o ~/tex
+proofs export algebra_example --user alice --format latex -o ~/tex
+proofs export algebra_example alice/3f9a2c1b4d5e6f70/a41c07 --format latex -o ~/tex
+
+# the citation graph: interactive in a browser, or as an image
+proofs export algebra_example --format html -o ~/graphs
+proofs export algebra_example --format png --theme dark -o ~/graphs
 
 # start a new conjecture (conjectures/standard_d/ under the workspace
 # root), then write its statement into conjecture.md
@@ -426,7 +449,7 @@ lemmas out:
   statement, best match first, and finds the lemmas that cite a given
   lemma (`cites`) or that it cites (`cited_by`), newest first unless a
   query ranks them. It returns whole statements with their citations, at
-  most `tools.max_search` (10) per call, and pages on with `offset`. Its
+  most `tools.max_search` (5) per call, and pages on with `offset`. Its
   index is SQLite's full-text index (FTS5), held in memory, built in the
   background the first time the tool is offered and kept up to date by
   the run's commits; it is never written to disk. A query's words are
@@ -448,7 +471,7 @@ to offer itself. A tool is a name, a JSON Schema for its arguments, a
 handler, a hint (what the prompt tells the model about it) and its own
 round limit (`proofs/tools/base.py`). `reason()` runs the loop — at most
 `tools.max_rounds` (8) rounds per call unless a tool asks for more,
-`tools.max_lookup` (10) lemmas per lookup and `tools.max_search` (10) per
+`tools.max_lookup` (10) lemmas per lookup and `tools.max_search` (5) per
 search (see [Settings](#settings)) —
 using native tool calls where the server supports them and a JSON protocol
 otherwise (`--tool-mode`). The tools' hints are added to the
@@ -1122,6 +1145,11 @@ proofs/
     parsing.py         # standalone references/ → references.md parser
   export/
     latex.py           # the LaTeX export
+    graph.py           # the citation graph's layout: rows, order, sizes, colours
+    html.py            # the interactive graph: one self-contained page
+    png.py             # the static image of the graph (matplotlib)
+    page/              # the interactive page's script and stylesheet
+    vendor/katex/      # KaTeX (MIT; fonts OFL), inlined into the page
     command.py         # proofs export
   ui/
     plain.py           # line-by-line output
@@ -1354,7 +1382,7 @@ takes them all; `proofs verify` takes the `tools.*` and `llm.*` ones, and
 | `tools.max_rounds` | 8 | `--max-tool-rounds` | Tool rounds one agent call may spend before it must answer. |
 | `tools.code_rounds` | 8 | `--max-code-rounds` | The same, for a call offered `run_code`. |
 | `tools.max_lookup` | 10 | `--max-lookup` | Lemmas one `lookup_lemmas` call may return. |
-| `tools.max_search` | 10 | `--max-search` | Lemmas one `search_lemmas` call may return. |
+| `tools.max_search` | 5 | `--max-search` | Lemmas one `search_lemmas` call may return. |
 | `llm.max_retries` | 3 | `--max-retries` | Attempts at one model call. |
 | `llm.max_compaction_passes` | 2 | `--max-compaction-passes` | Compaction-and-resume passes one truncated call may get. |
 

@@ -14,6 +14,8 @@ dependencies = ["requests", "rich", "orjson"]
 [project.optional-dependencies]
 # Faster, finer ancestry sketches for --strategy breadth (core/citations.py).
 fast = ["numpy"]
+# proofs export --format png (export/png.py).
+png = ["matplotlib"]
 
 [project.scripts]
 proofs = "proofs.cli.main:main"
@@ -21,6 +23,8 @@ proofs = "proofs.cli.main:main"
 [tool.setuptools.packages.find]
 include = ["proofs*"]
 
-# The default agent prompts, installed beside the code (workspace.agents_dir).
+# The default agent prompts, installed beside the code (workspace.agents_dir),
+# and the HTML export's page and the KaTeX it inlines (export/html.py).
 [tool.setuptools.package-data]
-proofs = ["agents/*.md", "agents/parallel/*.md"]
+proofs = ["agents/*.md", "agents/parallel/*.md", "export/page/*",
+          "export/vendor/katex/*", "export/vendor/katex/fonts/*"]

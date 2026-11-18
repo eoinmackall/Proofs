@@ -1,6 +1,6 @@
 """The LaTeX export of a DAG.
 
-`proofs export NAME [LEMMA_ID] [--user USER_ID]` writes a LaTeX document of
+`proofs export NAME [LEMMA_ID] [--user USER_ID] --format latex` writes a LaTeX document of
 the DAG, in dependency order: every lemma comes after the lemmas it cites,
 so the document reads as a sequence of results each resting on the ones
 above it. What it is given is what the document holds:

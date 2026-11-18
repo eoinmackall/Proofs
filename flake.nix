@@ -30,6 +30,7 @@
           rich
           orjson
           numpy     # optional: finer, faster ancestry sketches for --strategy breadth
+          matplotlib  # optional: proofs export --format png
         ]);
 
         # The installed package: the proofs/ module copied into a Python home,
