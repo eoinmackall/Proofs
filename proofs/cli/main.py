@@ -208,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Make DIR a proofs workspace: create DIR/conjectures/, write "
             "the .proofs marker and a .proofs-local.json holding the default "
-            "code limits, and write or update the proofs block of "
+            "code limits and run settings, and write or update the proofs block of "
             "DIR/.gitignore (lines outside the block are left alone). Safe "
             "to re-run: existing files other than the block are kept. A DIR "
             "inside another workspace is refused."
