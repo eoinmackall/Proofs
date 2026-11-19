@@ -1,11 +1,11 @@
 """The status board: what each agent is doing.
 
-One row per agent — the serial run's loop, or each thread of a parallel
-run (the planner, the generator, loop-0, loop-1, ...) — updated by the
-loops as they move (Context.status). A row holds:
+One row per agent — the serial run's loop, or each worker of a parallel
+run (loop-0, loop-1, ...) — updated by the loops as they move
+(Context.status). A row holds:
 
     role      what the agent is doing now: "planner", "prover",
-              "verifier 2/3", "reviser", "waiting for a lemma", ...
+              "verifier 2/3", "reviser", "waiting for work", ...
     lemma     the lemma it is on: the candidate's id until it is committed
     attempt   the prover round, "k/N"
     event     the last thing that happened to it: "verifier 2 rejected",

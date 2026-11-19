@@ -22,6 +22,9 @@ the start. The keys:
                               the planner is shown
     run.max_loop_restarts     parallel mode: restarts in a row of a crashed
                               thread before it is given up for the run
+    run.replan_every          parallel mode: lemmas committed under a plan
+                              before the next is due; -1 re-plans only when
+                              the operator asks
     tools.max_rounds          tool rounds one agent call may spend before it
                               must answer (lookup_lemmas, search_lemmas)
     tools.code_rounds         the same, for a call offered run_code: a
@@ -55,6 +58,7 @@ DEFAULTS: Dict[str, int] = {
     "run.max_proof_attempts": 3,
     "run.max_rejected_lemmas": 4,
     "run.max_loop_restarts": 3,
+    "run.replan_every": 5,
     "tools.max_rounds": 8,
     "tools.code_rounds": 8,
     "tools.max_lookup": 10,
@@ -70,6 +74,7 @@ FIELDS: Dict[str, str] = {
     "run.max_proof_attempts": "max_proof_attempts",
     "run.max_rejected_lemmas": "max_rejected_lemmas",
     "run.max_loop_restarts": "max_loop_restarts",
+    "run.replan_every": "replan_every",
     "tools.max_rounds": "max_tool_rounds",
     "tools.code_rounds": "code_tool_rounds",
     "tools.max_lookup": "max_lookup",
@@ -101,6 +106,7 @@ class Settings:
     max_proof_attempts: int = DEFAULTS["run.max_proof_attempts"]
     max_rejected_lemmas: int = DEFAULTS["run.max_rejected_lemmas"]
     max_loop_restarts: int = DEFAULTS["run.max_loop_restarts"]
+    replan_every: int = DEFAULTS["run.replan_every"]
     max_tool_rounds: int = DEFAULTS["tools.max_rounds"]
     code_tool_rounds: int = DEFAULTS["tools.code_rounds"]
     max_lookup: int = DEFAULTS["tools.max_lookup"]
@@ -133,6 +139,7 @@ FLAGS: Dict[str, str] = {
     "run.max_proof_attempts": "--max-proof-attempts",
     "run.max_rejected_lemmas": "--max-rejected-lemmas",
     "run.max_loop_restarts": "--max-loop-restarts",
+    "run.replan_every": "--replan-every",
     "tools.max_rounds": "--max-tool-rounds",
     "tools.code_rounds": "--max-code-rounds",
     "tools.max_lookup": "--max-lookup",

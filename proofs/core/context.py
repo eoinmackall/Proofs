@@ -173,8 +173,8 @@ class LoopState:
     """The calling thread's own state."""
 
     # The agent this thread is, as the status board names its row: "main"
-    # for a serial run, verify or repair; "planner", "generator", "loop-N"
-    # for the threads of a parallel run.
+    # for a serial run, verify or repair; "loop-N" for the workers of a
+    # parallel run.
     agent: str = "main"
     # Whether this thread's loop may run code (the first code.loops loops
     # of a parallel run).

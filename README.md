@@ -19,9 +19,9 @@ is not built on until it is verified again. See
 [Sharing a conjecture](#sharing-a-conjecture).
 
 By default the loop is serial: one lemma in flight at a time. `--parallel N`
-runs N of these loops side by side around one shared DAG, steered by a planner
-and a lemma generator that work for all the loops at once — see
-[Parallel mode](#parallel-mode).
+runs N workers side by side around one shared DAG, each planning, generating
+candidate lemmas or proving as the run needs, so that no more than N model
+calls are ever in flight — see [Parallel mode](#parallel-mode).
 
 ## How it works
 
@@ -98,8 +98,8 @@ both conditions:
 
 The test is on the statement, so a proof committed under a renamed id
 (`conjecture_2`) counts too. The serial run checks at the top of every
-iteration and once after the last; the parallel planner checks on every DAG
-change. Either way, a run stops when a DAG it started from — another
+iteration and once after the last; a parallel run checks at the start and
+on every commit. Either way, a run stops when a DAG it started from — another
 user's pulled file among them — settles the conjecture. Editing `conjecture.md`, or a refutation or repair anywhere
 below the settling lemma, reopens the conjecture on its own. A DAG that
 proves both the conjecture and its negation
@@ -407,7 +407,7 @@ server options.
 | `--unsandboxed-code` | off | Run code without the sandbox (where bubblewrap is unavailable). Scripts then run with your permissions, network and files. |
 | `--fresh` | off | Start a new run, with an empty checkpoint, instead of continuing your most recent one. The DAG is kept. See [Cancelling a run](#cancelling-a-run-ctrl-c-and-resuming). |
 | `--resume RUN_ID` | off | Continue the given run from its checkpoint. |
-| `--parallel [N]` | off | Run N proof loops in parallel around one shared DAG, steered by one planner and one lemma generator. Bare `--parallel` is N=1. `--mode human`, when set, takes the place of one of the loops (loop-0). See [Parallel mode](#parallel-mode). |
+| `--parallel [N]` | off | Run N workers in parallel around one shared DAG; each plans, generates candidate lemmas or proves, as the run needs, so the run never makes more than N model calls at once. Bare `--parallel` is N=1. `--mode human`, when set, takes the place of one of the workers (loop-0). See [Parallel mode](#parallel-mode). |
 | `--num-ctx N` | the server's own (probed) | Context window in tokens. On a local llama-server: defaults to the `-c` it was launched with, as probed — lower it if VRAM is tight — and an explicit value is clamped to that ceiling. On a hosted `--host` API nothing is probed, so the default is 65536 and an explicit value replaces it. Budgeting above the server's own window is caught at once from the server's 400, which names its real limit and the `--num-ctx` to re-run with. |
 | `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
 | `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
@@ -433,8 +433,9 @@ built on it yet.
 
 Every other strategy shows `--window-size` lemmas; ties go to the
 more recent. The lemmas are chosen when the planner starts and held until
-it next starts: the parallel lemma generator, and in a serial run the prover
-and the reviser, are shown the planner's choice. In a parallel run each
+it next starts: in a serial run the prover and the reviser are shown the
+planner's choice. The parallel lemma generator chooses again on every call,
+since plans are written only every few commits. In a parallel run each
 loop's prover chooses again when it starts, as a repair's does, and its
 reviser is shown the same lemmas; a serial run's prover chooses for itself
 only under `relevance`, once per lemma. Every lemma shown carries the ids
@@ -944,22 +945,30 @@ live run or for the next prune, and left alone as forks (naming one).
 
 ## Parallel mode
 
-`--parallel N` runs N proof loops concurrently. Each loop is the same engine
-the serial run uses — prover, the three verifiers, reviser, one
-lemma at a time — and every loop reads and writes the same DAG. Two further
-threads steer them: a **planner** that keeps a shared strategy current, and a
-**lemma generator** that keeps the loops supplied with work.
+`--parallel N` runs N workers concurrently, and N is every model call the
+run makes at once: there is no separate planner or generator thread.
+Between lemmas, each worker takes the most urgent task there is:
+
+1. **plan** — write the shared strategy, when one is due and no other
+   worker is writing it;
+2. **generate** — write a batch of candidate lemmas into the buffer, when
+   it runs low;
+3. **prove** — claim the oldest lemma in the buffer and run the same engine
+   the serial run uses on it — prover, the three verifiers, reviser — then
+   go back for the next task.
+
+Every worker reads and writes the same DAG.
 
 ```sh
 proofs run conjectures/algebra_example --parallel 2
 proofs run conjectures/algebra_example --parallel 3 --mode human
 ```
 
-A bare `--parallel` is N=1: the parallel machinery with a single loop. The
-loops never work on the same lemma — the buffer below makes that impossible —
-a loop that has spent its budget stops on its own, and the run ends when the
-last loop out stops, which is also what tells the planner and generator to
-finish.
+A bare `--parallel` is N=1: one worker that plans, generates and proves in
+turn. The loops never work on the same lemma — the buffer below makes that
+impossible — a worker that has spent its budget stops on its own (the others
+take the planning and generating from there), and the run ends when the
+last worker out stops.
 
 ### Coding loops
 
@@ -979,20 +988,33 @@ a candidate `"computation": true` when proving it needs a computer search
 or an exact finite check. Only a coding loop claims a marked lemma — and a
 coding loop takes marked lemmas before any other — while a loop without
 code never does. At most one marked lemma per coding loop sits in the
-buffer at a time; one marked beyond that is **held** outside the buffer and
-enters it as a marked slot frees, so marked lemmas wait for the loops that
-can prove them without crowding out the loops that cannot. (Held lemmas
-are not in the checkpoint: after a restart the generator proposes afresh.)
+buffer at a time; one marked beyond that is discarded, as any candidate
+without a slot is, so marked lemmas never crowd out the loops that cannot
+prove them. When a loop without code asks for a batch while marked lemmas
+are waiting, the generator is asked to prefer lemmas any loop can prove.
 
 ### The shared possible-lemma list
 
 The loops do not take lemmas from the planner directly. Between them sits a
-fixed buffer of **N+5 slots** — the possible-lemma list. The generator is its
-only writer: each round it proposes five candidate lemmas
-(`proofs/agents/parallel/parallel_lemma_generator.md`), each given its own new
-id by the code, and they go into the empty slots. The slots are also the flow control: a full buffer means
-the loops are behind, and the generator waits for a free slot instead of
-piling up work.
+fixed buffer — the possible-lemma list — of **N+2k slots**: room for the N
+claimed lemmas and two batches, one being used up while the next is written.
+k is the most candidates one generator call is asked for, set by the
+context window: 4 at 64K, two more for each doubling and two fewer for each
+halving (2 at 32K, 6 at 128K), at least 1 and at most N. A few candidates
+per call leave the generator room to think about and search for each one.
+
+A generate task reserves its slots before it calls the model, so generators
+running at once never ask for more than the buffer can take; a call that
+fails gives its reservation back. A worker starts one when its **stock** —
+the unclaimed lemmas it could claim plus the reserved slots — falls to k (a
+loop without code does not count the lemmas marked for computation, so it
+restocks even while marked lemmas wait for the coding loops), so that a batch is
+still there to prove while the next is written; and also while the stock is
+short of the workers waiting with nothing to claim. The second rule is what
+runs several generators at once: at the start of a run, and after a failed
+call, when the buffer would otherwise run dry. A generator running beside
+others is pointed at a plan priority of its own, so their batches overlap
+less. Each candidate is given its own new id by the code.
 
 The buffer is a queue. An unattended loop claims the oldest unclaimed lemma —
 first in, first out, by arrival order — and the claim is made under lock, so
@@ -1009,20 +1031,25 @@ draws for it. Every id is drawn once, so two loops never commit under one.
 
 - **Planner** (`proofs/agents/parallel/parallel_planner.md`) sets direction, not
   lemmas: a strategy summary and an ordered list of priorities — which gaps
-  in the DAG to close next, and why. It runs once at start, and then whenever
-  the DAG changes: a lemma added by *any* loop bumps the DAG version and
-  marks the plan stale. If the DAG moves again *during* the planning call,
-  the plan is installed already marked stale and the planner goes straight
-  back around — no DAG change is lost, and the plan the loops are steering
-  by was always written for the DAG as it stood.
+  in the DAG to close next, and why. A plan is written at the start,
+  whenever the operator asks, and once `run.replan_every` (5) lemmas have
+  been committed since the plan in force was installed. Each plan is written from scratch, from the DAG and the reject
+  list, never from the plan before it. The buffer is left as it is: its lemmas were written from
+  the old plan, and the loops still take them; no new batch is written while
+  a new plan is on its way.
 - **Generator** (`proofs/agents/parallel/parallel_lemma_generator.md`) turns the
-  plan into five concrete candidate lemmas per round. It sees the conjecture,
-  the plan, the DAG, the buffer's current contents, and the reject list, so
-  it never restates a lemma the loops already have, hold, or failed.
+  plan into concrete candidate lemmas, k at most per call. It sees the
+  conjecture, the plan, the lemma window of the DAG — chosen afresh on every
+  call, so it takes in the lemmas proved since the plan (searching and
+  looking up the rest) — the buffer's current contents, and the reject
+  list, so it never restates a lemma the loops already have, hold, or
+  failed.
 
-The split is deliberate: the planner re-reads the whole DAG and is the costly
-call, so it runs only when the DAG moves; the generator is cheap and runs
-continuously against the fixed buffer.
+Planning is kept rare on purpose: a plan steers many lemmas, and the
+generator, which sees the current DAG on every call, keeps a slightly old
+plan useful. A plan or generator call that comes back with nothing usable is
+tried again 10 seconds later; one whose prompt does not fit the context
+window is tried again once what it is built from has changed.
 
 ### Budgets
 
@@ -1030,8 +1057,8 @@ Each loop gets the full `--max-iterations` budget, spent one iteration per
 lemma claimed. Resuming an in-flight lemma after a restart does not spend a
 new one — the iteration was already spent when the lemma was claimed — and a
 loop that dies holding a lemma still finishes it, budget or no. Failed
-attempts go to one shared reject list that the steering planner and the
-generator both read, so a route one loop found dead is dead for the whole
+attempts go to one shared reject list that the planner and the generator
+both read, so a route one loop found dead is dead for the whole
 run.
 
 ### Human mode and the hotkey
@@ -1041,8 +1068,12 @@ menu while loops 1..N-1 run unattended. The menu shows the shared buffer —
 each lemma marked with the loop that has claimed it — and everything the
 serial menu can do works the same: prove a lemma yourself (the verifiers
 check it before it goes into the shared DAG), send one through the proving
-pipeline, write your own, or reject the buffer and send the planner back. The hotkey and the menu's `a` still hand loop-0 between human
-and automatic mid-run; the other loops are always automatic. Quitting from
+pipeline, write your own, or reject the buffer and send the planner back
+(the menu returns once the new plan is in; a plan another worker was
+writing at that moment is dropped for yours, which carries your notes). Loop-0 still takes plan and
+generate tasks like any other worker, between its lemmas. The hotkey and the
+menu's `a` still hand loop-0 between human and automatic mid-run; the other
+loops are always automatic. Quitting from
 the menu stops the whole run, not just
 loop-0 — the other loops' in-flight lemmas go into the checkpoint and resume
 next time.
@@ -1115,7 +1146,7 @@ proofs/
     proof.py           # the proof loop: prover -> verifiers -> reviser
     verifiers.py       # one verification step
     serial.py          # the serial run
-    parallel.py        # the parallel run: buffer, steering planner and generator, N loops
+    parallel.py        # the parallel run: buffer, scheduler, N workers
     human.py           # human mode: the menu, the operator's own proof
     mode.py            # the auto/human toggle
     verify.py, repair.py  # proofs verify, proofs repair
@@ -1301,9 +1332,9 @@ is: `tool call`, `accept`, `reject`, `commit`, `compaction`, `warning` or
 `error`, each in its own colour. A message of several lines (a shortlist, a
 traceback) shows its first line and `...`. Under them is one line about the run (the conjecture, the
 model, the run id, the iteration, how long it has been going) and one row
-per agent — the serial run's loop, or a parallel run's planner, generator
-and each loop — with what it is doing (`planner`, `prover`, `verifier 2`,
-`reviser`, `waiting for a lemma`, ...), the lemma it is on, the prover
+per agent — the serial run's loop, or each worker of a parallel run — with
+what it is doing (`planner`, `generator`, `prover`, `verifier 2`,
+`reviser`, `waiting for work`, ...), the lemma it is on, the prover
 round, how long it has been at it, and the last thing that happened to it
 (`verifier 2/3 rejected`, `committed alice/3f9a2c1b4d5e6f70/5e02bd`).
 
@@ -1379,6 +1410,7 @@ takes them all; `proofs verify` takes the `tools.*` and `llm.*` ones, and
 | `run.max_proof_attempts` | 3 | `--max-proof-attempts` | Prover rounds one iteration may spend on a lemma. |
 | `run.max_rejected_lemmas` | 4 | `--max-rejected-lemmas` | Rejected lemmas the planning agents are shown. |
 | `run.max_loop_restarts` | 3 | `--max-loop-restarts` | Parallel mode: restarts in a row of a crashed thread before it is given up. |
+| `run.replan_every` | 5 | `--replan-every` | Parallel mode: lemmas committed under a plan before the next is due. `-1` re-plans only when the operator asks. |
 | `tools.max_rounds` | 8 | `--max-tool-rounds` | Tool rounds one agent call may spend before it must answer. |
 | `tools.code_rounds` | 8 | `--max-code-rounds` | The same, for a call offered `run_code`. |
 | `tools.max_lookup` | 10 | `--max-lookup` | Lemmas one `lookup_lemmas` call may return. |
@@ -1474,7 +1506,11 @@ step the loop hands the file's contents to the planner verbatim as a
 to read it: weigh the suggestions — when a comment points at a viable route
 the state of the proof allows, one of the five candidates should be a
 concrete version of it — but treat them as suggestions, not instructions,
-since a comment may be mistaken or stale.
+since a comment may be mistaken or stale. In a parallel run the steering
+planner reads the comments the same way, turning a viable one into one of
+its priorities; the note telling it how is added to its prompt only when
+there is a `comments.md` (and the note on the references only when it is
+shown references).
 
 The file is gitignored: each user keeps their own `comments.md`, and
 comments are never committed or shared. A clone you pull therefore carries

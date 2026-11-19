@@ -318,17 +318,18 @@ def _fit_prompt(
 def candidate(ctx, raw: Any, conjecture: str) -> Optional[Dict[str, Any]]:
     """A proposed lemma as the run takes it: a new id (new_lemma_id) and
     the statement, pinned when the entry settles the conjecture
-    (resolution.pin). None for an entry without a statement: dropped, not
-    repaired. Whatever id the model wrote, and any field the run does not
-    use (a dependencies list a planner volunteers must not pre-empt the
-    prover), is left behind."""
+    (resolution.pin) — so a settling entry may leave its statement empty.
+    None for any other entry without a statement: dropped, not repaired.
+    Whatever id the model wrote, and any field the run does not use (a
+    dependencies list a planner volunteers must not pre-empt the prover),
+    is left behind."""
     if not isinstance(raw, dict):
         return None
     statement = str(raw.get("statement") or "").strip()
-    if not statement:
-        return None
     pinned = resolution.pin(
         {"statement": statement, "settles": raw.get("settles")}, conjecture)
+    if not pinned["statement"]:
+        return None
     return {"id": new_lemma_id(ctx), **pinned}
 
 

@@ -29,6 +29,9 @@ _SETTINGS_HELP = {
     "run.max_loop_restarts":
         "Parallel mode: restarts in a row of a crashed loop before it is "
         "given up for the run",
+    "run.replan_every":
+        "Parallel mode: lemmas committed under a plan before the next is "
+        "due (the operator's replan asks for one at any time)",
     "tools.max_rounds":
         "Tool rounds (lookup_lemmas, search_lemmas) one agent call may "
         "spend before it must answer",

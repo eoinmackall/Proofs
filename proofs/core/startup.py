@@ -224,6 +224,7 @@ from ..workspace import settings as settings_mod
 from . import streams
 from .checkpoint import RunError, attach_run, open_run
 from .context import Context, Paths
+from .dag import _warn_suspended
 from .interrupts import _on_sigint
 
 
@@ -385,6 +386,12 @@ def main(
         parser.error(str(e))
     for warning in dag.warnings:
         ctx.ui.log(f"warning: {warning}", err=True)
+    # So is the suspension (suspension.py): nothing a run does can suspend a
+    # lemma — refutations are written by proofs verify and proofs repair, a
+    # commit is certified before it is written, and a proof citing a
+    # suspended lemma is turned away — and the run never reloads the DAG,
+    # so what it starts with is what it has throughout.
+    _warn_suspended(ctx, dag.suspension(), args.verbose)
 
     # The listener puts the terminal in cbreak mode, so it has to be stopped on
     # every exit path — including a traceback — or the shell you return to has

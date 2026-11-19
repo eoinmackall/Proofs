@@ -110,11 +110,11 @@ def for_planner(ctx, dag: Any, suspended: Collection[str], query: str) -> Window
 
 
 def for_generator(ctx, dag: Any, suspended: Collection[str], query: str) -> Window:
-    """The parallel lemma generator is shown the planner's window (chosen
-    here, for both, when the planner has not chosen one yet)."""
-    window = ctx.run.planning_window
-    if window is None:
-        window = ctx.run.planning_window = choose(ctx, dag, suspended, query)
+    """The parallel lemma generator chooses its own window on every call:
+    plans are written only every few commits, and a window held from the
+    last one would leave out the lemmas proved since — the very lemmas the
+    generator must not propose again."""
+    window = choose(ctx, dag, suspended, query)
     ctx.loop.window = window
     return window
 

@@ -14,7 +14,7 @@ from ..core.checkpoint import (
 )
 from ..core.dag import (
     _committed_in_run, _committed_uncertified, _settled, _uncertified_message,
-    _warn_suspended, commit_lemma_to_dag, load_file, new_lemma_id,
+    commit_lemma_to_dag, load_file, new_lemma_id,
 )
 from ..core.interrupts import _commit_section
 from ..validity.steps import VERIFIER_AGENTS
@@ -163,9 +163,6 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
         return ctx.dag
 
     warned_dangling = set()
-    # The suspension warning last told this run: told again only when its
-    # counts change.
-    warned_suspended: Dict[str, Any] = {}
     ctx.run.live_state["rejected_lemmas"] = rejected_lemmas
     ctx.run.live_state["in_flight"] = in_flight
     ctx.run.live_state["plan"] = plan
@@ -188,9 +185,9 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
         # The suspension, computed from the in-memory DAG's hashes,
         # certificates and refutations (see suspension.py): the lemmas this
         # iteration's planner and prover are hidden from. It is never
-        # stored in the DAG — the computation is the only record of it.
+        # stored in the DAG — the computation is the only record of it —
+        # and it was told once at startup.
         susp = dag.suspension()
-        _warn_suspended(ctx, susp, verbose, warned_suspended)
         suspended = susp.suspended
 
         # Settled? Only a certified lemma stating the conjecture (or its
