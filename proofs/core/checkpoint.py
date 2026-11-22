@@ -62,7 +62,7 @@ draws one again. An in-flight record is one loop's lemma:
                                       shown)
     code_dir                          the loop's code directory under the
                                       run's scratch (tools/run_code/files.py)
-    stage                             "prove", "verify" or "revise": the
+    stage                             "prove", "verify", "citations" or "revise": the
                                       step the loop resumes at
     proof                             the prover's parsed output for this
                                       round (proof, cited_lemmas,
@@ -77,6 +77,13 @@ draws one again. An in-flight record is one loop's lemma:
                                        model, requested, hash}, written as
                                       each finishes
 
+The citations stage keeps the accepted proof's hash and its selected
+checks (including an empty selection), their receipt IDs, per-agent
+verdicts and completed outcomes until the batch is committed. A check list
+that does not validate is not resumed (the loop goes back to "verify"),
+but its finished, unwritten results are handed on as abandoned_checks and
+written by recovery, so a received rejection is never dropped.
+
 A loop resuming at "verify" runs only the verifiers missing from verdicts,
 and at "revise" goes straight to the reviser. A saved verdict counts only
 while the hash it checked is the proof's hash now and it came from the
@@ -89,11 +96,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Set
 
 from . import locking
 
@@ -101,7 +109,23 @@ CHECKPOINTS_DIRNAME = "checkpoints"
 CHECKPOINT_FILENAME = "checkpoint.json"
 RUN_LOCK_FILENAME = "run.lock"
 
-STAGES = ("prove", "verify", "revise")
+STAGES = ("prove", "verify", "revise", "citations")
+
+
+class CitationCheckpointError(OSError):
+    """No durable intent for a batch that might write verification evidence."""
+
+
+def report_checkpoint_stop(ctx, err: OSError, verbose: bool = True) -> None:
+    """The clean stop for a CitationCheckpointError. It is raised before any
+    agent is called or record written, so the files on disk are consistent
+    and the last checkpoint that did land is still a valid resume point."""
+    ctx.ui.log(
+        f"Could not write the checkpoint ({err}); stopping the run. Nothing "
+        f"already recorded is lost: re-run the same command to resume once "
+        f"the checkpoint can be written.",
+        verbose,
+    )
 
 
 class RunError(Exception):
@@ -378,6 +402,71 @@ def _validate_verdicts(raw: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def flights_in(data: Any) -> Iterator[Dict[str, Any]]:
+    """The in-flight records in either checkpoint shape (also used by prune)."""
+    if not isinstance(data, dict):
+        return
+    loops = data.get('loops')
+    slots = loops.values() if isinstance(loops, dict) else (data,)
+    for slot in slots:
+        if isinstance(slot, dict) and isinstance(slot.get('in_flight'), dict):
+            yield slot['in_flight']
+
+
+_CHECK_ID = re.compile(r'[0-9a-f]{32}')
+_CHECK_KEYS = ('lemma_id', 'hash', 'file', 'check_id')
+
+
+def _well_formed_check(check: Any) -> bool:
+    """The fields every check carries, and that its record would be written from."""
+    return (isinstance(check, dict)
+            and all(isinstance(check.get(k), str) and check[k] for k in _CHECK_KEYS)
+            and bool(_CHECK_ID.fullmatch(check['check_id'])))
+
+
+def _salvage_checks(raw: Any) -> List[Dict[str, Any]]:
+    """The finished, unwritten results in a check list that cannot be
+    resumed, each cut down to what its record needs: lemma_id, hash, file,
+    check_id, outcome, model, and a rejection's justification. Objections
+    are left out, so a salvaged acceptance dismisses no refutation."""
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for check in raw if isinstance(raw, list) else []:
+        if (not _well_formed_check(check) or check['check_id'] in seen
+                or check.get('published')
+                or check.get('outcome') not in ('accepted', 'rejected')
+                or not isinstance(check.get('model'), str)
+                or (check['outcome'] == 'rejected'
+                    and not isinstance(check.get('justification'), str))):
+            continue
+        seen.add(check['check_id'])
+        keys = (*_CHECK_KEYS, 'outcome', 'model') + (
+            ('justification',) if check['outcome'] == 'rejected' else ())
+        out.append({k: check[k] for k in keys})
+    return out
+
+
+def _validate_checks(raw: Any) -> Optional[List[Dict[str, Any]]]:
+    """A selected (possibly empty) queue; None if it must be selected anew."""
+    if not isinstance(raw, list):
+        return None
+    checks: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for check in raw:
+        if (not _well_formed_check(check)
+                or check['lemma_id'] in seen
+                or check.get('outcome') not in (None, 'accepted', 'rejected')
+                or not isinstance(check.get('objections', {}), dict)):
+            return None
+        seen.add(check['lemma_id'])
+        if check.get('outcome') and not isinstance(check.get('model'), str):
+            return None
+        if check.get('outcome') == 'rejected' and not isinstance(check.get('justification'), str):
+            return None
+        checks.append(dict(check, verdicts=_validate_verdicts(check.get('verdicts'))))
+    return checks
+
+
 def _validate_in_flight(ctx, raw: Any) -> Optional[Dict[str, Any]]:
     """The in-flight state a resuming loop is handed, or None (see the
     module docstring for the fields). Every field but the lemma, its
@@ -404,7 +493,18 @@ def _validate_in_flight(ctx, raw: Any) -> Optional[Dict[str, Any]]:
     proof = raw.get("proof") if isinstance(raw.get("proof"), dict) else None
     if proof is None:
         stage = "prove"
+    checks = _validate_checks(raw.get('checks')) if stage == 'citations' else None
+    if stage == 'citations':
+        cited = proof.get('cited_lemmas')
+        if (checks is None or not isinstance(cited, list) or
+                not {c['lemma_id'] for c in checks}.issubset(str(lid) for lid in cited)):
+            stage, checks = 'verify', None
+    # A list that cannot be resumed may still hold finished results nobody
+    # wrote; recovery writes them (citation_checks.recover_checks).
+    abandoned = _salvage_checks(raw.get('checks')) if checks is None else []
     return {
+        **({'checks': checks, 'audit_hash': raw.get('audit_hash')} if checks is not None else {}),
+        **({'abandoned_checks': abandoned} if abandoned else {}),
         "lemma_id": lemma_id,
         "claimed_id": str(raw.get("claimed_id") or lemma_id),
         "target": {"id": lemma_id, "statement": statement},
@@ -514,6 +614,10 @@ def _atomic_write_checkpoint_file(ctx, data: Dict[str, Any], verbose: bool) -> N
             os.remove(tmp)
         except OSError:
             pass
+        if any(f.get('stage') == 'citations' for f in flights_in(data)):
+            # This is also the transaction intent: don't call agents or
+            # append receipts if recovery wouldn't know their check IDs.
+            raise CitationCheckpointError(str(e)) from e
 
 
 def discard_checkpoint(ctx) -> None:

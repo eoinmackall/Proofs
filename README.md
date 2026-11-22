@@ -273,7 +273,7 @@ One command, twelve subcommands:
 | `proofs status DIR LEMMA_ID` | a conjecture, a lemma id | Lists the lemma's citation closure: each lemma's hash, stream file, valid certificates with how many times each was issued, and suspension; then whether the conjecture is settled. |
 | `proofs limits DIR` | a conjecture directory | Prints the [code limits](#limits) in effect on this machine and where each comes from. |
 | `proofs tools lock\|check DIR` | a conjecture directory | `lock`: the maintainer's tool — writes `tools.lock` from the conjecture's `flake.nix`. `check`: whether each declared tool is on PATH at its version, and whether the sandbox starts. See [Code tools](#code-tools-sage-python). |
-| `proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR --format latex\|html\|png [--theme light\|dark]` | a conjecture, an optional lemma id or user, the output directory, the format | Writes the DAG into OUT_DIR as a LaTeX document in dependency order, an interactive citation graph, or a static image of it. |
+| `proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex\|html\|png [--theme light\|dark]` | a conjecture, an optional lemma id or user, the output directory, an optional file name, the format | Writes the DAG into OUT_DIR as a LaTeX document in dependency order, an interactive citation graph, or a static image of it. |
 
 Every command works inside a **workspace**, the directory `proofs init`
 marks with a `.proofs` file. A bare `NAME` always means `conjectures/NAME`
@@ -289,7 +289,10 @@ complete DAG, the lemmas one user's runs proved (`--user`), or a lemma and
 everything it cites, into the directory `-o`/`--out` names (created if it is
 not there yet — the export is the user's artifact, and never lands in the
 project on its own): `proof.<ext>`, `<user_id>_proof.<ext>`, or the lemma's
-id with its slashes as `--`, plus `_proof.<ext>`. `--format` (required)
+id with its slashes as `--`, plus `_proof.<ext>`. `-n`/`--name NAME` names
+the file instead: the format's extension is added unless `NAME` already
+ends in it (`-n semisimplicity --format html` writes `semisimplicity.html`);
+a path, or another format's extension, is refused. `--format` (required)
 picks what it writes:
 
 - `latex` (`.tex`): the LaTeX document, in dependency order
@@ -730,7 +733,7 @@ in the same file and a merge is only ever additions.
 | `dags/<user_id>/<run_id>/*.jsonl` | that run: its lemmas, and a repair's reproofs | yes |
 | `certificates/<user_id>/<run_id>/*.jsonl` | that run (`run`, `verify`, `repair`): its acceptances | yes |
 | `computations/<user_id>/<run_id>/*.jsonl`, `code/<user_id>/<run_id>/` | that run: its code executions, and the scripts its lemmas rest on | yes |
-| `refutations/<user_id>--<run_id>--<hex>--<verifier>--<time>.json` | the verifier's `verify` or `repair`; deleted by any user's `verify` or `repair` that accepts the lemma, and by `prune` | yes |
+| `refutations/<user_id>--<run_id>--<hex>--<verifier>--<time>.json` | a stored-proof check (`verify`, `repair`, or a citation recheck); deleted when answered or pruned | yes |
 | `checkpoints/<user_id>/<run_id>/` | that user's runs: the checkpoint and the run's lock | no (gitignored) |
 | `references/`, `comments.md` | each user, locally | no (gitignored) |
 
@@ -818,13 +821,38 @@ certificate is **valid** only while its hash
 matches the lemma's current hash, so editing a lemma, or the statement of
 anything it cites, quietly invalidates its certificates.
 
+### Citation rechecks in `proofs run`
+
+After a prover's proof passes its own verifiers, and before committing it,
+`proofs run` independently samples each distinct **direct lemma citation**.
+For base `p` and `d` successful verification rounds for the cited lemma's
+**current hash**, the probability is `p^(-d)`. The initial acceptance counts
+as one round, not three or four agents. With the default `p=2`, the first
+chance is 1/2; after a second acceptance it is 1/4. Set
+`"run.citation_recheck_base": 1` in `.proofs-local.json` to always check,
+or `-1` to disable new selections. Reference entries are not checked and
+rechecks do not trigger further sampling. Operator-written proofs,
+`proofs verify` and `proofs repair` do not initiate these checks.
+
+Selected lemmas are checked in citation order, including the coding verifier
+for a proof with computations (no automatic script re-execution). A rejection
+refutes the **cited** lemma. The new proof is still certified and committed,
+but suspension propagates to it and all other dependents. If any direct citation
+has already become suspended, remaining checks are skipped. Completed outcomes
+are published with the commit; recovery reconciles any completed checks
+left in the checkpoint before deciding whether the run is settled. A missing verdict pauses the run: resume to
+retry the missing step, without rerolling the selection. The checkpoint keeps
+check IDs and finished steps; matching IDs on certificates and refutations
+prevent counting a check twice after an interruption. Counts are derived in
+memory from certificate records, including compacted counts. A full check of
+a settling proof's dependencies remains an explicit `proofs verify DIR LEMMA_ID --full`.
+
 ### Refutations
 
 A **refutation** (`proofs/core/refutations.py`) records a rejection by `proofs
-verify` or `proofs repair`: one file per rejection, holding the lemma's
+verify`, `proofs repair`, or a citation recheck: one file per rejection, holding the lemma's
 id and hash, the verifier, the model, the date, the verifier's
-justification, and the stream file holding the version it rejects. Rejections inside `proofs run` are not refutations; they
-are feedback to that run's reviser. A refutation *counts* while its hash
+justification, and the stream file holding the version it rejects. A rejection of a *proposed* proof inside `proofs run` is feedback to the reviser, not a refutation. A refutation *counts* while its hash
 matches the lemma's current hash. When the lemma changes, the refutation
 goes stale but is kept, and its justification is shown to the verifiers
 the next time the lemma is verified, so a known objection is not
@@ -1366,8 +1394,8 @@ otherwise lose: where the iteration budget stood, the latest plan, the
 planner's reject list (`rejected_lemmas`: the statements of the last
 `run.max_rejected_lemmas` lemmas that spent every prover round unproved),
 and the lemma in flight — its prover round, the step it reached (`prove`,
-`verify` or `revise`), the prover's output for that round, and the verdict
-of every verifier that finished. It is written after every step, and
+`verify`, `citations` or `revise`), the prover's output for that round,
+the selected citation rechecks, and the verdict of every verifier that finished. It is written after every step, and
 deleted when the conjecture resolves; any other exit keeps it, with nothing
 in flight after a clean one.
 
@@ -1401,7 +1429,7 @@ gitignored `.proofs-local.json` (`proofs init` writes every key at its
 default). Each key's flag beats the file for one command. `proofs run`
 takes them all; `proofs verify` takes the `tools.*` and `llm.*` ones, and
 `proofs repair` those and `--max-proof-attempts`. Every key but
-`run.max_rejected_lemmas` takes `-1` for no limit, in the file or a flag
+`run.max_rejected_lemmas` and `run.citation_recheck_base` takes `-1` for no limit, in the file or a flag
 (tool rounds are then bounded by the context window alone).
 
 | Key | Default | Flag | Meaning |
@@ -1410,6 +1438,7 @@ takes them all; `proofs verify` takes the `tools.*` and `llm.*` ones, and
 | `run.max_proof_attempts` | 3 | `--max-proof-attempts` | Prover rounds one iteration may spend on a lemma. |
 | `run.max_rejected_lemmas` | 4 | `--max-rejected-lemmas` | Rejected lemmas the planning agents are shown. |
 | `run.max_loop_restarts` | 3 | `--max-loop-restarts` | Parallel mode: restarts in a row of a crashed thread before it is given up. |
+| `run.citation_recheck_base` | 2 | `--citation-recheck-base` | Direct citation check probability `p^(-d)`; `1` always, `-1` off. |
 | `run.replan_every` | 5 | `--replan-every` | Parallel mode: lemmas committed under a plan before the next is due. `-1` re-plans only when the operator asks. |
 | `tools.max_rounds` | 8 | `--max-tool-rounds` | Tool rounds one agent call may spend before it must answer. |
 | `tools.code_rounds` | 8 | `--max-code-rounds` | The same, for a call offered `run_code`. |

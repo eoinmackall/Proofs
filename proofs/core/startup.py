@@ -386,11 +386,8 @@ def main(
         parser.error(str(e))
     for warning in dag.warnings:
         ctx.ui.log(f"warning: {warning}", err=True)
-    # So is the suspension (suspension.py): nothing a run does can suspend a
-    # lemma — refutations are written by proofs verify and proofs repair, a
-    # commit is certified before it is written, and a proof citing a
-    # suspended lemma is turned away — and the run never reloads the DAG,
-    # so what it starts with is what it has throughout.
+    # Build the initial suspension cache. A citation recheck can later
+    # refute a stored lemma and invalidate this cache for the new snapshot.
     _warn_suspended(ctx, dag.suspension(), args.verbose)
 
     # The listener puts the terminal in cbreak mode, so it has to be stopped on

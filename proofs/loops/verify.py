@@ -7,14 +7,14 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Tuple
 
 from .. import llm
 from ..core import certificates, merkle, refutations
 from ..core.checkpoint import attach_run, open_fresh_run
 from ..core.context import Code, Context, Paths
 from ..core.dag import (
-    _citation_closure, _dependency_order, describe_suspension, load_file,
+    Dag, _citation_closure, _dependency_order, describe_suspension, load_file,
     suspension_kinds, writer,
 )
 from ..tools.run_code import computations, execution, files
@@ -23,8 +23,8 @@ from ..validity.steps import VERIFIER_AGENTS, role_of, verifier_steps
 from ..workspace import layout as workspace
 from ..workspace import settings as settings_mod
 from .prompts import computations_block, verifier_context
-from .reasoning import REQUEST_TIMEOUT, _recorded_model
-from .verifiers import _run_verifier, fan_out, verifier_prompt
+from .reasoning import REQUEST_TIMEOUT, _recorded_model, _wait_for_server
+from .verifiers import _run_verifier, fan_out, stopping, verifier_prompt
 
 # proofs verify / proofs repair: the exit code when a verifier gave no
 # verdict (the server failed, or the reply could not be read). Distinct from
@@ -250,6 +250,35 @@ def verify_stored_lemma(
         ctx.ui.log(f"  Every computation of {lemma_id} reproduced; recorded in "
             f"the run's computations stream.", verbose)
 
+    outcome, justification = review_stored(
+        ctx, dag, references, lemma_id, conjecture_text, verifier_sys, verbose, on_file,
+    )
+    if outcome == "no_verdict":
+        return outcome, justification
+    if outcome == "rejected":
+        path = refutations.record(
+            ctx.paths.conjecture_root, lemma_id, h, ctx.user, _recorded_model(ctx),
+            "reject", justification, node["file"],
+        )
+        ctx.run.dag = ctx.dag.with_refutation(path, refutations.load(path))
+        ctx.ui.log(f"Refutation for {lemma_id} written: {path}", verbose)
+        return outcome, justification
+    return _accept_stored(ctx, lemma_id, h, on_file, verbose)
+
+
+def review_stored(
+    ctx, dag: Dag, references: List[Dict[str, Any]], lemma_id: str,
+    conjecture_text: str, verifier_sys: Mapping[str, str], verbose: bool,
+    on_file: List[Tuple[Path, Dict[str, Any]]], *,
+    accepted: Collection[str] = (),
+    on_verdict: Optional[Callable[[str, str, str], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> Tuple[str, Optional[str]]:
+    """Read one stored proof on a fixed snapshot. No evidence is written or
+    dismissed here. A citation audit can checkpoint each completed agent and
+    supply its already-accepted agents on resume. Never re-executes scripts."""
+    node = dag.lemmas[lemma_id]
+    h = dag.hash(lemma_id)
     cited_lemmas = [str(c) for c in node.get("cited_lemmas", [])]
     cited_references = [str(r) for r in node.get("cited_references", [])]
     statement = str(node.get("statement") or "")
@@ -295,16 +324,37 @@ def verify_stored_lemma(
     prompts = {agent: verifier_prompt(ctx, verifier_sys, agent) for agent in steps}
 
     def run_step(step_ctx, agent: str) -> Tuple[str, str]:
-        return _run_verifier(
-            step_ctx, role_of(agent), prompts[agent], verifier_user, verbose,
-        )
+        """One verifier. A citation recheck (should_stop given) waits out an
+        unreachable server and retries, as the proof loop's verifiers do: an
+        outage is not a missing verdict, and must not pause a long run. It
+        gives up only when should_stop fires during the wait, and the
+        UNAVAILABLE it then returns counts as no verdict. proofs verify
+        (no should_stop) reports an outage at once, as before."""
+        role = role_of(agent)
+        while True:
+            decision, justification = _run_verifier(
+                step_ctx, role, prompts[agent], verifier_user, verbose,
+            )
+            if decision != verdicts.UNAVAILABLE or should_stop is None:
+                return decision, justification
+            step_ctx.ui.log(
+                f"Verifier {steps.index(agent) + 1}/{len(steps)} ({role}): "
+                f"{decision.upper()} — {justification}",
+                verbose,
+            )
+            if not _wait_for_server(
+                step_ctx, role,
+                lambda: stopping(step_ctx) or should_stop(), verbose,
+            ):
+                return decision, justification
 
     # --parallel: the verifiers run at once. The first rejection settles
     # it, as the first one does in step order, and the rest are not waited
     # for; a missing verdict starts no further verifier but waits for the
     # running ones, since a rejection among them is a verdict to record.
     missing: Optional[Tuple[int, str, str]] = None
-    with fan_out(ctx, steps, run_step, ctx.settings.parallel_verifiers) as results:
+    remaining = [agent for agent in steps if agent not in accepted]
+    with fan_out(ctx, remaining, run_step, ctx.settings.parallel_verifiers) as results:
         if results.parallel:
             ctx.status(role=f"{results.workers} verifiers")
             ctx.ui.log(
@@ -312,14 +362,18 @@ def verify_stored_lemma(
                 f"{results.workers} at a time.",
                 verbose,
             )
+        completed = 0
         for agent, (decision, justification) in results:
+            completed += 1
+            kind = verdicts.record_kind(decision)
+            if on_verdict and kind != verdicts.NOTHING:
+                on_verdict(agent, decision, justification)
             step, role = steps.index(agent) + 1, role_of(agent)
             ctx.ui.log(
                 f"Verifier {step}/{len(steps)} ({role}): "
                 f"{decision.upper() or '???'} — {justification}",
                 verbose,
             )
-            kind = verdicts.record_kind(decision)
             if kind == verdicts.REFUTATION:
                 rest = results.abandoned()
                 if rest:
@@ -327,17 +381,15 @@ def verify_stored_lemma(
                         f"Not waiting for {', '.join(role_of(a) for a in rest)}.",
                         verbose,
                     )
-                path = refutations.record(
-                    ctx.paths.conjecture_root, lemma_id, h, ctx.user,
-                    _recorded_model(ctx), "reject", justification, node["file"],
-                )
-                ctx.run.dag = ctx.dag.with_refutation(path, refutations.load(path))
-                ctx.ui.log(f"Refutation for {lemma_id} written: {path}", verbose)
                 ctx.status(event=f"verifier {step}/{len(steps)} rejected")
                 return "rejected", justification
             if kind == verdicts.NOTHING and missing is None:
                 missing = (step, role, justification)
                 results.drain()
+            elif should_stop and should_stop() and completed < len(remaining):
+                results.drain()
+        if missing is None and completed < len(remaining):
+            return 'no_verdict', 'check interrupted'
     if missing is not None:
         _step, role, justification = missing
         ctx.ui.log(
@@ -347,6 +399,14 @@ def verify_stored_lemma(
             verbose,
         )
         return "no_verdict", justification
+    return "accepted", None
+
+
+def _accept_stored(
+    ctx, lemma_id: str, h: str, on_file: List[Tuple[Path, Dict[str, Any]]],
+    verbose: bool,
+) -> Tuple[str, Optional[str]]:
+    """Publish a successful manual verification; dismiss only objections read."""
     try:
         line = certificates.record(
             writer(ctx, certificates.DIR_NAME), lemma_id, h, ctx.user,
@@ -381,7 +441,7 @@ def verify_stored_lemma(
             ctx.ui.log(f"Could not delete the refutation {path}: {e}", verbose)
     ctx.run.dag = ctx.dag.without_refutations(dismissed)
     ctx.ui.log(
-        f"Lemma {lemma_id} passed all {len(steps)} verifier checks.",
+        f"Lemma {lemma_id} passed all verifier checks.",
         verbose,
     )
     return "accepted", None

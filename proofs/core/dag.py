@@ -69,13 +69,13 @@ import json
 import os
 import secrets
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..loops.json_repair import _FENCE_RE
 from ..loops.reasoning import _recorded_model
 from ..tools.run_code import computations
 from ..workspace import config
-from . import certificates, citations, merkle, refutations, resolution, streams, suspension
+from . import audits, certificates, citations, merkle, refutations, resolution, streams, suspension
 
 DIR_NAME = "dags"
 LEMMA = "lemma"
@@ -297,6 +297,9 @@ class Dag:
         # versions state different things.
         self.forked: Dict[str, List[str]] = dict(forked or {})
         self.conflicts: Dict[str, List[str]] = dict(conflicts or {})
+        # Only populated for a certificate written just before a crash that
+        # prevented its new lemma being appended. Not a second index of the DAG.
+        self._orphan_certs: Dict[str, List[Dict[str, Any]]] = {}
         self._suspension: Optional[suspension.Suspension] = None
         self._tree: Optional[merkle.Merkle] = None
         self._cited_by: Optional[Dict[str, List[str]]] = None
@@ -338,8 +341,18 @@ class Dag:
                 f"version of each is deleted by hand (e.g. {first}: "
                 + ", ".join(conflicts[first]) + ")."
             )
-        return cls(lemmas, hashes, references, certs, refs, root, warnings,
-                   forked, conflicts)
+        dag = cls(lemmas, hashes, references, certs, refs, root, warnings,
+                  forked, conflicts)
+        for cert in certs:
+            lid = cert.get("lemma_id")
+            if not isinstance(lid, str):
+                continue
+            if lid not in lemmas:
+                dag._orphan_certs.setdefault(lid, []).append(cert)
+            elif certificates.is_valid(cert, hashes[lid]):
+                node = lemmas[lid]
+                node['verified_count'] = node.get('verified_count', 0) + certificates.count(cert)
+        return dag
 
     def _replace(self, susp: Optional["suspension.Suspension"] = None,
                  cited_by: Optional[Dict[str, List[str]]] = None,
@@ -360,6 +373,7 @@ class Dag:
         )
         fields.update(changes)
         dag = Dag(**fields)
+        dag._orphan_certs = self._orphan_certs
         dag._suspension = susp
         if "lemmas" in changes:
             dag._cited_by, dag._depth, dag._ancestry = cited_by, depth, ancestry
@@ -471,7 +485,7 @@ class Dag:
     # -- the command's own changes ------------------------------------------
 
     def with_version(self, record: Dict[str, Any], path: Path, line: int,
-                     prover: str, run_id: str) -> "Dag":
+                     prover: str, run_id: str, evidence: Optional[audits.Evidence] = None) -> "Dag":
         """This DAG with a version just committed — a new lemma, or a
         reproof — as the current version of its id. The hashes that can
         move are recomputed, each on its own (merkle.py): the lemma's own,
@@ -492,8 +506,21 @@ class Dag:
         lemmas the version stopped or started citing are replaced, every
         other list is shared."""
         node = _version(record, path, line, prover, run_id, self.root)
-        lid = node["id"]
+        lid = node['id']
+        # Apply counts into the same private map that receives the version.
         lemmas = dict(self.lemmas)
+        evidence = evidence or audits.Evidence()
+        updated = self.with_evidence(evidence, lemmas)
+        own = [*self._orphan_certs.get(lid, ()),
+               *(c for c in evidence.certificates if c['lemma_id'] == lid)]
+        return updated._install_version(lemmas, node, own)
+
+    def _install_version(self, lemmas: Dict[str, Dict[str, Any]], node: Dict[str, Any],
+                         own: List[Dict[str, Any]]) -> "Dag":
+        """Finish a batch in its private lemma map after applying evidence.
+        own: the new lemma's certificates (this batch's, and any orphans
+        from an interrupted commit of the same lemma)."""
+        lid = node['id']
         old = lemmas.get(lid)
         lemmas[lid] = node
         hashes = dict(self.hashes)
@@ -504,12 +531,13 @@ class Dag:
         else:
             hashes[lid] = tree.node_hash(node, clean=True)
         if old is None:
+            node['verified_count'] = sum(certificates.count(c) for c in own
+                                         if certificates.is_valid(c, hashes[lid]))
             susp = None
             if self._suspension is not None:
                 susp = suspension.with_lemma(
                     self._suspension, lid, node, hashes[lid],
-                    [c for c in self.certificates
-                     if str(c.get("lemma_id") or "").strip() == lid],
+                    own,
                     [r for _p, r in self.refutations
                      if str(r.get("lemma_id") or "").strip() == lid],
                     self.conflicts,
@@ -522,13 +550,28 @@ class Dag:
                 depth[lid] = citations.depth_of(lemmas, depth, node)
             if self._ancestry is not None:
                 ancestry = self._ancestry.with_lemma(lemmas, node)
-            return self._replace(susp, self._carried_cited_by(lid, old, node),
-                                 depth, ancestry, lemmas=lemmas, hashes=hashes)
+            installed = self._replace(susp, self._carried_cited_by(lid, old, node),
+                                      depth, ancestry, lemmas=lemmas, hashes=hashes)
+            if lid in self._orphan_certs:
+                # Counted above; once the lemma is in, they are ordinary
+                # certificates (still in certificate_lines), not orphans.
+                installed._orphan_certs = {
+                    k: v for k, v in self._orphan_certs.items() if k != lid}
+            return installed
+        changed = {lid}
         if old["statement_hash"] != node["statement_hash"]:
             # A reproof changes what lid cites, never who cites lid.
             for k in self.cited_by_map().get(lid, ()):
                 if hashes.get(k) is not None:
                     hashes[k] = tree.node_hash(lemmas[k], clean=True)
+                    changed.add(k)
+        # A reproof (repair only): old evidence may match the new hashes.
+        for k in changed:
+            lemmas[k] = dict(lemmas[k], verified_count=0)
+        for cert in self.certificates:
+            k = cert.get('lemma_id')
+            if k in changed and certificates.is_valid(cert, hashes[k]):
+                lemmas[k]['verified_count'] += certificates.count(cert)
         # A reproof citing what its old version cited moves no depth and
         # no ancestry; one citing something else moves those of everything
         # above it, so they are built again when next asked for.
@@ -561,17 +604,57 @@ class Dag:
         return out
 
     def with_certificate(self, line: Dict[str, Any]) -> "Dag":
-        """This DAG with a certificate added. A commit certifies its lemma
-        before writing it, and a certificate for a lemma the DAG does not
-        hold yet changes no suspension, so the suspension is carried over;
-        for a lemma it holds, it is recomputed when next asked for."""
-        carried = self._suspension if line.get("lemma_id") not in self.lemmas else None
-        return self._replace(carried, certificate_lines=[*self.certificates, line])
+        """Add the certificate from a manual verification of a stored lemma."""
+        return self.with_evidence(audits.Evidence(certificates=[line]))
+
+    def with_evidence(self, evidence: audits.Evidence,
+                      private_lemmas: Optional[Dict[str, Dict[str, Any]]] = None) -> "Dag":
+        """Apply a batch without copying the lemma map per certificate. Only
+        a change in validity (not another acceptance) invalidates suspension."""
+        lines, added, gone = evidence.certificates, evidence.refutations, set(evidence.dismissed)
+        nodes = private_lemmas
+        susp = self._suspension
+        orphans = self._orphan_certs
+        for c in lines:
+            lid = c['lemma_id']
+            if lid not in self.lemmas and private_lemmas is None:
+                if orphans is self._orphan_certs:
+                    orphans = dict(orphans)
+                orphans[lid] = [*orphans.get(lid, ()), c]
+            elif lid in self.lemmas and certificates.is_valid(c, self.hashes[lid]):
+                if nodes is None:
+                    nodes = dict(self.lemmas)
+                count = nodes[lid].get('verified_count', 0)
+                if not count:
+                    susp = None
+                nodes[lid] = dict(nodes[lid], verified_count=count + certificates.count(c))
+        changes: Dict[str, Any] = {}
+        if nodes is not None:
+            changes['lemmas'] = nodes
+        if lines:
+            changes['certificate_lines'] = [*self.certificates, *lines]
+        if added or gone:
+            refs: List[Tuple[Path, Dict[str, Any]]] = []
+            for path, ref in self.refutations:
+                if path not in gone:
+                    refs.append((path, ref))
+                elif refutations.is_counting(ref, self.hashes.get(ref['lemma_id'])):
+                    susp = None
+            if any(refutations.is_counting(r, self.hashes.get(r['lemma_id'])) for _, r in added):
+                susp = None
+            changes['refutation_files'] = refs + added
+        if not changes:
+            return self
+        updated = self._replace(susp, self._cited_by, self._depth, self._ancestry, **changes)
+        updated._orphan_certs = orphans
+        return updated
 
     def with_refutation(self, path: Path, record: Dict[str, Any]) -> "Dag":
         return self._replace(refutation_files=[*self.refutations, (path, record)])
 
     def without_refutations(self, paths: List[Path]) -> "Dag":
+        if not paths:
+            return self
         gone = {str(p) for p in paths}
         return self._replace(refutation_files=[
             (p, r) for p, r in self.refutations if str(p) not in gone
@@ -655,14 +738,18 @@ def _store_computations(ctx, node: Dict[str, Any]) -> None:
                            node, sources, writer(ctx, computations.DIR_NAME))
 
 
-def _append_version(ctx, record: Dict[str, Any]) -> None:
+def _append_version(ctx, record: Dict[str, Any], evidence: audits.Evidence) -> None:
     path = writer(ctx, DIR_NAME).append(record)
     with open(path, "rb") as f:
         line = f.read().count(b"\n")       # the record is the file's last line
     lid = str(record.get("id") or "")
     statement = str(record.get("statement") or "")
     old = ctx.dag.lemmas.get(lid)
-    ctx.run.dag = ctx.dag.with_version(record, path, line, ctx.user, ctx.run_id)
+    updated = ctx.dag.with_version(record, path, line, ctx.user, ctx.run_id, evidence)
+    if evidence.refutations:
+        # One rebuild, not a race between the readers of this new snapshot.
+        updated.suspension()
+    ctx.run.dag = updated
     # Under the DAG lock, like the swap: the index sees the commits in the
     # order the DAG does. A reproof that keeps its statement changes no word.
     if ctx.run.search_index is not None and (old is None or old["statement"] != statement):
@@ -671,7 +758,7 @@ def _append_version(ctx, record: Dict[str, Any]) -> None:
 
 def commit_lemma_to_dag(
     ctx, lemma_id: str, node: Dict[str, Any], verified_hash: Optional[str],
-    verbose: bool = True,
+    verbose: bool = True, checks: Sequence[Dict[str, Any]] = (),
 ) -> str:
     """Certify node and commit it to the run's dags/ stream under the id
     its candidate was given (new_lemma_id); returns the id.
@@ -686,8 +773,9 @@ def commit_lemma_to_dag(
             # is committed once: this is a bug, not a state to recover from.
             raise ValueError(f"{lemma_id} is already in the DAG")
         _store_computations(ctx, node)
-        _certify_before_write(ctx, lemma_id, node, verified_hash, verbose)
-        _append_version(ctx, _record(ctx, LEMMA, lemma_id, node))
+        evidence = audits.write_checks(ctx, ctx.dag, checks, writer(ctx, certificates.DIR_NAME))
+        _certify_before_write(ctx, lemma_id, node, verified_hash, verbose, evidence)
+        _append_version(ctx, _record(ctx, LEMMA, lemma_id, node), evidence)
         return lemma_id
 
 
@@ -701,15 +789,16 @@ def commit_reproof(
     with ctx.run.dag_lock:
         current = ctx.dag.lemmas[lemma_id]
         _store_computations(ctx, node)
-        _certify_before_write(ctx, lemma_id, node, verified_hash, verbose)
+        evidence = audits.Evidence()
+        _certify_before_write(ctx, lemma_id, node, verified_hash, verbose, evidence)
         record = _record(ctx, REPROOF, lemma_id, node)
         record["supersedes"] = version_of(current)
-        _append_version(ctx, record)
+        _append_version(ctx, record, evidence)
 
 
 def _certify_before_write(
     ctx, lemma_id: str, node: Dict[str, Any],
-    verified_hash: Optional[str], verbose: bool = True,
+    verified_hash: Optional[str], verbose: bool, evidence: audits.Evidence,
 ) -> Optional[str]:
     """Record a certificate for a lemma this run just accepted, before the
     lemma is written: the first half of a commit. Returns the hash the
@@ -739,13 +828,18 @@ def _certify_before_write(
             verbose,
         )
         return h
+    if lemma_id not in ctx.dag.lemmas and any(
+        certificates.is_valid(c, h) and c.get('verifier') == ctx.user and c.get('model') == model
+        for c in ctx.dag._orphan_certs.get(lemma_id, ())
+    ):
+        return h  # interrupted between this certificate and the lemma
     try:
         line = certificates.record(writer(ctx, certificates.DIR_NAME),
                                    lemma_id, h, ctx.user, model)
     except OSError as e:
         ctx.ui.log(f"Could not write the certificate for {lemma_id}: {e}", verbose)
         return h
-    ctx.run.dag = ctx.dag.with_certificate(line)
+    evidence.certificates.append(line)
     how = f"model {model}" if model else "human acceptance"
     ctx.ui.log(f"Certificate for {lemma_id}: accepted by {ctx.user} ({how}).", verbose)
     return h
@@ -863,7 +957,7 @@ def _warn_suspended(
 
 
 def _settled(ctx, dag: "Dag", suspended: Iterable[str], conjecture: str,
-             verbose: bool) -> Optional[str]:
+             verbose: bool, *, announce: bool = True) -> Optional[str]:
     """Whether the DAG settles the conjecture now (resolution.find): the
     kind, "proved" or "disproved", or None while it is open. A DAG that
     holds both a proof and a disproof settles nothing — it is inconsistent,
@@ -881,8 +975,9 @@ def _settled(ctx, dag: "Dag", suspended: Iterable[str], conjecture: str,
         return None
     if not found:
         return None
-    for r in found:
-        ctx.ui.log(f"{resolution.describe(r)}.", verbose)
+    if announce:
+        for r in found:
+            ctx.ui.log(f"{resolution.describe(r)}.", verbose)
     return found[0].kind
 
 

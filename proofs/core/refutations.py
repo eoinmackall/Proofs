@@ -29,7 +29,7 @@ A refutation counts only while its hash matches the lemma's current Merkle
 hash (is_counting); when the lemma changes — its proof, its statement, or
 anything it cites — the refutation is stale: the record of an objection to a
 proof no longer in the files, shown to the verifiers all the same. Refutation
-files are written only by proofs verify and proofs repair (a rejection
+files are written by proofs verify, proofs repair and citation rechecks (a rejection
 inside proofs run is feedback to the loop's own reviser, not a record), and
 deleted when the lemma is verified with the objection on the table and
 accepted, or when proofs prune removes the lemma.
@@ -129,7 +129,7 @@ def record(
     conjecture_dir: Union[str, os.PathLike],
     lemma_id: str, hash: str, verifier: str,
     model: str, verdict: str, justification: str, file: str,
-    date: Optional[str] = None,
+    date: Optional[str] = None, *, check_id: Optional[str] = None,
 ) -> Path:
     """Write one refutation file for a rejection of the lemma and return
     its path.
@@ -155,6 +155,8 @@ def record(
         "justification": str(justification),
         "file": str(file),
     }
+    if check_id is not None:
+        obj["check_id"] = check_id
     base = name_for(lemma_id, verifier, when)
     with _LOCK:
         directory = dir_for(conjecture_dir)

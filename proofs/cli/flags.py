@@ -32,6 +32,9 @@ _SETTINGS_HELP = {
     "run.replan_every":
         "Parallel mode: lemmas committed under a plan before the next is "
         "due (the operator's replan asks for one at any time)",
+    "run.citation_recheck_base":
+        "Recheck each direct lemma citation with probability N^(-d), where d "
+        "is its current number of acceptances; 1 always, -1 disables",
     "tools.max_rounds":
         "Tool rounds (lookup_lemmas, search_lemmas) one agent call may "
         "spend before it must answer",
@@ -188,7 +191,7 @@ def add_settings_flags(parser: argparse.ArgumentParser,
             settings_mod.FLAGS[key], dest=settings_mod.flag_dest(key),
             type=int, default=None, metavar="N",
             help=f"{_SETTINGS_HELP[key]}"
-                 + ("" if key in settings_mod.BOUNDED or key == "run.max_iterations"
+                 + ("" if key in settings_mod.BOUNDED or key in ("run.max_iterations", "run.citation_recheck_base")
                     else "; -1 for no limit")
                  + f" (default: {key} in "
                  f"{settings_mod.LOCAL_FILENAME}, "

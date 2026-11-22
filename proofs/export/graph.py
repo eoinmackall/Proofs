@@ -50,14 +50,15 @@ R_PER = 2.2
 R_MAX = 30.0
 SWEEPS = 8
 
-# The categorical slots (the dataviz reference palette: CVD-validated in
-# both modes, in this order). Users past the eighth share the "other"
-# colour rather than a generated hue.
+# The categorical slots, in this order: blue, amber, red, cyan, green,
+# magenta, purple, orange (the dataviz reference palette's hues and steps,
+# re-ordered). Users past the eighth share the "other" colour rather than a
+# generated hue. page/graph.css carries the same slots as --u0..--u7.
 CATEGORICAL = {
-    "light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
-              "#e87ba4", "#008300", "#4a3aa7", "#e34948"],
-    "dark": ["#3987e5", "#d95926", "#199e70", "#c98500",
-             "#d55181", "#008300", "#9085e9", "#e66767"],
+    "light": ["#2a78d6", "#eda100", "#e34948", "#1baf7a",
+              "#008300", "#e87ba4", "#4a3aa7", "#eb6834"],
+    "dark": ["#3987e5", "#c98500", "#e66767", "#199e70",
+             "#008300", "#d55181", "#9085e9", "#d95926"],
 }
 OTHER = {"light": "#898781", "dark": "#898781"}
 # The chart chrome both renderers draw with.

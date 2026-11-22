@@ -42,7 +42,7 @@ from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 from ..workspace import layout as workspace
 from . import certificates, locking, refutations, streams
-from .checkpoint import CHECKPOINT_FILENAME, CHECKPOINTS_DIRNAME, RUN_LOCK_FILENAME
+from .checkpoint import CHECKPOINT_FILENAME, CHECKPOINTS_DIRNAME, RUN_LOCK_FILENAME, flights_in
 from .context import Context
 from .dag import DIR_NAME as DAGS_DIRNAME
 from .dag import LEMMA, REPROOF, dependents
@@ -56,6 +56,21 @@ def live_runs(root: Path) -> Set[Tuple[str, str]]:
         if locking.is_held(directory / RUN_LOCK_FILENAME):
             out.add((user_id, run_id))
     return out
+
+
+def _pending_check_ids(root: Path) -> Set[str]:
+    """Do not compact away the receipt of an interrupted citation batch."""
+    protected = set()
+    for _, _, directory in streams.run_dirs(root / CHECKPOINTS_DIRNAME):
+        try:
+            data = json.loads((directory / CHECKPOINT_FILENAME).read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        for flight in flights_in(data):
+            if isinstance(flight.get('checks'), list):
+                protected.update(c['check_id'] for c in flight['checks'] if
+                                 isinstance(c, dict) and isinstance(c.get('check_id'), str))
+    return protected
 
 
 def _needed_scratch(checkpoint: Path) -> Set[str]:
@@ -162,6 +177,7 @@ def prune_entry(
                 for _path, ref in dag.refutations_for(lid)
             )
         }
+        protected = _pending_check_ids(root)
         wanted = set(refuted)
         if with_dependents:
             # A lemma citing one an earlier prune removed (an id no stream
@@ -176,6 +192,7 @@ def prune_entry(
         # alone.
         conflicted = set(dag.conflicts)
         wanted -= conflicted
+        wanted -= {r['lemma_id'] for _, r in dag.refutations if r.get('check_id') in protected}
 
         def certified(lid: str) -> bool:
             h = dag.hashes.get(lid)
@@ -251,7 +268,7 @@ def prune_entry(
         stale_certs = 0
         for order, (u, r, path, line, rec) in enumerate(
                 streams.records(certificates.dir_for(root))):
-            if (u, r) in live or rec.get("type") != certificates.TYPE \
+            if (u, r) in live or rec.get('check_id') in protected or rec.get("type") != certificates.TYPE \
                     or rec.get("lemma_id") in conflicted:
                 continue
             if not current_cert(rec):
@@ -267,7 +284,8 @@ def prune_entry(
             duplicates |= {(m[2], m[3]) for m in rest}
 
         def edit_cert(path: Path, line: int, rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-            if rec.get("type") != certificates.TYPE or rec.get("lemma_id") in conflicted:
+            if (rec.get("type") != certificates.TYPE or rec.get("lemma_id") in conflicted
+                    or rec.get('check_id') in protected):
                 return rec
             where = (path.resolve(), line)
             if not current_cert(rec) or where in duplicates:
@@ -282,7 +300,7 @@ def prune_entry(
         refutation_files = stale_refutations = 0
         for path, ref in dag.refutations:
             lid = ref.get("lemma_id")
-            if lid in conflicted or lid in in_live:
+            if lid in conflicted or lid in in_live or ref.get('check_id') in protected:
                 continue
             if lid in remove or lid not in dag.lemmas:
                 refutations.delete(path)

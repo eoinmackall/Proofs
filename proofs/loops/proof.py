@@ -19,7 +19,7 @@ from ..validity import verdicts
 from ..validity.citations import check_citations, scan_citations
 from ..validity.steps import role_of, verifier_steps
 from ..workspace import settings as settings_mod
-from . import strategies
+from . import citation_checks, strategies
 from .json_repair import parse_json_or_none
 from .prompts import (
     _fit_prompt, agent_tools, computations_block, planner_dag_view,
@@ -63,11 +63,12 @@ def _parse_reviser_decision(ctx, revision_text: str, verbose: bool) -> Dict[str,
     return res or {}
 
 
-def _restore_failed(ctx, lemma_id: str, why: str, verbose: bool) -> None:
+def _restore_failed(ctx, flight, why: str, verbose: bool) -> None:
     """A resumed loop's saved proof does not stand any more: say so. The
     caller re-runs the prover round, at no cost to the budget."""
+    citation_checks.recover_checks(ctx, [flight])
     ctx.ui.log(
-        f"The saved proof of {lemma_id} no longer stands ({why}); re-running "
+        f"The saved proof of {flight['lemma_id']} no longer stands ({why}); re-running "
         f"the prover round.",
         verbose,
     )
@@ -121,6 +122,7 @@ def _proof_loop(
     toggle_hotkey,
     should_stop=None,
     allow_decomposition: bool = True,
+    audit_citations: bool = False,
 ) -> Dict[str, Any]:
     """Steps 2-5 of the proof loop: prover -> verifiers -> reviser, shared
     by the serial run and by every parallel loop.
@@ -148,6 +150,10 @@ def _proof_loop(
     (None for a fresh start); when given, the engine re-runs that round with
     that feedback instead of starting from attempt 1. `fresh_target` is the
     lemma the caller picked for a fresh start; it is ignored when resuming.
+
+    When audit_citations is enabled (agent-produced proofs in proofs run),
+    the post-acceptance stage checkpoints the sampled direct citations and
+    passes their completed checks to on_proof for publication with the node.
 
     The engine never touches the DAG or the checkpoint itself: `on_round` is
     called at each prover round with the in-flight state that round
@@ -239,14 +245,10 @@ def _proof_loop(
     # stopped resolving, a script gone from the scratch directory — the
     # round is re-run from the prover, at no cost to the lemma's budget.
     restore: Optional[Dict[str, Any]] = None
-    if resuming and in_flight.get("stage") in ("verify", "revise") \
+    if resuming and in_flight.get("stage") in ("verify", "revise", "citations") \
             and in_flight.get("proof"):
-        restore = {
-            "stage": in_flight["stage"],
-            "proof": in_flight["proof"],
-            "prover_model": str(in_flight.get("prover_model") or ""),
-            "verdicts": list(in_flight.get("verdicts") or []),
-        }
+        restore = dict(in_flight, prover_model=str(in_flight.get('prover_model') or ''),
+                       verdicts=list(in_flight.get('verdicts') or []))
     proved = False
     attempt = first_attempt
     # `attempt` is a while-loop counter rather than a for-range because the
@@ -299,6 +301,8 @@ def _proof_loop(
             "prover_model": saved["prover_model"] if restoring else "",
             "verdicts": saved["verdicts"] if restoring else [],
         }
+        if restoring and saved['stage'] == 'citations':
+            in_flight_state.update(audit_hash=saved['audit_hash'], checks=saved['checks'])
         on_round(in_flight_state)
         ctx.status(
             lemma=lemma_id,
@@ -600,7 +604,7 @@ def _proof_loop(
             raw_code_runs = prover_res.get("code_runs")
 
         if not proof and restoring:
-            _restore_failed(ctx, lemma_id, "it holds no proof", verbose)
+            _restore_failed(ctx, in_flight_state, "it holds no proof", verbose)
             continue
         if not proof:
             # The model's failure, not the server's (an outage was waited
@@ -649,11 +653,17 @@ def _proof_loop(
             # is spent, so a proof that claims a result nobody has proved
             # never reaches the verifiers to be rejected there instead.
             cited_lemmas, cited_refs, unmatched = check_citations(
-                raw_cited_lemmas, raw_cited_refs, dag, ref_ids, suspended
+                raw_cited_lemmas, raw_cited_refs, dag, ref_ids,
+                # A proof resumed at its citation checks already passed its
+                # verifiers with these edges, and a suspension since (perhaps
+                # from its own recheck) is inherited at commit. Any earlier
+                # step re-checks them, so a newly suspended citation sends
+                # the round back to the prover.
+                () if audit_citations and restoring and saved['stage'] == 'citations' else suspended,
             )
             if unmatched and restoring:
                 _restore_failed(
-                    ctx, lemma_id,
+                    ctx, in_flight_state,
                     "it cites " + ", ".join(label for label, _ in unmatched)
                     + ", which can no longer be cited",
                     verbose,
@@ -740,7 +750,7 @@ def _proof_loop(
         code_sources: Dict[str, Path] = {}
         if restoring and not raw_code_runs \
                 and computations.unknown_references(proof, []):
-            _restore_failed(ctx, lemma_id, "its computations are not cited", verbose)
+            _restore_failed(ctx, in_flight_state, "its computations are not cited", verbose)
             continue
         if not raw_code_runs and computations.unknown_references(proof, []):
             ctx.ui.log(
@@ -770,7 +780,7 @@ def _proof_loop(
             if not code_problems:
                 code_problems = computations.unknown_references(proof, code)
             if code_problems and restoring:
-                _restore_failed(ctx, lemma_id, "; ".join(code_problems), verbose)
+                _restore_failed(ctx, in_flight_state, "; ".join(code_problems), verbose)
                 continue
             if code_problems:
                 ctx.ui.log(
@@ -818,9 +828,8 @@ def _proof_loop(
         # run resumes at the verifiers instead of re-running the prover.
         if not restoring:
             in_flight_state["stage"] = "verify"
-            in_flight_state["proof"] = (
-                prover_res if isinstance(prover_res, dict) else {"proof": proof}
-            )
+            in_flight_state["proof"] = dict(proof=proof, cited_lemmas=cited_lemmas,
+                                            cited_references=cited_refs, code_runs=last_code_runs)
             in_flight_state["prover_model"] = prover_model
             in_flight_state["verdicts"] = []
             on_round(in_flight_state)
@@ -868,6 +877,9 @@ def _proof_loop(
             and _same_model(ctx, v.get("model", ""), v.get("requested", ""))
         ]
         if len(kept) < len(in_flight_state["verdicts"]):
+            # The parent may now be rejected or revised; do not lose completed
+            # checks of its original citations if its batch is abandoned.
+            citation_checks.recover_checks(ctx, [in_flight_state])
             ctx.ui.log(
                 f"  {len(in_flight_state['verdicts']) - len(kept)} saved "
                 f"verdict(s) on {lemma_id} no longer apply (the proof's hash "
@@ -983,10 +995,24 @@ def _proof_loop(
             # All three verifier checks accepted the same proof.
             ctx.ui.log(
                 f"Lemma {lemma_id} passed all {len(steps)} "
-                f"verifier checks. Adding to DAG.",
+                f"verifier checks.",
                 verbose,
             )
-            committed_id = on_proof(lemma_id, proved_node, verified_hash)
+            if audit_citations and (in_flight_state['stage'] == 'citations' or
+                                    (cited_lemmas and ctx.settings.citation_recheck_base != -1)):
+                # Canonical edges also for pre-feature prover checkpoints.
+                in_flight_state['proof'].update(cited_lemmas=cited_lemmas, cited_references=cited_refs)
+                ready = citation_checks.run_checks(
+                    ctx, in_flight_state, on_round, proved_node, verified_hash,
+                    conjecture, verifier_sys, verbose, should_stop,
+                )
+                if not ready:
+                    return dict(proved=False, exhausted=False, stopped=True, lemma_id=lemma_id,
+                                committed_id=None, claimed_id=claimed_id, target=target,
+                                proof=proof, attempt_notes=attempt_notes)
+                committed_id = on_proof(lemma_id, proved_node, verified_hash, in_flight_state['checks'])
+            else:
+                committed_id = on_proof(lemma_id, proved_node, verified_hash)
             ctx.status(event=f"committed {committed_id}")
             proved = True
             break

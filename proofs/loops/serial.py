@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import itertools
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .. import tools as tools_mod
 from ..core import resolution
 from ..core.checkpoint import (
-    discard_checkpoint, drop_rejection, load_checkpoint, note_rejection,
-    save_checkpoint,
+    CitationCheckpointError, discard_checkpoint, drop_rejection, load_checkpoint,
+    note_rejection, report_checkpoint_stop, save_checkpoint,
 )
 from ..core.dag import (
     _committed_in_run, _committed_uncertified, _settled, _uncertified_message,
@@ -28,6 +28,7 @@ from .prompts import (
     replan_note, select_lemma,
 )
 from . import strategies
+from .citation_checks import recover_checks
 from .proof import run_proof_loop
 from .reasoning import extract, reason
 from .schemas import PLANNER_SCHEMA
@@ -59,7 +60,7 @@ def _serial_on_round(
 def _serial_on_proof(
     ctx,
     lemma_id: str, node: Dict[str, Any], verified_hash: Optional[str],
-    verbose: bool,
+    verbose: bool, checks: Sequence[Dict[str, Any]] = (),
 ) -> str:
     """The serial success boundary: commit the lemma through the same
     check-and-write as the parallel run, so the engine's on_proof
@@ -69,7 +70,7 @@ def _serial_on_proof(
         # All three verifier checks accepted this proof: the commit
         # certifies it, then writes it, the way the parallel on_proof's
         # does.
-        return commit_lemma_to_dag(ctx, lemma_id, node, verified_hash, verbose)
+        return commit_lemma_to_dag(ctx, lemma_id, node, verified_hash, verbose, checks)
 
 
 def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
@@ -132,6 +133,7 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
         start_iteration = cp["iteration"]
         rejected_lemmas = cp["rejected_lemmas"]
         in_flight = cp["in_flight"]
+        recover_checks(ctx, [in_flight], keep_staged=True)
         plan = cp["plan"]
         if in_flight is None:
             ctx.ui.log(
@@ -195,6 +197,11 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
         # pulled streams hold (resolution.py). Nothing is stored: the
         # resolution is the lemma, and it lasts exactly as long as the
         # lemma stays unsuspended.
+        if in_flight and in_flight.get('checks') and _settled(ctx, dag, suspended, conjecture, False):
+            recover_checks(ctx, [in_flight])  # about to discard this parent
+            dag = ctx.dag
+            susp = dag.suspension()
+            suspended = susp.suspended
         if _settled(ctx, dag, suspended, conjecture, verbose):
             discard_checkpoint(ctx)
             return dag
@@ -473,30 +480,39 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
         # checkpoint, and commit proved lemmas to the DAG. The lock is a
         # formality here — one thread — and the engine's contract does not
         # change between the two modes.
-        result = run_proof_loop(
-            ctx,
-            verbose=verbose,
-            conjecture=conjecture,
-            prover_sys=prover_sys,
-            reviser_sys=reviser_sys,
-            reference_block=reference_block,
-            reviser_ref_block=reviser_ref_block,
-            references=references,
-            verifier_sys=verifier_sys,
-            ref_ids=ref_ids,
-            initial=in_flight if resuming else None,
-            fresh_target=None if resuming else next_lemma,
-            on_round=lambda state: _serial_on_round(
+        # A checkpoint that cannot be written during citation checks stops
+        # the run before any agent is called (checkpoint.py).
+        try:
+            result = run_proof_loop(
                 ctx,
-                iteration, rejected_lemmas, state, verbose
-            ),
-            on_proof=lambda lid, node, vh: _serial_on_proof(
-                ctx,
-                lid, node, vh, verbose
-            ),
-            get_dag=lambda: ctx.dag,
-            toggle_hotkey=lambda: check_mode_toggle(ctx, verbose),
-        )
+                verbose=verbose,
+                conjecture=conjecture,
+                prover_sys=prover_sys,
+                reviser_sys=reviser_sys,
+                reference_block=reference_block,
+                reviser_ref_block=reviser_ref_block,
+                references=references,
+                verifier_sys=verifier_sys,
+                ref_ids=ref_ids,
+                initial=in_flight if resuming else None,
+                fresh_target=None if resuming else next_lemma,
+                on_round=lambda state: _serial_on_round(
+                    ctx,
+                    iteration, rejected_lemmas, state, verbose
+                ),
+                audit_citations=True,
+                on_proof=lambda lid, node, vh, checks=(): _serial_on_proof(
+                    ctx,
+                    lid, node, vh, verbose, checks
+                ),
+                get_dag=lambda: ctx.dag,
+                toggle_hotkey=lambda: check_mode_toggle(ctx, verbose),
+            )
+        except CitationCheckpointError as e:
+            report_checkpoint_stop(ctx, e, verbose)
+            return ctx.dag
+        if result.get('stopped'):
+            return ctx.dag  # citation check pending, keep this iteration and proof
         lemma_id = result["lemma_id"]
         proved = result["proved"]
 

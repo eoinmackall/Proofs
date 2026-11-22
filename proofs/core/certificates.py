@@ -17,7 +17,9 @@ verifier and model is a second record. proofs prune merges such duplicates to
 shrink the files: the first (the earliest) is kept with a "count" field, the
 number of acceptances it stands for, and the rest are deleted. A record
 without "count" stands for one. How many times a certificate was issued is
-summed when it is asked for (tally(), for proofs status). A certificate always goes into the
+summed in the loaded DAG for its current hash, and by tally() for proofs
+status. A citation recheck also records a check_id for crash recovery.
+A certificate always goes into the
 stream of the run that issued it, whoever owns the lemma, so no two users —
 no two runs — ever write the same file.
 
@@ -37,7 +39,7 @@ import os
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Union
 
 from . import streams
 
@@ -57,7 +59,7 @@ def now_iso() -> str:
 
 
 def record(writer: "streams.Writer", lemma_id: str, lemma_hash: str,
-           verifier: str, model: str) -> Dict[str, Any]:
+           verifier: str, model: str, *, check_id: Optional[str] = None) -> Dict[str, Any]:
     """Append a certificate to the run's certificate stream; returns it."""
     cert = {
         "type": TYPE,
@@ -67,6 +69,8 @@ def record(writer: "streams.Writer", lemma_id: str, lemma_hash: str,
         "model": model or "",
         "date": now_iso(),
     }
+    if check_id is not None:
+        cert["check_id"] = check_id
     writer.append(cert)
     return cert
 
@@ -101,7 +105,7 @@ def is_valid(cert: Mapping[str, Any], current_hash: str) -> bool:
 def tally(lines: Iterable[Mapping[str, Any]], lemma_id: str) -> List[Dict[str, Any]]:
     """A lemma's certificates, one entry per distinct (hash, verifier,
     model): how many times it was issued and when last — what proofs status
-    shows, and the only place a count is made."""
+    shows."""
     counts: Counter = Counter()
     last: Dict[tuple, str] = {}
     for c in lines:

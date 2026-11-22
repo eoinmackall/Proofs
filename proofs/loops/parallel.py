@@ -26,21 +26,23 @@ reader can never see a half-state.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
 import threading
 import time
 import traceback
-from typing import Any, Callable, Collection, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Collection, Dict, List, Optional, Sequence, Set, Tuple
 
 from .. import llm
 from .. import tools as tools_mod
 from ..core import merkle, resolution
+from ..core.audits import CitationCommitError
 from ..workspace import settings as settings_mod
 from ..core.checkpoint import (
-    _atomic_write_checkpoint_file, clean_rejected, discard_checkpoint,
-    drop_rejection, load_parallel_checkpoint, note_rejection,
+    CitationCheckpointError, _atomic_write_checkpoint_file, clean_rejected, discard_checkpoint,
+    drop_rejection, load_parallel_checkpoint, note_rejection, report_checkpoint_stop,
 )
 from ..core.dag import (
     _committed_in_run, _committed_uncertified, _settled, _uncertified_message,
@@ -56,6 +58,7 @@ from .prompts import (
     _build_comments_block, _build_reference_blocks, _fit_prompt, agent_tools,
     candidate, planner_dag_view, rejected_block, replan_note,
 )
+from .citation_checks import recover_checks
 from .proof import run_proof_loop
 from .reasoning import Cancelled, _fail_context_length, extract, reason
 from .schemas import PARALLEL_LEMMA_GENERATOR_SCHEMA, PARALLEL_PLANNER_SCHEMA
@@ -733,7 +736,7 @@ class ParallelState:
         """The engine's round boundary: publish this loop's resumable
         position (None when its lemma is settled)."""
         with self.state_lock:
-            self.loops[loop_id]["in_flight"] = state
+            self.loops[loop_id]["in_flight"] = copy.deepcopy(state)
         self.write_checkpoint()
 
     def take_in_flight(self, loop_id: str) -> Optional[Dict[str, Any]]:
@@ -747,7 +750,7 @@ class ParallelState:
         so re-taking it never spends an iteration twice."""
         with self.state_lock:
             pending = self.loops[loop_id]["in_flight"]
-            return dict(pending) if pending is not None else None
+            return copy.deepcopy(pending)
 
     def in_flight_ids(self) -> Set[str]:
         """The lemmas the loops are holding in flight right now: whether
@@ -778,6 +781,7 @@ class ParallelState:
     def add_lemma(
         self, lemma_id: str, node: Dict[str, Any],
         verified_hash: Optional[str], verbose: bool = True,
+        checks: Sequence[Dict[str, Any]] = (),
     ) -> str:
         """Commit a lemma to the shared DAG (commit_lemma_to_dag, under the
         DAG lock, so the loops commit one at a time). Then bump the DAG
@@ -785,7 +789,7 @@ class ParallelState:
         the reject list, check whether the DAG now settles the conjecture
         (check_dag), wake the scheduler, and checkpoint. Returns the id the
         lemma was committed under."""
-        committed = commit_lemma_to_dag(self.ctx, lemma_id, node, verified_hash, verbose)
+        committed = commit_lemma_to_dag(self.ctx, lemma_id, node, verified_hash, verbose, checks)
         with self.state_lock:
             self.dag_version += 1
         with self.rejected_lock:
@@ -804,9 +808,9 @@ class ParallelState:
         with self.dag_check_lock:
             dag = self.ctx.dag
             kind = _settled(self.ctx, dag, dag.suspension().suspended,
-                            self.conjecture, self.verbose)
+                            self.conjecture, self.verbose, announce=False)
         if kind is not None:
-            self.ctx.ui.log("The loops are being stopped.", self.verbose)
+            self.ctx.ui.log("Possible resolution; stopping the loops for the final DAG check.", self.verbose)
             self.set_resolution(kind)
 
     def dag_version_snapshot(self) -> int:
@@ -1576,12 +1580,18 @@ def _parallel_worker(
             state.begin_lemma(loop_id)
         def on_proof(
             lid: str, node: Dict[str, Any], verified_hash: Optional[str],
+            checks: Sequence[Dict[str, Any]] = (),
         ) -> str:
             # All three verifier checks accepted this proof: add_lemma
             # certifies it under the new id it is committed under, then
             # writes it.
             with _commit_section(ctx):
-                return state.add_lemma(lid, node, verified_hash, verbose)
+                try:
+                    return state.add_lemma(lid, node, verified_hash, verbose, checks)
+                except Exception as exc:
+                    if checks:
+                        raise CitationCommitError(str(exc)) from exc
+                    raise
         result = run_proof_loop(
             ctx,
             verbose=verbose,
@@ -1598,6 +1608,7 @@ def _parallel_worker(
             on_round=lambda state_dict: state.set_in_flight(
                 loop_id, state_dict
             ),
+            audit_citations=True,
             on_proof=on_proof,
             get_dag=lambda: ctx.dag,
             toggle_hotkey=lambda: check_mode_toggle(ctx, verbose),
@@ -1607,6 +1618,7 @@ def _parallel_worker(
             # A stop landed mid-round: the engine's last on_round already
             # published the resumable position, and the buffer claim is
             # kept — the lemma is still this loop's to finish.
+            state.request_stop()
             break
         # The lemma is settled one way or another: clear the resumable
         # position (the engine's last on_round may still hold it), free the
@@ -1702,6 +1714,7 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
     )
     cp = load_parallel_checkpoint(ctx, loop_ids, verbose)
     if cp is not None:
+        recover_checks(ctx, (slot['in_flight'] for slot in cp['loops'].values()), keep_staged=True)
         dropped = state.apply_checkpoint(cp)
         pending = sum(
             1
@@ -1724,7 +1737,11 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
                f"batches) and were dropped." if dropped else ""),
             verbose,
         )
-    state.write_checkpoint()
+    try:
+        state.write_checkpoint()
+    except CitationCheckpointError as e:
+        report_checkpoint_stop(ctx, e, verbose)
+        return ctx.dag
     steering = {"planner_sys": planner_sys, "generator_sys": generator_sys,
                 "comments_block": comments_block, "ref_block": ref_block}
 
@@ -1734,6 +1751,8 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
     # shared state, so the run ends cleanly with its checkpoint intact. A
     # worker that crashes run.max_loop_restarts times in a row without
     # completing a task is given up for the run.
+    write_failed = threading.Event()
+
     def _worker_thread(i: int, lid: str) -> None:
         # Each thread works on its own copy of the context.
         lctx = ctx.for_loop(
@@ -1751,6 +1770,13 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
                         reviser_sys, reference_block, reviser_ref_block,
                         references, verifier_sys, ref_ids, steering,
                     )
+                    return
+                except (CitationCommitError, CitationCheckpointError) as e:
+                    # A batch might be partly on disk. Reconcile against a
+                    # fresh load, not a worker restart on the old snapshot.
+                    write_failed.set()
+                    state.request_stop()
+                    lctx.ui.log(f'{lid}: could not publish citation checks: {e}. Stopping; resume from checkpoint.')
                     return
                 except llm.ContextLengthError as e:
                     # A mis-sized window, not a crash: every restart would
@@ -1835,14 +1861,22 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
     finally:
         ctx.run.parallel = None
 
-    if state.resolution is None:
-        # A settling lemma is caught as it is committed (check_dag); this
-        # is the last word for one whose check did not run to the end.
+    if write_failed.is_set():
+        try:
+            state.write_checkpoint()
+        except CitationCheckpointError as e:
+            report_checkpoint_stop(ctx, e, verbose)
+        return ctx.dag
+    # A sibling may have received a rejection while the settling loop was
+    # asking workers to stop. Never clear that evidence with the checkpoint.
+    pending = [slot['in_flight'] for slot in state.loops.values()]
+    recover_checks(ctx, pending, keep_staged=True)
+    dag = ctx.dag
+    if any(f and f.get('checks') for f in pending) and _settled(
+            ctx, dag, dag.suspension().suspended, conjecture, False):
+        recover_checks(ctx, pending)  # about to discard these parents
         dag = ctx.dag
-        susp = dag.suspension()
-        kind = _settled(ctx, dag, susp.suspended, conjecture, verbose)
-        if kind is not None:
-            state.set_resolution(kind)
+    state.resolution = _settled(ctx, dag, dag.suspension().suspended, conjecture, verbose)
     if state.resolution is not None:
         # Nothing is written to the DAG: the settling lemma is the record,
         # and the resolution is recomputed from it (resolution.py).
@@ -1852,7 +1886,11 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
             verbose,
         )
         return ctx.dag
-    state.write_checkpoint()
+    try:
+        state.write_checkpoint()
+    except CitationCheckpointError as e:
+        report_checkpoint_stop(ctx, e, verbose)
+        return ctx.dag
     buffer_snapshot = state.buffer.snapshot()
     ctx.ui.log(
         f"\nParallel run finished without settling the conjecture: "

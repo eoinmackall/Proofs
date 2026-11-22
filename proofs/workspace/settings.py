@@ -25,6 +25,8 @@ the start. The keys:
     run.replan_every          parallel mode: lemmas committed under a plan
                               before the next is due; -1 re-plans only when
                               the operator asks
+    run.citation_recheck_base probability base for direct citation rechecks
+                              in proofs run; 1 always, -1 disabled
     tools.max_rounds          tool rounds one agent call may spend before it
                               must answer (lookup_lemmas, search_lemmas)
     tools.code_rounds         the same, for a call offered run_code: a
@@ -36,7 +38,8 @@ the start. The keys:
     llm.max_compaction_passes compaction-and-resume passes one truncated call
                               may get before its partial work is handed on
 
-Every key but run.max_rejected_lemmas also takes -1, for no limit (a tool
+run.citation_recheck_base takes -1 to disable citation checks. Every other
+key but run.max_rejected_lemmas also takes -1, for no limit (a tool
 call's rounds are then bounded by the context window alone). within,
 below, counts and of_limit read a limit that may be -1.
 """
@@ -59,6 +62,7 @@ DEFAULTS: Dict[str, int] = {
     "run.max_rejected_lemmas": 4,
     "run.max_loop_restarts": 3,
     "run.replan_every": 5,
+    "run.citation_recheck_base": 2,
     "tools.max_rounds": 8,
     "tools.code_rounds": 8,
     "tools.max_lookup": 10,
@@ -75,6 +79,7 @@ FIELDS: Dict[str, str] = {
     "run.max_rejected_lemmas": "max_rejected_lemmas",
     "run.max_loop_restarts": "max_loop_restarts",
     "run.replan_every": "replan_every",
+    "run.citation_recheck_base": "citation_recheck_base",
     "tools.max_rounds": "max_tool_rounds",
     "tools.code_rounds": "code_tool_rounds",
     "tools.max_lookup": "max_lookup",
@@ -107,6 +112,7 @@ class Settings:
     max_rejected_lemmas: int = DEFAULTS["run.max_rejected_lemmas"]
     max_loop_restarts: int = DEFAULTS["run.max_loop_restarts"]
     replan_every: int = DEFAULTS["run.replan_every"]
+    citation_recheck_base: int = DEFAULTS["run.citation_recheck_base"]
     max_tool_rounds: int = DEFAULTS["tools.max_rounds"]
     code_tool_rounds: int = DEFAULTS["tools.code_rounds"]
     max_lookup: int = DEFAULTS["tools.max_lookup"]
@@ -140,6 +146,7 @@ FLAGS: Dict[str, str] = {
     "run.max_rejected_lemmas": "--max-rejected-lemmas",
     "run.max_loop_restarts": "--max-loop-restarts",
     "run.replan_every": "--replan-every",
+    "run.citation_recheck_base": "--citation-recheck-base",
     "tools.max_rounds": "--max-tool-rounds",
     "tools.code_rounds": "--max-code-rounds",
     "tools.max_lookup": "--max-lookup",
@@ -225,6 +232,8 @@ def _parse(key: str, value: Any) -> int:
     low = _MINIMUM.get(key, 1)
     if n < low:
         extra = "" if key in BOUNDED else " (or -1, for no limit)"
+        if key == "run.citation_recheck_base":
+            extra = " (or -1 to disable)"
         raise ValueError(f"{key} must be at least {low}{extra}, not {n}")
     return n
 

@@ -10,7 +10,7 @@
     proofs prune DIR                  remove refuted lemmas [--with-dependents]
     proofs migrate [DIR]              convert a format-1 workspace to streams
     proofs status DIR LEMMA_ID        a lemma's closure: hashes, certificates
-    proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR --format latex|html|png
+    proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex|html|png
                                     write the DAG as LaTeX, an interactive graph or an image
     proofs limits DIR                 show the code limits in effect, and their sources
     proofs tools lock DIR             write DIR's tools.lock from its flake (maintainer)
@@ -54,8 +54,9 @@ point, where the command's own docstring says what it does:
   * export (export/command.py, export/latex.py) writes the DAG as a LaTeX
     document in dependency order — the complete DAG, one user's lemmas
     (--user), or a lemma and everything it cites — into the directory
-    -o/--out names, created if it is not there yet. -o/--out is required:
-    the document is the user's artifact, not the project's data.
+    -o/--out names, created if it is not there yet, as -n/--name or a
+    name after what is exported. -o/--out is required: the document is the
+    user's artifact, not the project's data.
   * init (workspace.init) creates DIR/conjectures/, writes the .proofs
     marker and writes or updates the proofs block of DIR/.gitignore. It
     is safe to re-run, and refuses a DIR inside another workspace.
@@ -436,7 +437,8 @@ def build_parser() -> argparse.ArgumentParser:
             "in one self-contained HTML file (--format html), or a static "
             "image of that graph (--format png, needs matplotlib). The file "
             "is written into the -o/--out directory (created if it is not "
-            "there yet)."
+            "there yet), named by -n/--name or, without it, after what is "
+            "exported."
         ),
     )
     p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
@@ -453,6 +455,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="The directory the file is written to, created if it is "
              "not there yet. The export never lands in the project on "
              "its own.",
+    )
+    p.add_argument(
+        "-n", "--name", dest="name", default=None, metavar="NAME",
+        help="The file's name in OUT_DIR. The format's extension is added "
+             "unless NAME already ends in it. Default: proof, "
+             "<user_id>_proof, or the lemma id with its slashes as --, "
+             "plus _proof.",
     )
     p.add_argument(
         "--format", dest="fmt", choices=export_command.FORMATS, required=True,
@@ -840,6 +849,7 @@ def _cmd_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         parser=parser,
         fmt=args.fmt,
         theme=args.theme or "light",
+        name=args.name,
     )
     sys.exit(rc)
 

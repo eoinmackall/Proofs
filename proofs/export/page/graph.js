@@ -714,7 +714,7 @@
       if (hits.length === 1) i = hits[0];
     }
     search.setAttribute("aria-invalid", i === undefined ? "true" : "false");
-    search.style.borderColor = i === undefined ? "var(--u7)" : "";
+    search.style.borderColor = i === undefined ? "var(--u2)" : ""; // red: no match
     if (i !== undefined) { pin(i); centre(i); }
   }
   search.addEventListener("change", find);

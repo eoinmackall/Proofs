@@ -16,6 +16,36 @@ from ..workspace import layout as workspace
 from . import graph, html, latex, png
 
 FORMATS = ("latex", "html", "png")
+# The file extension each format writes.
+EXTENSIONS = {"latex": ".tex", "html": ".html", "png": ".png"}
+
+
+def file_name(default: str, name: Optional[str], fmt: str) -> str:
+    """The export's file name in the -o/--out directory: -n/--name when
+    given, else the default (latex.name_for's, its stem kept), with fmt's
+    extension. A name already ending in that extension keeps it; any other
+    suffix is part of the name ("v1.2" becomes "v1.2.tex"). Raises
+    ValueError for a name that is a path, or that ends in another format's
+    extension (writing an image as "graph.html" is a mistake, not a choice).
+    """
+    ext = EXTENSIONS[fmt]
+    if name is None:
+        return Path(default).stem + ext
+    if not name.strip() or name in (".", "..") or "/" in name or "\\" in name:
+        raise ValueError(
+            f"-n/--name takes a file name, not a path: {name!r}; "
+            f"-o/--out names the directory"
+        )
+    suffix = Path(name).suffix.lower()
+    if suffix == ext:
+        return name
+    if suffix in EXTENSIONS.values() or suffix == ".htm":
+        raise ValueError(
+            f"-n/--name {name!r} ends in {suffix}, but --format {fmt} "
+            f"writes {ext}"
+        )
+    return name + ext
+
 
 
 def export_entry(
@@ -28,13 +58,15 @@ def export_entry(
     parser: argparse.ArgumentParser,
     fmt: str,
     theme: str = "light",
+    name: Optional[str] = None,
 ) -> int:
     """proofs export NAME [LEMMA_ID] [--user USER_ID] --format FORMAT:
     write the chosen lemmas into out_dir (-o/--out, created if it is not
     there: the export is the user's artifact, not the project's data) as
     fmt — "latex", the document in dependency order (latex.py); "html",
     the interactive citation graph (html.py); "png", the static image of
-    it in the given theme (png.py).
+    it in the given theme (png.py). The file is named name (-n/--name,
+    see file_name) or, without it, after what is exported.
 
     With neither lemma_id nor owner it is the complete DAG; with owner, the
     lemmas that user's runs proved, ordered among themselves (their
@@ -44,6 +76,10 @@ def export_entry(
     document is a function of the files. Returns the exit code: 0 when the
     document was written.
     """
+    try:
+        file_name("proof.tex", name, fmt)
+    except ValueError as e:
+        parser.error(str(e))
     ctx = Context(user=user_id)
     try:
         paths = workspace.resolve(root, user_id)
@@ -59,23 +95,22 @@ def export_entry(
         if lemma_id not in lemmas:
             parser.error(f"{lemma_id} is not a lemma of the DAG {root}")
         order = _citation_closure(dag, lemma_id)
-        name = latex.name_for(lemma_id=lemma_id)
+        default = latex.name_for(lemma_id=lemma_id)
         scope = f"lemma {lemma_id} and everything it cites — {len(order)} lemma(s)"
     elif owner is not None:
         order = _dependency_order(dag, {lid for lid in lemmas if owner_of(lid) == owner})
-        name = latex.name_for(owner=owner)
+        default = latex.name_for(owner=owner)
         scope = f"{owner}'s lemmas — {len(order)} lemma(s)"
     else:
         order = _dependency_order(dag, set(lemmas))
         users = {owner_of(lid) for lid in order}
-        name = latex.name_for()
+        default = latex.name_for()
         scope = (f"the complete DAG — {len(order)} lemma(s) from "
                  f"{len(users)} user(s)")
+    out_path = Path(out_dir) / file_name(default, name, fmt)
     if fmt != "latex":
         return _export_graph(ctx, dag, order, scope, paths.root.name,
-                             Path(out_dir) / Path(name).with_suffix(
-                                 ".png" if fmt == "png" else ".html").name,
-                             fmt, theme, parser)
+                             out_path, fmt, theme, parser)
     # The scripts the exported lemmas rest on, for the appendix: latex.py
     # renders from data, so they are read here.
     run_lines = computations.load_runs(paths.root)
@@ -103,7 +138,7 @@ def export_entry(
         references=dag.references,
         computations=code_shown,
     )
-    out = latex.write(Path(out_dir) / name, document)
+    out = latex.write(out_path, document)
     ctx.ui.log(
         f"Exported {len(order)} lemma(s) to {out} — dependency order, "
         f"dependencies first."
