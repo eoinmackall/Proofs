@@ -16,8 +16,8 @@ from ..core.dag import load_file, new_lemma_id
 from ..tools.run_code import computations
 from . import strategies
 from .reasoning import (
-    COMPACT_MIN_ROOM, _estimate_tokens, _lookup_room, _model_for,
-    _native_tools, _reserve, _room,
+    COMPACT_MIN_ROOM, _lookup_room, _model_for, _native_tools,
+    _prompt_tokens, _reserve, _room,
 )
 
 # request a server accepted and then dropped must not stall the run longer.
@@ -258,20 +258,27 @@ def _fit_prompt(
     # The window and the chars/token estimate of the model role is routed
     # to, or pinned to (a fallback).
     m = _model_for(ctx, role)
-    num_ctx = m.num_ctx
-    limit = num_ctx - _reserve(num_ctx) - _lookup_room(num_ctx)
+    ctx_budget = m.ctx_budget
+    limit = ctx_budget - _reserve(ctx_budget) - _lookup_room(ctx_budget)
 
     def estimate(user_prompt: str, tools: Optional["tools_mod.ToolSet"]) -> int:
-        extra = ""
+        """The prompt reason() will send for user_prompt, measured
+        (_prompt_tokens: counted by the server where it can): while the
+        tools are offered it adds their specs (native) or the protocol on
+        the system prompt (JSON), and their hints on the task."""
+        native = bool(tools) and _native_tools(ctx, m)
+        system = system_prompt
+        user = user_prompt
         if tools:
-            # What reason() adds while it offers the tools: the specs or the
-            # protocol, and the hints on the task.
-            extra = (json.dumps(tools.specs()) if _native_tools(ctx, m)
-                     else tools.json_protocol()) + tools.prompt_hints()
-        return _estimate_tokens(m, [
-            {"content": system_prompt}, {"content": user_prompt},
-            {"content": extra},
-        ])
+            if not native:
+                system += "\n\n" + tools.json_protocol()
+            hints = tools.prompt_hints()
+            if hints:
+                user += "\n\n" + hints
+        return _prompt_tokens(m, [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ], tools.specs() if native else None)
 
     def build_with(sizes: Tuple[int, ...]):
         saved = ctx.loop.window_override
@@ -298,11 +305,11 @@ def _fit_prompt(
     if sizes != configured:
         ctx.ui.log(
             f"  {role}: showing at most {sum(sizes)} lemmas instead of "
-            f"{sum(configured)} to fit the {num_ctx:,}-token window (the "
+            f"{sum(configured)} to fit the {ctx_budget:,}-token window (the "
             f"rest stay available by search and lookup).",
             verbose,
         )
-    if _room(used, num_ctx) < COMPACT_MIN_ROOM:
+    if _room(used, ctx_budget) < COMPACT_MIN_ROOM:
         # Only reached with every size at 0: the room limit is below
         # half the window, so the loop above ran to the end.
         sized = {"the system prompt": system_prompt, **(parts or {})}
@@ -314,7 +321,7 @@ def _fit_prompt(
         )
         ctx.ui.log(
             f"  {role}: the prompt (~{used:,} tokens) does not fit the "
-            f"{num_ctx:,}-token window even with no lemmas in full; its "
+            f"{ctx_budget:,}-token window even with no lemmas in full; its "
             f"largest parts: "
             + ", ".join(f"{label} ~{n:,}" for label, n in largest)
             + ".",

@@ -72,14 +72,14 @@ LOOP_RESTART_DELAY = 10
 STEERING_RETRY_DELAY = 10
 
 
-def batch_size(num_ctx: int, loops: int) -> int:
+def batch_size(ctx_budget: int, loops: int) -> int:
     """k, the most candidate lemmas one generator call is asked for: 4 at a
     64K window, two more for each doubling and two fewer for each halving
     (2 at 32K, 6 at 128K), at least 1 and at most the loops. Each candidate
     in a call shares its thinking and its searches with the others, so a
     larger window affords a few more, and a few good candidates beat many
     thin ones."""
-    k = round(4 + 2 * math.log2(max(num_ctx, 1) / 65536))
+    k = round(4 + 2 * math.log2(max(ctx_budget, 1) / 65536))
     return max(1, min(k, loops))
 
 
@@ -377,7 +377,7 @@ class ParallelState:
         # Sized by the window of the model the generator is routed to:
         # the batch is its call's to write.
         self.batch = batch_size(
-            ctx.models.for_role("parallel_lemma_generator").num_ctx,
+            ctx.models.for_role("parallel_lemma_generator").ctx_budget,
             len(loop_ids))
         self.buffer = LemmaBuffer(len(loop_ids) + 2 * self.batch,
                                   marked_cap=self.ctx.code.loops)
@@ -1073,8 +1073,8 @@ def _plan_round(
                 "The parallel planner's prompt does not fit the context "
                 "window even with no lemmas shown in full (its largest "
                 "parts are logged above), and there is no plan to steer "
-                "by. Stopping the run: re-run with a larger window "
-                "(--num-ctx, and the server's own) or a smaller part.",
+                "by. Stopping the run: re-run with a larger budget "
+                "(--ctx-budget, up to the server's window) or a smaller part.",
                 verbose,
             )
             state.request_stop()
@@ -1202,8 +1202,8 @@ def _generate_round(
                 "The lemma generator's prompt does not fit the context "
                 "window even with no lemmas shown in full (its largest "
                 "parts are logged above), and no loop has work. "
-                "Stopping the run: re-run with a larger window "
-                "(--num-ctx, and the server's own) or a smaller part.",
+                "Stopping the run: re-run with a larger budget "
+                "(--ctx-budget, up to the server's window) or a smaller part.",
                 verbose,
             )
             state.request_stop()
@@ -1754,7 +1754,7 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
                 "comments_block": comments_block, "ref_block": ref_block}
 
     # A worker is restarted after a crash. A server context 400 (a
-    # mis-sized --num-ctx) is not a crash — every restart would 400 the
+    # mis-sized --ctx-budget) is not a crash — every restart would 400 the
     # same way — and turns into the one loud message plus a stop of the
     # shared state, so the run ends cleanly with its checkpoint intact. A
     # worker that crashes run.max_loop_restarts times in a row without

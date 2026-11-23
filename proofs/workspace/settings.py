@@ -61,6 +61,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
+from ..llm.base import DEFAULT_CTX_BUDGET  # noqa: F401  (re-exported for the flags)
 from ..tools.run_code import limits
 
 LOCAL_FILENAME = limits.LOCAL_FILENAME
@@ -104,8 +105,8 @@ FIELDS: Dict[str, str] = {
 
 # The defaults of the settings that are flags only (proofs run, proofs
 # repair): how the lemma window is chosen (loops/strategies.py) and its
-# size (-1 is no limit), how agents call tools, and the context window
-# used when nothing is probed (llm.base.Profile).
+# size (-1 is no limit) and how agents call tools. The context budget's
+# default, DEFAULT_CTX_BUDGET, is the llm package's (llm/base.py).
 DEFAULT_WINDOW_SIZE = 30
 # The window's strategies; the two that take a dial (random's beta,
 # depth's jitter), a number from 0 to 1, after a comma: random,0.5.
@@ -113,7 +114,6 @@ STRATEGIES = ("recent", "random", "depth", "breadth", "relevance", "popular")
 DIALS = ("random", "depth")
 DEFAULT_STRATEGY: Tuple[str, float] = ("recent", 0.0)
 DEFAULT_TOOL_MODE = "auto"
-DEFAULT_NUM_CTX = 65536
 
 
 @dataclass
@@ -144,7 +144,7 @@ class Settings:
     tool_mode: str = DEFAULT_TOOL_MODE
     # The routing keys as each file holds them, lowest layer first, as
     # (source, value) pairs: llm/routing.py combines them. The context
-    # window is each model's own (llm.routing.Model.num_ctx).
+    # budget is each model's own (llm.routing.Model.ctx_budget).
     model_layers: List[Tuple[str, Any]] = field(default_factory=list)
     route_layers: List[Tuple[str, Any]] = field(default_factory=list)
     # How many of a proof's verifiers run at once (proofs verify and

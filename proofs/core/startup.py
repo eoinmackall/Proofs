@@ -83,7 +83,7 @@ the statement it gave up on goes on the reject list the planner reads.
 When a call runs into the context wall
 --------------------------------------
 The server is stateless, so a truncated exchange — prompt, thinking trace,
-answer-so-far, summing to about num_ctx — cannot be re-sent whole. reason()
+answer-so-far, summing to about ctx_budget — cannot be re-sent whole. reason()
 therefore gets pi-style compaction rescues before reporting "ceiling":
 the thinking trace (scratch, regenerable) is summarised into a structured
 summary — Goal, Progress, Key Decisions, Next Steps, Critical Context, plus

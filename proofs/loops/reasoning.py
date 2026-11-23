@@ -157,7 +157,7 @@ def _call_options(m: "llm.Model") -> Dict[str, Any]:
     Likewise the reasoning effort (llm.models.NAME.effort, or --effort),
     which each backend sends in its API's own field. num_predict is set per
     call."""
-    options: Dict[str, Any] = {"num_ctx": m.num_ctx}
+    options: Dict[str, Any] = {"ctx_budget": m.ctx_budget}
     if m.spec.temperature is not None:
         options["temperature"] = m.spec.temperature
     if m.spec.effort is not None:
@@ -179,11 +179,11 @@ def _call_options(m: "llm.Model") -> Dict[str, Any]:
 # COMPACT_THRESHOLD is the fraction of the window a call is allowed to fill
 # (prompt + thinking + answer) before it is cut off and compacted. It is the
 # single knob for "how long a role may think before compaction": the generation
-# budget is set so that prompt + budget lands on COMPACT_THRESHOLD * num_ctx,
+# budget is set so that prompt + budget lands on COMPACT_THRESHOLD * ctx_budget,
 # leaving (1 - COMPACT_THRESHOLD) of the window as a safety margin rather than
 # a fixed 512 tokens. 0.99 leaves a ~1% margin; note the prompt itself eats
 # into the window, so the generation budget is really
-# (COMPACT_THRESHOLD * num_ctx) - prompt — a 30k prompt on a 90k window caps
+# (COMPACT_THRESHOLD * ctx_budget) - prompt — a 30k prompt on a 90k window caps
 # generation near 60k regardless of this value. Raise toward 1.0 for maximum
 # thinking room; lower it only if a run reports the server tripping the wall.
 COMPACT_ENABLED = True
@@ -201,7 +201,7 @@ COMPACT_TAIL_CHARS = 2000
 COMPACT_MIN_ROOM = 2048
 
 
-# Room kept for the reply. num_ctx is enforced only through the max_tokens
+# Room kept for the reply. ctx_budget is enforced only through the max_tokens
 # reason() asks for — the server never sees it — so nothing but this keeps a
 # prompt that grows with tool results from leaving a thinking model too
 # little room to think and then answer. RESERVE_TOKENS (Pi's default
@@ -228,12 +228,12 @@ _RESULT_FRAME_TOKENS = 128
 _MIN_RESULT_TOKENS = 256
 
 
-def _reserve(num_ctx: int) -> int:
-    return min(RESERVE_TOKENS, num_ctx // 4)
+def _reserve(ctx_budget: int) -> int:
+    return min(RESERVE_TOKENS, ctx_budget // 4)
 
 
-def _lookup_room(num_ctx: int) -> int:
-    return min(LOOKUP_ROOM, num_ctx // 4)
+def _lookup_room(ctx_budget: int) -> int:
+    return min(LOOKUP_ROOM, ctx_budget // 4)
 
 
 # HTTP statuses that mean "this request is malformed", not "the server is
@@ -351,7 +351,7 @@ def _context_length_message(
     400 — a measurement, not this run's budget; the budget is what the run
     asked for (m's window). Naming both, and only the setting that fixes
     it, keeps the failure from looking like a model or a network problem."""
-    budget = m.num_ctx
+    budget = m.ctx_budget
     if e.prompt_tokens is not None and e.prompt_tokens >= e.server_limit:
         return (
             f"\nThe server of {m.label()} rejected a call as too long: the "
@@ -370,7 +370,7 @@ def _context_length_message(
         f"call whose prompt plus generation budget outruns the window is "
         f"rejected outright — a rejection the compaction rescue never sees, "
         f"because it only triggers on a truncated reply. To match the "
-        f"server's --max-model-len, {m.num_ctx_fix(e.server_limit)}."
+        f"server's --max-model-len, {m.ctx_budget_fix(e.server_limit)}."
     )
 
 
@@ -380,7 +380,7 @@ def _fail_context_length(ctx, e: "llm.ContextLengthError",
     run, then the stop the caller names (parallel mode stops the shared
     state; serial mode exits from main instead). The checkpoint is
     untouched — it holds the last safe boundary, which is exactly where a
-    re-run with a corrected --num-ctx should resume from. Logged
+    re-run with a corrected --ctx-budget should resume from. Logged
     unconditionally: a fatal the operator must see is not verbose noise.
     The message names the model whose server refused (e.model, set by
     _chat), once per model."""
@@ -400,31 +400,46 @@ def _fail_context_length(ctx, e: "llm.ContextLengthError",
         stop()
 
 
-def _headroom(m: "llm.Model", messages: List[Dict[str, str]]) -> int:
-    """Tokens m's window has available for generation after the prompt,
-    with a safety margin.
+def _headroom(m: "llm.Model", messages: List[Dict[str, Any]],
+              tools: Optional[List[Dict[str, Any]]] = None) -> int:
+    """Tokens m's context budget has left for generation after the prompt
+    (messages, and the tools field when one is sent).
 
-    num_ctx caps prompt + generation together, so this is the most a response
-    can ever get: anything more is cut off by the context window, not the
-    budget, after a long generation.
-
-    The prompt size used to be estimated as chars // 4. That is optimistic for
-    LaTeX-dense text and, worse, it is tokenizer-specific — and the users
-    sharing a conjecture may each run a different model, with a different
-    tokenizer. The backend's chars_per_token() reads the running estimate that
-    note_usage() revises from each call's real prompt token count, so the
-    estimate converges on the truth for whichever model is loaded.
-
-    The budget is set so that prompt + generation lands on
-    COMPACT_THRESHOLD * num_ctx: the model may think and write until the window
-    is COMPACT_THRESHOLD full, and only then is it cut off for compaction.
+    ctx_budget caps prompt + generation together, so this is the most a
+    response can ever get. The budget is set so that prompt + generation
+    lands on COMPACT_THRESHOLD * ctx_budget: the model may think and write
+    until the budget is COMPACT_THRESHOLD full, and only then is it cut off
+    for compaction. The prompt is counted by the server where it can
+    count (_prompt_tokens), so the sum is exact at any prompt length.
     """
-    return _room(_estimate_tokens(m, messages), m.num_ctx)
+    return _room(_prompt_tokens(m, messages, tools), m.ctx_budget)
+
+
+def _prompt_tokens(m: "llm.Model", messages: List[Dict[str, Any]],
+                   tools: Optional[List[Dict[str, Any]]] = None) -> int:
+    """The size in tokens of the prompt messages (and tools, the
+    OpenAI-style field) make on m: the server's own count, chat template
+    included, where it offers one (Backend.count_tokens); else estimated
+    from characters (_estimate_tokens). An estimate's error grows with the
+    prompt — LaTeX runs nearer 2.5 characters a token than 4 — so on a
+    server that counts, nothing that sizes a call is estimated."""
+    counted = m.backend.count_tokens(messages, tools)
+    if counted is not None:
+        return counted
+    estimate = _estimate_tokens(m, messages)
+    if tools:
+        estimate += int(len(json.dumps(tools))
+                        / max(m.backend.chars_per_token(), 1.0))
+    return estimate
 
 
 def _estimate_tokens(m: "llm.Model", messages: List[Dict[str, Any]]) -> int:
     """The size in tokens of a list of messages, estimated from their
-    characters and m's running chars/token ratio (see _headroom)."""
+    characters and m's running chars/token ratio — the fallback where the
+    server counts nothing (_prompt_tokens), and the quick measure of a
+    prompt's parts. The ratio starts from the model's calibrated seed and
+    is revised from every real count and usage the server reports
+    (Backend.note_usage)."""
     # A tool-call turn carries its calls beside an often-empty content, and
     # sometimes its reasoning trace (reason()'s Model.echo_reasoning).
     chars = sum(
@@ -436,10 +451,10 @@ def _estimate_tokens(m: "llm.Model", messages: List[Dict[str, Any]]) -> int:
     return int(chars / max(ratio, 1.0)) + 1
 
 
-def _room(used: int, num_ctx: int) -> int:
+def _room(used: int, ctx_budget: int) -> int:
     """The generation budget a prompt of `used` tokens leaves: up to
     COMPACT_THRESHOLD of the window, floored at 0 (see _headroom)."""
-    return max(int(num_ctx * COMPACT_THRESHOLD) - used, 0)
+    return max(int(ctx_budget * COMPACT_THRESHOLD) - used, 0)
 
 
 COMPACT_SYSTEM = (
@@ -477,10 +492,10 @@ def _split_inline_thinking(content: str, thinking: str) -> Tuple[str, str]:
     return strip_thinking(content).strip(), thinking
 
 
-def _summary_room(num_ctx: int) -> int:
+def _summary_room(ctx_budget: int) -> int:
     """The room a compaction call keeps for its summary, clamped like
     _reserve so a small window still leaves most of itself for the trace."""
-    return min(COMPACT_SUMMARY_TOKENS, num_ctx // 4)
+    return min(COMPACT_SUMMARY_TOKENS, ctx_budget // 4)
 
 
 def _compact_messages(part: str, prev: str, tail: str, part_no: int,
@@ -512,7 +527,7 @@ def _compact_budget(m: "llm.Model", prev: str, tail: str) -> int:
     after the call's fixed text (system prompt, framing, the summary so
     far, the answer's tail) and the room kept for the summary it writes."""
     fixed = _estimate_tokens(m, _compact_messages("", prev, tail, 1, False))
-    return _room(fixed, m.num_ctx) - _summary_room(m.num_ctx)
+    return _room(fixed, m.ctx_budget) - _summary_room(m.ctx_budget)
 
 
 def _take_lines(lines: List[str], start: int, max_chars: int) -> int:
@@ -545,7 +560,7 @@ def _compact_pass(ctx, m: "llm.Model", part: str, prev: str, tail: str,
     # A chunk is sized to leave _summary_room for the summary (a quarter
     # of a small window); far less than that means the estimate was off
     # and the pass would be cut short or refused.
-    if room < min(COMPACT_MIN_ROOM, _summary_room(m.num_ctx) // 2):
+    if room < min(COMPACT_MIN_ROOM, _summary_room(m.ctx_budget) // 2):
         ctx.ui.log(f"  compaction chunk {part_no} leaves only ~{room} tokens of "
                    f"{m.label()}'s window; keeping the previous summary.",
                    verbose)
@@ -956,8 +971,8 @@ def _reason(
     # The tools as offered, for the fold notes of a task re-sent without
     # them (tools itself is dropped when they close).
     offered_tools = tools
-    num_ctx = m.num_ctx
-    reserve = _reserve(num_ctx)
+    ctx_budget = m.ctx_budget
+    reserve = _reserve(ctx_budget)
     native = bool(tools) and _native_tools(ctx, m)
     if tools and not native:
         system_prompt = base_system + "\n\n" + tools.json_protocol()
@@ -980,7 +995,8 @@ def _reason(
         another lookup result before the reserve."""
         return room - reserve - _RESULT_FRAME_TOKENS < _MIN_RESULT_TOKENS
 
-    if tools and _no_lookup_room(_room(_estimate_tokens(m, messages), num_ctx)):
+    if tools and _no_lookup_room(_headroom(
+            m, messages, tools.specs() if native else None)):
         # The task alone already reaches into the reply's reserve: no
         # lookup could fit, so none is offered — not the tools field, not
         # the protocol in the system prompt.
@@ -992,7 +1008,7 @@ def _reason(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        room = _room(_estimate_tokens(m, messages), num_ctx)
+        room = _room(_estimate_tokens(m, messages), ctx_budget)
         if room >= COMPACT_MIN_ROOM:   # else the loop's too_large says it
             ctx.ui.log(f"  {role}: closing lookups, ~{room:,} tokens left for the "
                 f"answer.", verbose)
@@ -1031,7 +1047,7 @@ def _reason(
     def _spare() -> int:
         """Tokens the prompt as it now stands has left before the reserve."""
         return _room(_used(_outgoing() if native else messages),
-                     num_ctx) - reserve
+                     ctx_budget) - reserve
 
     def _result_budget() -> int:
         """The characters the next tool result may take: the room left
@@ -1118,11 +1134,6 @@ def _reason(
         offer = (bool(tools) and not folded
                  and settings_mod.below(rounds, max_rounds))
         outgoing = _outgoing() if native else messages
-        # As much room as the window has left, recomputed for this prompt:
-        # the prompt differs every iteration and every role — and grows
-        # with each tool round — and there is no point asking for more than
-        # the window holds or less than it does.
-        room = _room(_used(outgoing), num_ctx)
         if native and not offer:
             # The last round of lookups is spent. Never a request that
             # declares tools with tool_choice "none": a model that still
@@ -1132,6 +1143,17 @@ def _reason(
             _fold(f"has used its {max_rounds} rounds of "
                   f"lookups")
             continue
+        # As much room as the budget has left, recomputed for this prompt:
+        # the prompt differs every iteration and every role — and grows
+        # with each tool round — and there is no point asking for more than
+        # the budget holds or less than it does. The server counts the
+        # prompt exactly, tools field included, where it can; that count
+        # is then what _used builds on until the conversation is reshaped.
+        counted = m.backend.count_tokens(
+            outgoing, tools.specs() if native else None)
+        if counted is not None:
+            measured = (counted, len(outgoing))
+        room = _room(_used(outgoing), ctx_budget)
         if native and _no_lookup_room(room):
             # The prompt has reached the reply's reserve: lookups close the
             # same way, by folding, and the model answers with what it
@@ -1147,7 +1169,7 @@ def _reason(
             # Never a request for (next to) nothing: a server refuses
             # max_tokens 0, and a thinking model cannot answer in less.
             ctx.ui.log(f"  {role}: the prompt leaves only ~{room:,} tokens of the "
-                f"{num_ctx:,}-token window for the reply; not sending it.",
+                f"{ctx_budget:,}-token window for the reply; not sending it.",
                 verbose)
             return "", "too_large", None
         if offer and _no_lookup_room(room):
@@ -1293,7 +1315,7 @@ def _reason(
                      or (len(thinking) + len(content)) // 4)
             ctx.ui.log(
                 f"  {role} hit the context wall "
-                f"(num_ctx={options['num_ctx']}, generated {spent} tokens, "
+                f"(ctx_budget={options['ctx_budget']}, generated {spent} tokens, "
                 f"~{len(thinking) // 4} of them thinking).",
                 verbose,
             )
@@ -1365,7 +1387,7 @@ def extract(
                f"sending it to the fallback, {fallback.label()}.", verbose)
     # The source fitted the extraction model's window, not necessarily the
     # fallback's: one that leaves no room for the copy is not sent.
-    room = _headroom(fallback, [{"content": source_text}])
+    room = _headroom(fallback, [{"role": "user", "content": source_text}])
     if room < COMPACT_MIN_ROOM:
         ctx.ui.log(f"  {role} extraction: the text leaves only ~{room} tokens "
                    f"of {fallback.label()}'s window; not sending it.", verbose)

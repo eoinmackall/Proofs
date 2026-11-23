@@ -7,7 +7,7 @@ through a routing table built from two keys of .proofs-local.json:
     "llm.models": {
         "local":  {"host": "http://localhost:8080/v1", "model": "qwen3-32b"},
         "strong": {"host": "https://api.openai.com/v1", "model": "gpt-5",
-                   "api_key_env": "OPENAI_API_KEY", "num_ctx": 200000}
+                   "api_key_env": "OPENAI_API_KEY", "ctx_budget": 200000}
     },
     "llm.routes": {
         "default":    "local",
@@ -19,8 +19,9 @@ through a routing table built from two keys of .proofs-local.json:
 A model entry names a server the way the backend flags do: host and model
 (host optional for backend anthropic, which defaults to
 https://api.anthropic.com), backend (auto, llamacpp, openai, or anthropic
-for the Anthropic Messages API; default auto), num_ctx (the context window;
-default the probed one), temperature (sent with every call to it; by
+for the Anthropic Messages API; default auto), ctx_budget (the most one
+call may take, prompt plus generation; default DEFAULT_CTX_BUDGET, capped
+by the server's own window where the probe reads one), temperature (sent with every call to it; by
 default none is sent, and the server's own applies; the Anthropic API
 takes none), effort (how hard a reasoning model thinks, where the API
 takes it: EFFORTS lists each backend's levels; by default none is sent)
@@ -35,7 +36,7 @@ routed apart from their role: "extract", the schema extraction that copies
 a role's prose into JSON, and "compact", the summarising pass of a call
 that hit the context wall; unrouted, each goes to its role's model.
 
-The backend flags (--host, --model, --api-key, --backend, --num-ctx,
+The backend flags (--host, --model, --api-key, --backend, --ctx-budget,
 --temperature, --effort) describe one more model, and make it the default route; --route ROLE=NAME
 routes one role (or glob) for one command. A command line that worked
 before routing works the same, and a file that routes a default needs no
@@ -82,6 +83,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from .base import DEFAULT_CTX_BUDGET
+
 DEFAULT_ROUTE = "default"
 FALLBACK_ROUTE = "fallback"
 STAGES = ("extract", "compact")
@@ -92,7 +95,7 @@ BACKENDS = ("auto", "llamacpp", "openai", "anthropic")
 # The host a backend defaults to, when it has one.
 DEFAULT_HOSTS = {"anthropic": "https://api.anthropic.com"}
 # The fields a file's model entry may hold.
-_FIELDS = ("host", "model", "backend", "num_ctx", "temperature", "effort",
+_FIELDS = ("host", "model", "backend", "ctx_budget", "temperature", "effort",
            "api_key_env")
 # The effort levels each API takes: the Anthropic API's output_config.effort
 # (which levels a model takes is probed, AnthropicBackend.effort_error), and
@@ -132,7 +135,7 @@ class ModelSpec:
     host: str
     model: str
     backend: str = "auto"
-    num_ctx: Optional[int] = None
+    ctx_budget: Optional[int] = None
     # Sent with every call when set; None leaves it to the server.
     temperature: Optional[float] = None
     # The reasoning effort (EFFORTS), sent the same way.
@@ -177,6 +180,10 @@ def parse_model(name: str, raw: Any, source: str) -> ModelSpec:
             f"it in an environment variable and name the variable with "
             f"api_key_env"
         )
+    if "num_ctx" in raw:
+        raise RoutingError(
+            f"{where}: num_ctx is now ctx_budget (the most one call may "
+            f"take, prompt plus generation); rename the field")
     unknown = sorted(set(raw) - set(_FIELDS))
     if unknown:
         raise RoutingError(
@@ -193,11 +200,11 @@ def parse_model(name: str, raw: Any, source: str) -> ModelSpec:
     for required, value in (("host", host), ("model", raw.get("model"))):
         if not isinstance(value, str) or not value.strip():
             raise RoutingError(f"{where} needs a {required}")
-    num_ctx = raw.get("num_ctx")
-    if num_ctx is not None and (isinstance(num_ctx, bool)
-                                or not isinstance(num_ctx, int) or num_ctx < 1):
+    ctx_budget = raw.get("ctx_budget")
+    if ctx_budget is not None and (isinstance(ctx_budget, bool)
+                                or not isinstance(ctx_budget, int) or ctx_budget < 1):
         raise RoutingError(
-            f"{where}: num_ctx must be a positive integer, not {num_ctx!r}")
+            f"{where}: ctx_budget must be a positive integer, not {ctx_budget!r}")
     temperature = raw.get("temperature")
     if temperature is not None and (isinstance(temperature, bool)
                                     or not isinstance(temperature, (int, float))
@@ -216,7 +223,7 @@ def parse_model(name: str, raw: Any, source: str) -> ModelSpec:
             f"{where}: api_key_env must name an environment variable, "
             f"not {env!r}")
     return ModelSpec(host=host.strip(), model=raw["model"].strip(),
-                     backend=backend, num_ctx=num_ctx,
+                     backend=backend, ctx_budget=ctx_budget,
                      temperature=(float(temperature) if temperature is not None
                                   else None),
                      effort=effort,
@@ -231,7 +238,7 @@ class Flags:
     model: Optional[str] = None
     api_key: Optional[str] = field(default=None, repr=False)
     backend: Optional[str] = None
-    num_ctx: Optional[int] = None
+    ctx_budget: Optional[int] = None
     temperature: Optional[float] = None
     effort: Optional[str] = None
     # --route ROLE=NAME, as given.
@@ -245,7 +252,7 @@ class Flags:
         if self.host is None and self.model is None:
             given = [flag for flag, value in (
                 ("--api-key", self.api_key), ("--backend", self.backend),
-                ("--num-ctx", self.num_ctx),
+                ("--ctx-budget", self.ctx_budget),
                 ("--temperature", self.temperature),
                 ("--effort", self.effort)) if value is not None]
             if given:
@@ -263,7 +270,7 @@ class Flags:
                 "--temperature: the Anthropic API takes no temperature (it "
                 "refuses one on every model)")
         return ModelSpec(host=host, model=self.model,
-                         backend=self.backend or "auto", num_ctx=self.num_ctx,
+                         backend=self.backend or "auto", ctx_budget=self.ctx_budget,
                          temperature=self.temperature,
                          effort=check_effort(self.backend or "auto",
                                              self.effort, "--effort"),
@@ -293,8 +300,9 @@ class Model:
     # The llm.Backend that owns the HTTP conversation, and its probe.
     backend: Any = None
     profile: Any = None
-    # The context window in tokens (llm.connect settles it).
-    num_ctx: int = 65536
+    # The context budget in tokens: the most one call may take, prompt
+    # plus generation (llm.connect settles it).
+    ctx_budget: int = DEFAULT_CTX_BUDGET
     # Native tool calls: None until the server refuses one, then False.
     native_tools_ok: Optional[bool] = None
     # Schema-constrained extraction proved incompatible with the model's
@@ -327,11 +335,11 @@ class Model:
             return f"--model {self.requested}"
         return f"{self.name} ({self.requested})"
 
-    def num_ctx_fix(self, tokens: int) -> str:
-        """The instruction that sets this model's window to tokens."""
+    def ctx_budget_fix(self, tokens: int) -> str:
+        """The instruction that sets this model's budget to tokens."""
         if self.name == FLAG_MODEL:
-            return f"re-run with --num-ctx {tokens}"
-        return (f"set num_ctx to {tokens} on llm.models.{self.name} in "
+            return f"re-run with --ctx-budget {tokens}"
+        return (f"set ctx_budget to {tokens} on llm.models.{self.name} in "
                 f"{self.spec.source}")
 
 
@@ -406,10 +414,10 @@ class Models:
             key = m.spec.key(m.name)
             try:
                 c = connect(m.spec.model, m.spec.host, timeout, key,
-                            m.spec.backend, m.spec.num_ctx)
+                            m.spec.backend, m.spec.ctx_budget)
             except ProbeError as e:
                 raise ProbeError(f"{m.label()}: {e}" if many else str(e)) from None
-            m.backend, m.profile, m.num_ctx = c.backend, c.profile, c.num_ctx
+            m.backend, m.profile, m.ctx_budget = c.backend, c.profile, c.ctx_budget
             m.echo_reasoning = c.backend.echoes_reasoning
             if m.spec.effort is not None:
                 # A level the probe shows the model does not take would
@@ -430,7 +438,7 @@ class Models:
             if m is self.fallback:
                 roles.append("fallback")
             lines.append(
-                f"  {m.label()} at {m.spec.host}, {m.num_ctx:,}-token window: "
+                f"  {m.label()} at {m.spec.host}, {m.ctx_budget:,}-token budget: "
                 f"{', '.join(roles)}"
             )
         return "\n".join(lines)

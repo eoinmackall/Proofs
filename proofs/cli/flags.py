@@ -11,7 +11,7 @@ from typing import Iterable
 from ..llm import routing
 from ..workspace import settings as settings_mod
 from ..workspace.settings import (
-    DEFAULT_NUM_CTX, DEFAULT_TOOL_MODE, DEFAULT_WINDOW_SIZE,
+    DEFAULT_CTX_BUDGET, DEFAULT_TOOL_MODE, DEFAULT_WINDOW_SIZE,
 )
 
 # What each settings flag sets (workspace/settings.py), before its default.
@@ -73,9 +73,9 @@ def _temperature(text: str) -> float:
 
 
 def add_backend_flags(parser: argparse.ArgumentParser) -> None:
-    """--host, --api-key, --model, --backend, --num-ctx, --temperature,
+    """--host, --api-key, --model, --backend, --ctx-budget, --temperature,
     --effort and --route: which models the command talks to, over which
-    dialect, in how large a window.
+    dialect, with how large a budget per call.
     Taken by proofs run, parse, verify and repair; model_flags reads them
     back. The first five describe one model, the default route; the
     .proofs-local.json files can route roles to others (llm/routing.py),
@@ -122,14 +122,17 @@ def add_backend_flags(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
-        "--num-ctx", type=int, default=None,
+        "--ctx-budget", type=int, default=None, metavar="TOKENS",
         help=(
-            "Context window in tokens. Defaults to the server's context — "
-            "the -c llama-server was launched with, as probed (lower it if "
-            f"VRAM is tight) — or {DEFAULT_NUM_CTX} on a hosted --host API, "
-            "where nothing is probed. An explicit value replaces that "
-            "default; against a probed llama-server it is clamped to the "
-            "ceiling."
+            "The most one call may take, prompt plus generation, in tokens: "
+            "each loop's share of the server, and how long a model may "
+            f"think before its trace is compacted. Default "
+            f"{DEFAULT_CTX_BUDGET}. Never sent to the server: each call's "
+            "max_tokens is sized from it, the prompt counted by the server "
+            "where it can (/tokenize). The server's own window (llama.cpp's "
+            "-c per slot, vLLM's --max-model-len) is read at startup and "
+            "caps it; it is never the default. A model in llm.models takes "
+            "a ctx_budget field instead."
         ),
     )
     parser.add_argument(
@@ -181,7 +184,7 @@ def model_flags(args: argparse.Namespace) -> routing.Flags:
     routing table takes them."""
     return routing.Flags(
         host=args.host, model=args.model, api_key=args.api_key,
-        backend=args.backend, num_ctx=args.num_ctx,
+        backend=args.backend, ctx_budget=args.ctx_budget,
         temperature=args.temperature, effort=args.effort,
         routes=tuple(args.route or ()), with_fallback=args.with_fallback,
     )

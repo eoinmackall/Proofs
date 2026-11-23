@@ -159,17 +159,26 @@ revision, does the lemma fall back to the planner's decomposition escape
 hatches.
 
 All of that assumes the server *answers* the call and merely cuts it off.
-When the window the run budgets (`NUM_CTX`) is larger than the window the
-server actually has — a `--host` API, where nothing is probed, or a
-`--num-ctx` above the server's own limit — the server does not truncate:
+Each call asks for `max_tokens` = the context budget (`--ctx-budget`, default
+65536) less its prompt, and on a self-hosted server the prompt is
+*counted*, not estimated: vLLM's `/tokenize`, or llama.cpp's
+`/apply-template` and `/tokenize`, apply the server's own chat template
+and tokenizer (no model runs; tens of milliseconds for a short prompt,
+about half a second for a 140k-token one). An estimate's error grows with
+the prompt — LaTeX runs nearer 2.5 characters a token than 4 — so a server
+that counts never sees a call larger than the budget. Where the server
+counts nothing (a hosted API), the prompt is estimated from its characters,
+the ratio revised from each reply's reported usage. When the budget is
+larger than the window the server actually has — a hosted API whose window
+was not read at startup — the server does not truncate:
 OpenAI- and vLLM-style servers answer a call whose prompt plus requested
 generation outruns their window with a 400 that names the real ceiling
 ("maximum context length is X tokens"). `chat()` reads that ceiling out of
 the 400 and raises `ContextLengthError` rather than a transport error, so
 no retry loop burns its attempts on a 400 that is guaranteed to repeat, and
-the run stops with the fix spelled out: `--num-ctx X`, matched to the
-server's `--max-model-len` — or, when the prompt alone already exceeds the
-window, the fact that no `--num-ctx` fixes that and the DAG has grown past
+the run stops with the fix spelled out: `--ctx-budget X`, matched to the
+server's window — or, when the prompt alone already exceeds the
+window, the fact that no `--ctx-budget` fixes that and the DAG has grown past
 the model. The checkpoint is untouched, so the corrected re-run resumes
 from the last safe boundary.
 
@@ -201,11 +210,14 @@ command).
 The probe can't tell the servers apart by name, so it tries: a `/props`
 answer means llama.cpp (full option set, real context ceiling); no
 `/props` means a generic endpoint (standard OpenAI option set —
-`top_k`/`min_p` are dropped, because a strict provider 400s on them). Its
-context window is read from the model's entry in the `models` list where
-the server gives one — vLLM's `max_model_len`, OpenRouter's
-`context_length` — and is otherwise a default (65536) unless `--num-ctx`
-is given.
+`top_k`/`min_p` are dropped, because a strict provider 400s on them). The
+server's own window is read where it gives one — llama.cpp's per-slot
+`n_ctx` from `/props`, otherwise the model's entry in the `models` list
+(vLLM's `max_model_len`, OpenRouter's `context_length`) — and is used only
+as a ceiling on the context budget, never as its default: on a server
+shared among many users, each call taking the whole window is not fair use,
+and a loop fills whatever it is offered. The probe also finds which token
+counting route the server offers, if any (above).
 
 `--backend {auto,llamacpp,openai}` (default `auto`) overrides that decision
 when the probe can't see the real server — a proxy in front of llama-server
@@ -282,7 +294,7 @@ JSON. Routes live in the gitignored `.proofs-local.json` files, beside the
   "llm.models": {
     "local":  {"host": "http://localhost:8081/v1", "model": "qwen3.8-27b"},
     "strong": {"host": "https://api.openai.com/v1", "model": "gpt-4o",
-               "api_key_env": "OPENAI_API_KEY", "num_ctx": 128000},
+               "api_key_env": "OPENAI_API_KEY", "ctx_budget": 128000},
     "claude": {"backend": "anthropic", "model": "claude-opus-5-5",
                "api_key_env": "ANTHROPIC_API_KEY"}
   },
@@ -298,7 +310,7 @@ JSON. Routes live in the gitignored `.proofs-local.json` files, beside the
 
 A model entry takes the fields the server flags do: `host` and `model`
 (required; `host` defaults to `https://api.anthropic.com` for an `anthropic`
-backend), `backend` (`auto`, `llamacpp`, `openai` or `anthropic`), `num_ctx`,
+backend), `backend` (`auto`, `llamacpp`, `openai` or `anthropic`), `ctx_budget`,
 `temperature` and `effort`. One exception to leaving sampling to the
 server: an extraction, which only copies a reply into JSON, is sent
 greedy, with every penalty off (temperature 0, no presence, frequency or
@@ -333,7 +345,7 @@ Routes are resolved key by key, the last of these that sets one winning:
 
 1. the workspace's `.proofs-local.json`;
 2. the conjecture's, `conjectures/NAME/.proofs-local.json`;
-3. `--host`/`--model` (with `--api-key`, `--backend`, `--num-ctx`), which
+3. `--host`/`--model` (with `--api-key`, `--backend`, `--ctx-budget`), which
    describe one more model and make it the `default`;
 4. `--route ROLE=NAME`, repeatable, for this command only.
 
@@ -569,7 +581,7 @@ proofs config --global user.email eoin@example.com
 `run` and `parse` both take one argument, the conjecture directory: a name
 under the workspace root's `conjectures/` or a path to it — anything after it is passed through
 to the tool unchanged. `parse` shares `run`'s server options (`--host`,
-`--api-key`, `--backend`, `--model`, `--num-ctx`, `--route`) and its DIR / `--verbose`
+`--api-key`, `--backend`, `--model`, `--ctx-budget`, `--route`) and its DIR / `--verbose`
 pair; it has no proving options, because it has no loop. `verify` and
 `repair` take the same server options too, and `repair` also takes the
 lemma-window and tool options (`--strategy`, `--window-size`,
@@ -606,7 +618,7 @@ server options.
 | `--fresh` | off | Start a new run, with an empty checkpoint, instead of continuing your most recent one. The DAG is kept. See [Cancelling a run](#cancelling-a-run-ctrl-c-and-resuming). |
 | `--resume RUN_ID` | off | Continue the given run from its checkpoint. |
 | `--parallel [N]` | off | Run N workers in parallel around one shared DAG; each plans, generates candidate lemmas or proves, as the run needs, so the run never makes more than N model calls at once. Bare `--parallel` is N=1. `--mode human`, when set, takes the place of one of the workers (loop-0). See [Parallel mode](#parallel-mode). |
-| `--num-ctx N` | the server's own (probed) | Context window in tokens. On a local llama-server: defaults to the `-c` it was launched with, as probed — lower it if VRAM is tight — and an explicit value is clamped to that ceiling. On a hosted `--host` API nothing is probed, so the default is 65536 and an explicit value replaces it. Budgeting above the server's own window is caught at once from the server's 400, which names its real limit and the `--num-ctx` to re-run with. |
+| `--ctx-budget N` | 65536 | The most one call may take, prompt plus generation, in tokens: each loop's share of the server (a parallel run holds up to N × this), and how long a model may think before its trace is compacted. Never sent to the server; each call's `max_tokens` is sized from it. The server's own window (llama.cpp's `-c` per slot, vLLM's `--max-model-len`, SGLang's `--context-length`), where the probe reads it, caps it. Where nothing is read, budgeting above the server's window is caught at once from the server's 400, which names its real limit and the `--ctx-budget` to re-run with. A model in `llm.models` takes a `ctx_budget` field instead (it was `num_ctx`). |
 | `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
 | `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
 | `--verbose / --no-verbose` | on | Console logging. |

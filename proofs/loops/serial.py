@@ -325,7 +325,7 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
                         "The planner's prompt does not fit the context window "
                         "even with no lemmas shown in full (its largest parts "
                         "are logged above). Stopping the run: re-run with a "
-                        "larger window (--num-ctx, and the server's own) or a "
+                        "larger budget (--ctx-budget, up to the server's window) or a "
                         "smaller part; the checkpoint keeps this iteration.",
                         verbose,
                     )

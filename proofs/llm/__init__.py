@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from .base import (
-    Backend, ContextLengthError, Profile, QuotaExhausted, Reply, ToolCall,
+    DEFAULT_CTX_BUDGET, Backend, ContextLengthError, Profile, QuotaExhausted, Reply, ToolCall,
     ToolsUnsupported, reasoning_chars,
 )
 from .anthropic import AnthropicBackend
@@ -55,41 +55,35 @@ class ProbeError(Exception):
 class Connection:
     backend: Backend
     profile: Profile
-    # The context window the command runs with (see connect()).
-    num_ctx: int
+    # The context budget the command runs with (see connect()).
+    ctx_budget: int
     # Startup notes about the probe and the request (describe()); "" when
     # there are none.
     notes: str
 
 
 def connect(model: str, host: str, timeout: int, api_key: Optional[str],
-            backend: str, num_ctx: Optional[int]) -> Connection:
-    """Make the backend, probe it, and settle the context window.
+            backend: str, ctx_budget: Optional[int]) -> Connection:
+    """Make the backend, probe it, and settle the context budget.
 
-    The probe tells the real context ceiling. With no num_ctx (--num-ctx)
-    the server's own is used as-is (on a llama-server the KV cache is
-    already allocated at launch, so there is nothing to request); an
-    explicit value always wins — clamped only when the ceiling was probed
-    (a llama-server's -c, the Anthropic Models API's window: a fact), since
-    on another endpoint the value on record is a default, not a
-    measurement, and clamping an explicit request to a guess would defeat
-    it. A model the probe found unservable (Profile.error) is not a
-    "degrade to defaults" situation — every call would fail — so it raises
-    ProbeError before a token is spent."""
+    The budget is the most one call — prompt plus generation — may take:
+    ctx_budget (--ctx-budget, llm.models.NAME.ctx_budget) when given, else
+    DEFAULT_CTX_BUDGET. The server's own window is a ceiling on it, never
+    the default: where the probe read one (llama.cpp's per-slot n_ctx,
+    vLLM's max_model_len, the Anthropic Models API) the budget is clamped
+    to it; where it read none there is nothing to clamp to, and a budget
+    the server cannot hold comes back as its context-length 400
+    (ContextLengthError). A model the probe found unservable
+    (Profile.error) is not a "degrade to defaults" situation — every call
+    would fail — so it raises ProbeError before a token is spent."""
     b = make_backend(model, host, timeout, api_key=api_key, backend=backend)
     prof = b.probe()
     if prof.error:
         raise ProbeError(prof.error)
-    if num_ctx is None:
-        window = prof.context_limit
-    elif prof.context_probed:
-        window = min(num_ctx, prof.context_limit)
-    else:
-        window = num_ctx
-    # describe() warns when an *explicit* --num-ctx is clamped; in the auto
-    # case the resolution above has already made the two agree.
-    notes = describe(prof, num_ctx if num_ctx is not None else window)
-    return Connection(b, prof, window, notes)
+    requested = ctx_budget if ctx_budget is not None else DEFAULT_CTX_BUDGET
+    budget = (min(requested, prof.context_limit) if prof.context_probed
+              else requested)
+    return Connection(b, prof, budget, describe(prof, requested))
 
 
 def describe(prof: Profile, requested_ctx: int) -> str:
@@ -117,22 +111,13 @@ def describe(prof: Profile, requested_ctx: int) -> str:
             "only the standard OpenAI fields are sent, and thinking is not "
             "suppressed for schema calls."
         )
-    if requested_ctx > prof.context_limit:
-        if prof.context_probed:
-            lines.append(
-                f"num_ctx {requested_ctx} exceeds the server's "
-                f"{prof.context_limit}. Clamping to {prof.context_limit} for now."
-            )
-        else:
-            # A default, not a measurement — and connect() lets an explicit
-            # --num-ctx replace it there instead of clamping to a guess. If
-            # the provider's real window is smaller than the budget, the
-            # first call that outruns it is 400'd and chat() turns that
-            # into a loud stop naming the server's own number
-            # (ContextLengthError).
-            lines.append(
-                f"num_ctx {requested_ctx} replaces the "
-                f"{prof.context_limit} default on record (this endpoint "
-                f"reports no context limit). "
-            )
+    if prof.context_probed and requested_ctx > prof.context_limit:
+        lines.append(
+            f"The context budget {requested_ctx:,} exceeds the server's "
+            f"{prof.context_limit:,}-token window; using "
+            f"{prof.context_limit:,}.")
+    if prof.probe_ok and prof.tokenizer is None:
+        lines.append(
+            "Prompt sizes are estimated from their characters: the server "
+            "offers no token count.")
     return "\n".join(lines)

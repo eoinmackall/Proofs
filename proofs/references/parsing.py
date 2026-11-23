@@ -55,7 +55,7 @@ Usage
 -----
     proofs parse conjectures/algebra_example
     proofs parse conjectures/algebra_example --model Qwen3.5-122B-Q4_K_M
-    proofs parse conjectures/algebra_example --num-ctx 65536
+    proofs parse conjectures/algebra_example --ctx-budget 65536
 
 DIR names a conjecture directory holding a conjecture.md (proofs parse
 hands it to run() as --conjecture, as proofs run does to core.startup.main()).
@@ -315,7 +315,7 @@ def run(
         ap.error(str(e))
         return
     parser_model = ctx.models.for_role("parser")
-    num_ctx = parser_model.num_ctx
+    ctx_budget = parser_model.ctx_budget
 
     # The run's user, before the paths: resolve() names the run's DAG
     # file after it, and the description the operator sees mentions whose
@@ -387,11 +387,14 @@ def run(
         if not text:
             ctx.ui.log(f"  {path.name}: empty, skipping.", args.verbose)
             continue
-        est = parser_model.backend.estimate_tokens(text)
-        if est > int(MAX_FILE_FRACTION * num_ctx):
+        counted = parser_model.backend.count_tokens(
+            [{"role": "user", "content": text}])
+        est = (counted if counted is not None
+               else parser_model.backend.estimate_tokens(text))
+        if est > int(MAX_FILE_FRACTION * ctx_budget):
             ctx.ui.log(
                 f"  skipping {path.name}: ~{est} tokens leaves no room for "
-                f"a reply inside the {num_ctx} context. Split the file into "
+                f"a reply inside the {ctx_budget} context. Split the file into "
                 f"chapters and re-run.",
                 args.verbose,
             )
@@ -400,7 +403,7 @@ def run(
         try:
             items = parse_file(ctx, system_prompt, text, path.name, args.verbose)
         except llm.ContextLengthError as e:
-            # A file this long for the window is a mis-sized --num-ctx, not
+            # A file this long for the window is a mis-sized --ctx-budget, not
             # a bad file: say so once, with the server's own number, and
             # stop. references.md keeps its previous contents — re-run
             # with the corrected budget and everything re-parses.

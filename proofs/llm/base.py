@@ -11,6 +11,8 @@ a small surface:
     backend.recorded_model() -> str       the model certificates record
     backend.recorded_model_known()        whether that is read off the
                                           server yet, or only the request
+    backend.count_tokens(messages, tools) a prompt's exact size, counted by
+                                          the server; None where it cannot
     backend.estimate_tokens(text)         a prompt's size, from the running
     backend.chars_per_token()             chars/token estimate chat() keeps
 
@@ -30,6 +32,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 
+# The context budget a model runs with when none is configured
+# (--ctx-budget, llm.models.NAME.ctx_budget): the most one call — prompt
+# plus generation — may take, so the size of each loop's share of a
+# server. The server's own window is only a ceiling on it (llm.connect):
+# taking a shared server's whole window by default is not fair use, and a
+# loop is expected to fill whatever it is offered.
+DEFAULT_CTX_BUDGET = 65536
+
+
 @dataclass
 class Profile:
     """What we know about the loaded model. Probed where possible."""
@@ -39,13 +50,20 @@ class Profile:
     # which is what --model asked for: a llama-server ignores the request's
     # model field and answers with whatever it loaded.
     model_name: Optional[str] = None
-    context_limit: int = 65536     # ceiling of the server's KV cache (tokens).
-                                   # --num-ctx must fit inside this.
+    # The server's own per-request window in tokens (llama.cpp's per-slot
+    # n_ctx, vLLM's max_model_len, the Anthropic Models API's window),
+    # when context_probed; otherwise a placeholder nothing is clamped to.
+    context_limit: int = DEFAULT_CTX_BUDGET
     probe_ok: bool = False         # False => everything below is a guess
-    # Whether context_limit was read off the server (llama.cpp's /props,
-    # the Anthropic Models API) rather than a default: an explicit window
-    # is clamped to a probed one only (llm.connect).
+    # Whether context_limit was read off the server rather than left at
+    # its placeholder: the budget is clamped to a probed window only
+    # (llm.connect).
     context_probed: bool = False
+    # How the server counts a prompt's tokens exactly (count_tokens):
+    # "vllm" (POST /tokenize with the chat messages), "llamacpp" (POST
+    # /apply-template, then /tokenize), or None when it offers neither and
+    # prompt sizes are estimated from characters.
+    tokenizer: Optional[str] = None
     # Transport facts, set by probe(). is_llama_cpp decides the option set;
     # key_verified reports that a supplied API key was accepted, and error
     # why the server cannot serve this model at all (unreachable, a wrong
@@ -249,6 +267,18 @@ class Backend(abc.ABC):
         """The running chars/token estimate: the profile's calibrated seed,
         revised by note_usage() as real usage arrives."""
         return self._chars_per_token
+
+    def count_tokens(self, messages: List[Dict[str, Any]],
+                     tools: Optional[List[Dict[str, Any]]] = None
+                     ) -> Optional[int]:
+        """The server's own count of the prompt messages (and tools, the
+        OpenAI-style field) make, chat template included: what a call's
+        generation budget is sized from (loops/reasoning.py,
+        _prompt_tokens). None when the server offers no count, or this one
+        failed: the caller estimates instead (estimate_tokens). A backend
+        that counts also folds each count into the running estimate
+        (note_usage), so what is still estimated converges on the truth."""
+        return None
 
     def estimate_tokens(self, text: str) -> int:
         """Rough size in tokens of a chunk of prompt text.

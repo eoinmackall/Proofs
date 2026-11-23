@@ -109,8 +109,10 @@ class OpenAICompatibleBackend(Backend):
         "min_p": "min_p",           # ditto
         "repeat_penalty": "repeat_penalty",
         "seed": "seed",
-        # num_ctx has no request-level equivalent: it is llama-server's -c/--ctx-size
-        # flag, fixed at launch. Dropped here and validated in probe() instead.
+        # ctx_budget is never sent: it is this client's own budget, which
+        # the loops spend by sizing num_predict (max_tokens) per call. The
+        # server's window is its launch flag (-c, --max-model-len), read
+        # by probe() as the ceiling.
     }
 
     # The standard OpenAI fields only, for a hosted API. The llama.cpp
@@ -253,6 +255,8 @@ class OpenAICompatibleBackend(Backend):
             prof.probed_llama_cpp if self.backend == "auto"
             else self.backend == "llamacpp"
         )
+        if prof.error is None:
+            prof.tokenizer = self._probe_tokenizer(prof.probed_llama_cpp)
 
         # Seed the running chars/token estimate from this model's calibrated
         # value; note_usage() revises it as real usage arrives this run.
@@ -312,6 +316,88 @@ class OpenAICompatibleBackend(Backend):
         if isinstance(window, int) and window > 0:
             prof.context_limit = window
             prof.context_probed = True
+
+    # Token counting: the server's own tokenizer and chat template, which
+    # self-hosted servers expose and hosted APIs do not. Neither route
+    # runs the model — it is a CPU-side lookup, tens to hundreds of ms
+    # even for a full window — so a count before every call is cheap next
+    # to the call it sizes.
+    #
+    #   vllm      POST <root>/tokenize with the chat messages (and tools):
+    #             vLLM applies the chat template and answers {"count"}.
+    #   llamacpp  POST <root>/apply-template with the messages (and tools)
+    #             for the templated prompt, then POST <root>/tokenize
+    #             with it as content: {"tokens": [...]}.
+    _COUNT_TIMEOUT = 60
+
+    def _probe_tokenizer(self, llama_cpp: bool) -> Optional[str]:
+        """Which counting route the server answers (see above), tried on a
+        one-message prompt; None when neither does."""
+        probe = [{"role": "user", "content": "x"}]
+        order = ("llamacpp", "vllm") if llama_cpp else ("vllm", "llamacpp")
+        for route in order:
+            if self._count(route, probe, None) is not None:
+                return route
+        return None
+
+    def _count(self, route: str, messages: List[Dict[str, Any]],
+               tools: Optional[List[Dict[str, Any]]]) -> Optional[int]:
+        """One count over route; None on any failure."""
+        try:
+            if route == "vllm":
+                body: Dict[str, Any] = {"model": self.model,
+                                        "messages": messages,
+                                        "add_generation_prompt": True}
+                if tools:
+                    body["tools"] = tools
+                r = requests.post(f"{self.root}/tokenize", json=body,
+                                  timeout=self._COUNT_TIMEOUT,
+                                  headers=self._headers)
+                if r.status_code != 200:
+                    return None
+                count = r.json().get("count")
+            else:
+                body = {"messages": messages}
+                if tools:
+                    body["tools"] = tools
+                r = requests.post(f"{self.root}/apply-template", json=body,
+                                  timeout=self._COUNT_TIMEOUT,
+                                  headers=self._headers)
+                if r.status_code != 200:
+                    return None
+                prompt = r.json().get("prompt")
+                if not isinstance(prompt, str):
+                    return None
+                r = requests.post(f"{self.root}/tokenize",
+                                  json={"content": prompt},
+                                  timeout=self._COUNT_TIMEOUT,
+                                  headers=self._headers)
+                if r.status_code != 200:
+                    return None
+                tokens = r.json().get("tokens")
+                count = len(tokens) if isinstance(tokens, list) else None
+        except (requests.RequestException, ValueError, AttributeError):
+            return None
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            return None
+        return count
+
+    def count_tokens(self, messages: List[Dict[str, Any]],
+                     tools: Optional[List[Dict[str, Any]]] = None
+                     ) -> Optional[int]:
+        """The server's count of this prompt (Backend.count_tokens), over
+        the route probe() found; None when it found none, or when this
+        count failed (the caller estimates that one call instead)."""
+        route = self.profile.tokenizer if self.profile is not None else None
+        if route is None:
+            return None
+        count = self._count(route, messages, tools)
+        if count is not None:
+            self.note_usage(
+                {"prompt_tokens": count},
+                sum(len(str(m.get("content") or "")) + reasoning_chars(m)
+                    for m in messages))
+        return count
 
     def chat(self, messages: List[Dict[str, Any]], *, think: Any = None,
              schema: Optional[Dict[str, Any]] = None,

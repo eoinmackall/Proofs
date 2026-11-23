@@ -249,7 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Parse the conjecture's references/ directory into "
             "references.md. Anything after DIR is passed to the parser "
-            "unchanged (--model, --host, --num-ctx, ...)."
+            "unchanged (--model, --host, --ctx-budget, ...)."
         ),
     )
     p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
