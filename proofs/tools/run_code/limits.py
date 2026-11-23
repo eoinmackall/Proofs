@@ -2,16 +2,17 @@
 
 A limit is resolved key by key, the first of these that sets it winning:
 
-    --code-* flags                       this command only
-    conjectures/NAME/limits.json         this conjecture on this machine
-    <workspace>/.proofs-local.json       this machine
-    DEFAULTS                             built in
+    --code-* flags                          this command only
+    conjectures/NAME/.proofs-local.json     this conjecture on this machine
+    conjectures/NAME/limits.json            the same, its older name
+    <workspace>/.proofs-local.json          this machine
+    DEFAULTS                                built in
 
-Both files are gitignored: limits describe the machine a run is on, not
+Every file is gitignored: limits describe the machine a run is on, not
 the conjecture, so they are never shared. Each is a JSON object holding
 only the keys it overrides, named the way config.py names its keys (the
-workspace file also holds the run's settings, workspace/settings.py,
-under their own run.*, tools.* and llm.* keys):
+.proofs-local.json files also hold the run's settings,
+workspace/settings.py, under their own run.*, tools.* and llm.* keys):
 
     {"code.memory": "32G", "code.jobs": 4}
 
@@ -57,7 +58,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-LOCAL_FILENAME = ".proofs-local.json"     # at the workspace root
+LOCAL_FILENAME = ".proofs-local.json"     # at the workspace root, and in a conjecture directory
 CONJECTURE_FILENAME = "limits.json"       # in a conjecture directory
 
 DEFAULTS: Dict[str, Any] = {
@@ -154,8 +155,8 @@ class Limits:
 
 
 def _read(path: Path, shared: bool = False) -> Dict[str, Any]:
-    """A limits file's object, {} when it is not there. shared: the
-    workspace's .proofs-local.json, which also holds the run's settings
+    """A limits file's object, {} when it is not there. shared: a
+    .proofs-local.json, which also holds the run's settings
     (workspace/settings.py) — only its code.* keys are limits."""
     if not path.is_file():
         return {}
@@ -199,6 +200,8 @@ def resolve(
     if conjecture_dir is not None:
         p = conjecture_dir / CONJECTURE_FILENAME
         layers.append((label(p), _read(p)))
+        p = conjecture_dir / LOCAL_FILENAME
+        layers.append((label(p), _read(p, shared=True)))
     if flags:
         layers.append(("flag", {k: v for k, v in flags.items() if v is not None}))
     values: Dict[str, int] = {}

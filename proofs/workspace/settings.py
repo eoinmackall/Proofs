@@ -1,17 +1,19 @@
 """The run's tunables, per machine: the run.*, tools.* and llm.* keys of
-the workspace's .proofs-local.json.
+the .proofs-local.json files.
 
 A setting is resolved key by key, the first of these that sets it winning:
 
-    flags                               this command only (FLAGS names
-                                        each key's; cli/flags.py adds them)
-    <workspace>/.proofs-local.json      this machine
-    DEFAULTS                            built in
+    flags                                   this command only (FLAGS names
+                                            each key's; cli/flags.py adds them)
+    conjectures/NAME/.proofs-local.json     this conjecture on this machine
+    <workspace>/.proofs-local.json          this machine
+    DEFAULTS                                built in
 
-The file is the one the code limits live in (tools/run_code/limits.py
-reads its code.* keys); it is gitignored, and proofs init writes it with
-every key at its default, so the machine's settings are there to edit from
-the start. The keys:
+The files are the ones the code limits live in (tools/run_code/limits.py
+reads their code.* keys); both are gitignored. proofs init writes the
+workspace's with every key at its default, so the machine's settings are
+there to edit from the start; a conjecture's holds only the keys it
+overrides, and need not exist. The keys:
 
     run.max_iterations        loop iterations before the run stops; -1 runs
                               until the conjecture is settled or the run is
@@ -42,15 +44,22 @@ run.citation_recheck_base takes -1 to disable citation checks. Every other
 key but run.max_rejected_lemmas also takes -1, for no limit (a tool
 call's rounds are then bounded by the context window alone). within,
 below, counts and of_limit read a limit that may be -1.
+
+Two more keys are objects rather than integers, and route the agents'
+calls to models (llm/routing.py has their format and how their layers
+combine):
+
+    llm.models                the models a run may use, by name
+    llm.routes                which model each role is served by
 """
 
 from __future__ import annotations
 
 import itertools
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from ..tools.run_code import limits
 
@@ -71,6 +80,11 @@ DEFAULTS: Dict[str, int] = {
     "llm.max_compaction_passes": 2,
 }
 KEYS = tuple(DEFAULTS)
+# The routing keys (llm/routing.py): objects, layered and checked there
+# rather than parsed as integers here.
+MODELS_KEY = "llm.models"
+ROUTES_KEY = "llm.routes"
+ROUTING_KEYS = (MODELS_KEY, ROUTES_KEY)
 
 # The Settings field each key sets.
 FIELDS: Dict[str, str] = {
@@ -91,7 +105,7 @@ FIELDS: Dict[str, str] = {
 # The defaults of the settings that are flags only (proofs run, proofs
 # repair): how the lemma window is chosen (loops/strategies.py) and its
 # size (-1 is no limit), how agents call tools, and the context window
-# used when nothing is probed.
+# used when nothing is probed (llm.base.Profile).
 DEFAULT_WINDOW_SIZE = 30
 # The window's strategies; the two that take a dial (random's beta,
 # depth's jitter), a number from 0 to 1, after a comma: random,0.5.
@@ -128,8 +142,11 @@ class Settings:
     my_lemmas: Optional[int] = None
     # How agents call tools: "auto" or "json" (see --tool-mode).
     tool_mode: str = DEFAULT_TOOL_MODE
-    # The context window in tokens: the probed server's, or --num-ctx.
-    num_ctx: int = DEFAULT_NUM_CTX
+    # The routing keys as each file holds them, lowest layer first, as
+    # (source, value) pairs: llm/routing.py combines them. The context
+    # window is each model's own (llm.routing.Model.num_ctx).
+    model_layers: List[Tuple[str, Any]] = field(default_factory=list)
+    route_layers: List[Tuple[str, Any]] = field(default_factory=list)
     # How many of a proof's verifiers run at once (proofs verify and
     # proofs repair --parallel); 1 runs them one after another.
     parallel_verifiers: int = 1
@@ -238,12 +255,10 @@ def _parse(key: str, value: Any) -> int:
     return n
 
 
-def read(workspace_root: Optional[Path]) -> Dict[str, Any]:
-    """The settings keys .proofs-local.json holds, {} when there is no
-    file. Its code.* keys are limits.py's; any other key is an error."""
-    if workspace_root is None:
-        return {}
-    path = workspace_root / LOCAL_FILENAME
+def read(path: Path) -> Dict[str, Any]:
+    """The settings and routing keys a .proofs-local.json holds, {} when
+    there is no file. Its code.* keys are limits.py's; any other key is an
+    error."""
     if not path.is_file():
         return {}
     try:
@@ -253,23 +268,59 @@ def read(workspace_root: Optional[Path]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise SettingsError(f"{path} must hold a JSON object")
     unknown = sorted(k for k in data
-                     if k not in DEFAULTS and not k.startswith("code."))
+                     if k not in DEFAULTS and k not in ROUTING_KEYS
+                     and not k.startswith("code."))
     if unknown:
         raise SettingsError(
             f"{path}: unknown key(s) {', '.join(unknown)}; the keys are "
-            f"{' '.join(KEYS)} and the code.* limits"
+            f"{' '.join(KEYS + ROUTING_KEYS)} and the code.* limits"
         )
-    return {k: v for k, v in data.items() if k in DEFAULTS}
+    return {k: v for k, v in data.items()
+            if k in DEFAULTS or k in ROUTING_KEYS}
+
+
+def local_files(
+    workspace_root: Optional[Path], conjecture_dir: Optional[Path],
+) -> List[Tuple[str, Path]]:
+    """The .proofs-local.json files a command reads, lowest layer first,
+    each with the name messages give it: its path from the workspace root
+    when it is under one."""
+    paths = []
+    if workspace_root is not None:
+        paths.append(workspace_root / LOCAL_FILENAME)
+    if conjecture_dir is not None:
+        paths.append(conjecture_dir / LOCAL_FILENAME)
+    files = []
+    for p in paths:
+        label = str(p)
+        if workspace_root is not None:
+            try:
+                label = str(p.relative_to(workspace_root))
+            except ValueError:
+                pass
+        files.append((label, p))
+    return files
 
 
 def resolve(
     workspace_root: Optional[Path],
     flags: Optional[Mapping[str, Any]] = None,
+    conjecture_dir: Optional[Path] = None,
 ) -> Settings:
     """The settings in effect (see the module docstring). flags maps a key
-    to the value a flag gave, None for a flag not passed."""
+    to the value a flag gave, None for a flag not passed; conjecture_dir,
+    when given, adds its .proofs-local.json above the workspace's."""
     values: Dict[str, int] = {}
-    layers = [("default", DEFAULTS), (LOCAL_FILENAME, read(workspace_root))]
+    layers = [("default", DEFAULTS)]
+    model_layers: List[Tuple[str, Any]] = []
+    route_layers: List[Tuple[str, Any]] = []
+    for label, path in local_files(workspace_root, conjecture_dir):
+        data = read(path)
+        layers.append((label, {k: v for k, v in data.items() if k in DEFAULTS}))
+        if MODELS_KEY in data:
+            model_layers.append((label, data[MODELS_KEY]))
+        if ROUTES_KEY in data:
+            route_layers.append((label, data[ROUTES_KEY]))
     if flags:
         layers.append(("flag", {k: v for k, v in flags.items() if v is not None}))
     for source, layer in layers:
@@ -278,4 +329,5 @@ def resolve(
                 values[key] = _parse(key, raw)
             except ValueError as e:
                 raise SettingsError(f"{source}: {e}") from None
-    return Settings(**{FIELDS[k]: v for k, v in values.items()})
+    return Settings(**{FIELDS[k]: v for k, v in values.items()},
+                    model_layers=model_layers, route_layers=route_layers)

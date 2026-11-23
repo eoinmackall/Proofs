@@ -10,6 +10,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .. import llm
 from ..core import certificates, merkle, refutations
 from ..core.context import Code, Context
 from ..core.dag import (
@@ -24,6 +25,7 @@ from ..workspace.settings import (
     DEFAULT_STRATEGY, DEFAULT_TOOL_MODE, DEFAULT_WINDOW_SIZE,
 )
 from .prompts import _build_reference_blocks
+from .reasoning import VERIFIER_ROLES
 from .proof import run_proof_loop
 from .verify import (
     EXIT_NO_VERDICT, _verifier_prompts, _verify_session, verify_stored_lemma,
@@ -422,8 +424,7 @@ def _guarded(ctx, verbose: bool, body) -> int:
 
 
 def _session(
-    ctx, *, root: Path, user_id: str, model: str, host: Optional[str],
-    api_key: Optional[str], backend: str, num_ctx: Optional[int],
+    ctx, *, root: Path, user_id: str, model_flags: "llm.Flags",
     verbose: bool, parser: argparse.ArgumentParser, lemmas_all: Optional[int],
     my_lemmas: Optional[int], tool_mode: str, strategy: Tuple[str, float],
     window_size: int, parallel: int = 1,
@@ -432,8 +433,10 @@ def _session(
     """The verify session, with the re-proof's lemma window and tool mode."""
     _verify_session(
         ctx,
-        conjecture_dir=str(root), user_id=user_id, model=model, host=host,
-        api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
+        conjecture_dir=str(root), user_id=user_id, model_flags=model_flags,
+        # A repair re-verifies, and re-proves what fails: the prover's and
+        # the reviser's models as well as the verifiers'.
+        roles=(*VERIFIER_ROLES, "prover", "reviser"),
         verbose=verbose, parser=parser, parallel=parallel,
         settings_flags=settings_flags,
     )
@@ -447,11 +450,7 @@ def repair_entry(
     *,
     path: str,
     user_id: str,
-    model: str,
-    host: Optional[str],
-    api_key: Optional[str],
-    backend: str,
-    num_ctx: Optional[int],
+    model_flags: "llm.Flags",
     verbose: bool,
     parser: argparse.ArgumentParser,
     lemmas_all: Optional[int] = None,
@@ -541,8 +540,8 @@ def repair_entry(
             f"--tools"
         )
     _session(
-        ctx, root=root, user_id=user_id, model=model, host=host,
-        api_key=api_key, backend=backend, num_ctx=num_ctx, verbose=verbose,
+        ctx, root=root, user_id=user_id, model_flags=model_flags,
+        verbose=verbose,
         parser=parser, lemmas_all=lemmas_all, my_lemmas=my_lemmas,
         tool_mode=tool_mode, strategy=strategy, window_size=window_size,
         parallel=parallel,
@@ -586,11 +585,7 @@ def repair_all_entry(
     *,
     root: str,
     user_id: str,
-    model: str,
-    host: Optional[str],
-    api_key: Optional[str],
-    backend: str,
-    num_ctx: Optional[int],
+    model_flags: "llm.Flags",
     verbose: bool,
     parser: argparse.ArgumentParser,
     lemmas_all: Optional[int] = None,
@@ -632,8 +627,8 @@ def repair_all_entry(
     """
     ctx = Context(user=user_id, code=code if code is not None else Code())
     _session(
-        ctx, root=Path(root), user_id=user_id, model=model, host=host,
-        api_key=api_key, backend=backend, num_ctx=num_ctx, verbose=verbose,
+        ctx, root=Path(root), user_id=user_id, model_flags=model_flags,
+        verbose=verbose,
         parser=parser, lemmas_all=lemmas_all, my_lemmas=my_lemmas,
         tool_mode=tool_mode, strategy=strategy, window_size=window_size,
         parallel=parallel,

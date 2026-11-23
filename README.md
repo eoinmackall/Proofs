@@ -113,6 +113,21 @@ runs as a fallback. The underlying tension there — on llama.cpp, reasoning
 silently voids the grammar — is handled inside `proofs/llm/openai_compat.py`, which
 disables reasoning for exactly the calls that carry a schema.
 
+The prover is never extracted: a reply that does not parse is taken as the
+proof text, verbatim. Every other agent's (the planner's, the verifiers',
+the reviser's, the parallel planner's and generator's, the parser's) goes
+to extraction when its reply does not parse. The parse
+(`proofs/loops/json_repair.py`) is forgiving where models commonly slip:
+raw newlines inside a JSON string (a long proof), prose or a sentence of
+preamble before the object, LaTeX braces in that prose, reasoning left in
+the reply — `<think>...</think>`, or only the closing `</think>` when the
+chat template opened the tag in the prompt and the server ran without a
+reasoning parser — and an object restarted after a context-wall
+continuation. It takes the first object that has a key the agent's answer
+has (`proof`, `decision`, `candidate_lemmas`, ...), so a citation written
+as `{"user_id": ..., "lemma_id": ...}` in the prose is never mistaken for
+the answer.
+
 ### When a call hits the context wall
 
 The server is stateless, so a response cut off by the context window cannot
@@ -160,24 +175,37 @@ from the last safe boundary.
 
 ### Backend
 
-One transport, probed at startup (`proofs/llm/openai_compat.py`, behind the
-small `Backend` interface in `proofs/llm/base.py` that the loops call): the
-OpenAI-compatible `/v1/chat/completions` endpoint. The same code serves two
-backends:
+Two transports, each probed at startup, behind the small `Backend` interface
+in `proofs/llm/base.py` that the loops call: the OpenAI-compatible
+`chat/completions` endpoint (`proofs/llm/openai_compat.py`), and the
+Anthropic Messages API (`proofs/llm/anthropic.py`, below). Both are plain
+HTTP over `requests`; no provider SDK is needed. The OpenAI-compatible code
+serves two kinds of server:
 
 - **llama.cpp** — a local `llama-server`. There the grammar suppresses
   thinking, so reasoning is disabled for schema calls.
 - **a hosted API** — any OpenAI-compatible provider (OpenAI, OpenRouter,
-  DeepSeek, ...), pointed at by `--host` with its base URL and authenticated
-  with `--api-key`. A supplied key is checked against the
-  provider's `/v1/models` at startup, so a wrong key fails loudly instead of
-  401-ing every call in a run.
+  DeepSeek, Google Gemini, ...), pointed at by `--host` with its base URL and authenticated
+  with `--api-key`.
 
-The probe can't tell the two apart by name, so it tries: a `/props` answer
-means llama.cpp (full option set, real context ceiling); no `/props` means a
-generic endpoint (standard OpenAI option set — `top_k`/`min_p` are dropped,
-because a strict provider 400s on them — and the context limit is a default
-unless `--num-ctx` is given).
+At startup every model is checked against its server's `models` route,
+which every OpenAI-compatible server answers, and the command stops unless
+it answers: no answer (is the server up?), a 404 (the base URL is wrong —
+usually it is missing its version path, `/v1`), a 401/403 (the key is
+rejected, or one is needed). So a mistake fails loudly before any work,
+instead of every call in a run failing. The same answer verifies a
+supplied key, and warns when the list does not name the requested model
+(a provider's list is not always complete, so this does not stop the
+command).
+
+The probe can't tell the servers apart by name, so it tries: a `/props`
+answer means llama.cpp (full option set, real context ceiling); no
+`/props` means a generic endpoint (standard OpenAI option set —
+`top_k`/`min_p` are dropped, because a strict provider 400s on them). Its
+context window is read from the model's entry in the `models` list where
+the server gives one — vLLM's `max_model_len`, OpenRouter's
+`context_length` — and is otherwise a default (65536) unless `--num-ctx`
+is given.
 
 `--backend {auto,llamacpp,openai}` (default `auto`) overrides that decision
 when the probe can't see the real server — a proxy in front of llama-server
@@ -203,11 +231,163 @@ the work, not the `--model` request:
   suffix (`gpt-4o` → `gpt-4o-2024-08-06`).
 - **When the server names nothing**, the `--model` name.
 
-The `/v1/models` list is not used for naming: on a hosted API it is the
+The `models` list is not used for naming: on a hosted API it is the
 provider's whole catalogue.
 
 Model capabilities (context size) are *profiles*, probed
 rather than hard-coded, so adding a model needs no code change.
+
+**The Anthropic Messages API** (`--backend anthropic`, or `"backend":
+"anthropic"` on a [routed](#model-routing) model; the host defaults to
+`https://api.anthropic.com`) speaks Claude's own API rather than an
+OpenAI-compatible shim:
+
+- the probe reads `GET /v1/models/{model}`: the real context window, the
+  output cap, and whether the model takes adaptive thinking and structured
+  outputs. A rejected key or an unknown model id stops the command there.
+- reasoning calls ask for adaptive thinking with a summarized display, so
+  the [compaction rescue](#when-a-call-hits-the-context-wall) has a trace to
+  work from; thinking blocks go back unchanged with their tool calls, as the
+  API requires.
+- extraction calls send the schema as structured output
+  (`output_config.format`), made strict, instead of a grammar.
+- the system prompt carries a cache breakpoint, so a role's repeated calls
+  read it from the prompt cache; a call that offers tools also caches its
+  growing conversation, round by round.
+- an `effort` (`--effort`, or a model entry's `effort`) is sent as
+  `output_config.effort`, checked at startup against the levels the model
+  takes; unset, the model's default applies (`medium` on Claude Opus 5.5).
+- no sampling field is ever sent: on the API version used (`2026-10-21`)
+  Claude refuses `temperature`, `top_p` and `top_k` outright, so a
+  `temperature` on an Anthropic model is refused at startup.
+- requests are not streamed: one call waits for its whole reply, under the
+  90-minute read timeout.
+
+```bash
+export ANTHROPIC_API_KEY=...
+proofs run algebra_example --backend anthropic --model claude-opus-5-5 \
+    --api-key "$ANTHROPIC_API_KEY"
+```
+
+### Model routing
+
+A run need not use one model for everything: each agent role can be served
+by a model of its own — a strong hosted model for the prover and the
+verifiers, say, and a local one for planning and for copying prose into
+JSON. Routes live in the gitignored `.proofs-local.json` files, beside the
+[settings](#settings), as two keys (`proofs/llm/routing.py`):
+
+```json
+{
+  "llm.models": {
+    "local":  {"host": "http://localhost:8081/v1", "model": "qwen3.8-27b"},
+    "strong": {"host": "https://api.openai.com/v1", "model": "gpt-4o",
+               "api_key_env": "OPENAI_API_KEY", "num_ctx": 128000},
+    "claude": {"backend": "anthropic", "model": "claude-opus-5-5",
+               "api_key_env": "ANTHROPIC_API_KEY"}
+  },
+  "llm.routes": {
+    "default":    "local",
+    "prover":     "strong",
+    "verifier_*": "strong",
+    "coding_verifier": "strong",
+    "extract":    "local"
+  }
+}
+```
+
+A model entry takes the fields the server flags do: `host` and `model`
+(required; `host` defaults to `https://api.anthropic.com` for an `anthropic`
+backend), `backend` (`auto`, `llamacpp`, `openai` or `anthropic`), `num_ctx`,
+`temperature` and `effort`. One exception to leaving sampling to the
+server: an extraction, which only copies a reply into JSON, is sent
+greedy, with every penalty off (temperature 0, no presence, frequency or
+repeat penalty), so a server's launch-time sampling cannot make it
+paraphrase. Never to an Anthropic model, and a server that refuses those
+fields gets the call again without them, and never again that run.
+`effort` sets how hard a reasoning model thinks,
+where its API takes it: `low`, `medium`, `high`, `xhigh` or `max` on an
+`anthropic` model (sent as `output_config.effort`; a level the model does
+not take, as its probe reports, stops the command at startup), and `none`,
+`minimal`, `low`, `medium`, `high` or `xhigh` elsewhere (sent as
+`reasoning_effort`; which levels a provider takes varies and cannot be
+probed). Like `temperature`, it is not sent unless set. No sampling field is sent unless `temperature` is set (or
+`--temperature`, for the `--model` model): the server's own defaults, the
+ones the model's card recommends, apply. Its
+API key is never in the file: `api_key_env` names the environment variable
+that holds it, and a file holding an `api_key` is refused — a gitignored
+file is still one `git add -f`, backup or tarball away from being shared.
+
+A route maps a role to a model's name: `planner`, `prover`, `verifier_1`,
+`verifier_2`, `verifier_3`, `coding_verifier`, `reviser`, `parser`,
+`parallel_planner` or `parallel_lemma_generator`, or a glob over them
+(`verifier_*`). `default` serves every role nothing else routes. Two stages
+of a call can be routed apart from its role: `extract`, the extraction that
+copies a reply into JSON, and `compact`, the summarising pass of a call that
+[hit the context wall](#when-a-call-hits-the-context-wall); unrouted, each
+goes to the role's own model. Every verifier must route to one model for
+now — a certificate records one model for the whole check — and a split is
+refused at startup.
+
+Routes are resolved key by key, the last of these that sets one winning:
+
+1. the workspace's `.proofs-local.json`;
+2. the conjecture's, `conjectures/NAME/.proofs-local.json`;
+3. `--host`/`--model` (with `--api-key`, `--backend`, `--num-ctx`), which
+   describe one more model and make it the `default`;
+4. `--route ROLE=NAME`, repeatable, for this command only.
+
+Within one file an exact role beats a glob; across layers the later one
+wins, whichever form either takes. A model entry is replaced whole by a
+later file's entry of the same name. So a command line from before routing
+works unchanged, a file that routes a `default` needs no server flags at
+all, and `--model` with a file that routes the prover elsewhere replaces
+every role but the prover's.
+
+**Fallback** (`--with-fallback`). When a call's model cannot serve it,
+the call is sent again to the fallback model: the `fallback` route
+(`"llm.routes": {"fallback": "local"}`, layered like `default`, or
+`--route fallback=NAME`), else the default route's model. A model cannot
+serve a call when
+
+- its quota, credit or spend limit is used up — a 402, OpenAI's
+  `insufficient_quota` 429, Anthropic's `billing_error`, spend-limit 429 or
+  "credit balance is too low": the call fails over at once, since waiting
+  does not bring a quota back;
+- or it gave no answer through `llm.max_retries` attempts: a rate limit
+  (any other 429), an overload, a server that is down. These are retried
+  with backoff first, as always.
+
+It is per call, never sticky: the next call goes to its own model first,
+so a rate limit that has passed, or a topped-up quota, is picked up at
+once. A call already on the fallback model has nothing to fall back to and
+keeps the retry behaviour it has without the flag (a server that never
+answers is waited out). The failed-over call starts from the beginning on
+the fallback, its prompt fitted again for the fallback's window.
+
+A verifier's call does not fail over on its own: a certificate names one
+model for its whole check, so the check restarts from the first verifier
+with every verifier on the fallback, and its certificate (or refutation)
+names the fallback. The next check starts on the verifiers' own model
+again. What gets recorded follows the work: a proof written by the
+fallback records the fallback's model.
+
+Without `--with-fallback`, a spent quota stops the command with a message
+saying so — the checkpoint is safe, and the run resumes where it stopped —
+rather than retrying a call that cannot succeed.
+
+Each model the command uses — the routes of the roles it calls (`proofs
+parse` the parser's, `proofs verify` the verifiers', `proofs repair`
+those and the prover's and reviser's, `proofs run` every role's), the
+stages' routes and the fallback — is probed once at startup, before any
+work, and any one that fails its check (above), or whose key variable is
+unset, stops the command there. A model only other roles use is neither
+probed nor needs its key. With more
+than one model the log says which serves which role. Each model keeps its
+own context window, its own running chars-per-token estimate, and what the
+run learns about it (whether it takes native tool calls, whether schema
+mode works). What gets recorded follows the work: a lemma records its
+prover's model, a certificate or refutation its verifiers'.
 
 ## Setup
 
@@ -260,7 +440,7 @@ One command, twelve subcommands:
 | Subcommand | Takes | Does |
 | --- | --- | --- |
 | `proofs config KEY [VALUE]` | a config key, an optional value | Gets or sets the user's config, git-style: `user.id`, `user.name`, `user.email`. |
-| `proofs init [DIR]` | a directory (default `.`) | Makes `DIR` a proofs workspace: creates `DIR/conjectures/`, writes the `.proofs` marker (`format = 2`) and a `.proofs-local.json` holding the default code limits, and writes or updates the proofs block of `DIR/.gitignore` (between `# >>> proofs >>>` and `# <<< proofs <<<`; lines outside it are never touched). Safe to re-run; refuses a `DIR` inside another workspace. |
+| `proofs init [DIR]` | a directory (default `.`) | Makes `DIR` a proofs workspace: creates `DIR/conjectures/`, writes the `.proofs` marker (`format = 2`) and a `.proofs-local.json` holding the default code limits and run settings (and empty model routes), and writes or updates the proofs block of `DIR/.gitignore` (between `# >>> proofs >>>` and `# <<< proofs <<<`; lines outside it are never touched). Safe to re-run; refuses a `DIR` inside another workspace. |
 | `proofs new NAME` | a directory name | Lays out a blank conjecture, `conjectures/NAME/` under the workspace root: an empty `references/` directory, an empty `conjecture.md` and `comments.md`, and a `references.md` holding the empty collection `[]`. Refuses a `NAME` that already exists. |
 | `proofs run DIR` | `DIR`, then the loop's options | Runs the proof loop on the conjecture. |
 | `proofs parse DIR` | `DIR`, then the parser's options | The maintainer's tool: parses `DIR`'s `references/` into the committed `references.md`. |
@@ -341,15 +521,26 @@ proofs init
 # a bare name is looked up in the workspace's conjectures/, from anywhere
 # inside the workspace; a path (conjectures/algebra_example, /abs/path)
 # works too, and outside a workspace only a path does
-# --host and --model are required on every run, parse, verify and repair
-proofs run algebra_example --host http://localhost:8081 --model qwen3.8-27b
-proofs run algebra_example --host http://localhost:8081 --model qwen3.8-27b --mode human
-proofs run algebra_example --host http://localhost:8081 --model qwen3.8-27b --parallel 2
-proofs run conjectures/algebra_example --host http://localhost:8081 --model qwen3.8-27b
+# --host and --model name the model every run, parse, verify and repair
+# talks to, unless .proofs-local.json routes one (see Model routing)
+proofs run algebra_example --host http://localhost:8081/v1 --model qwen3.8-27b
+proofs run algebra_example --host http://localhost:8081/v1 --model qwen3.8-27b --mode human
+proofs run algebra_example --host http://localhost:8081/v1 --model qwen3.8-27b --parallel 2
+proofs run conjectures/algebra_example --host http://localhost:8081/v1 --model qwen3.8-27b
 
 # or against a hosted API instead of a local llama-server
 proofs run algebra_example \
-    --host https://api.openai.com --model gpt-4o --api-key sk-...
+    --host https://api.openai.com/v1 --model gpt-4o --api-key sk-...
+
+# or Google Gemini, through its OpenAI-compatible endpoint
+proofs run algebra_example \
+    --host https://generativelanguage.googleapis.com/v1beta/openai \
+    --model YOUR_GEMINI_MODEL --api-key "$GEMINI_API_KEY"
+
+# with routes in .proofs-local.json, no server flags; --route changes one
+# role's model for one command
+proofs run algebra_example
+proofs run algebra_example --route prover=strong
 
 # once, before proving: parse the conjecture's reference collection
 proofs parse algebra_example
@@ -378,7 +569,7 @@ proofs config --global user.email eoin@example.com
 `run` and `parse` both take one argument, the conjecture directory: a name
 under the workspace root's `conjectures/` or a path to it — anything after it is passed through
 to the tool unchanged. `parse` shares `run`'s server options (`--host`,
-`--api-key`, `--backend`, `--model`, `--num-ctx`) and its DIR / `--verbose`
+`--api-key`, `--backend`, `--model`, `--num-ctx`, `--route`) and its DIR / `--verbose`
 pair; it has no proving options, because it has no loop. `verify` and
 `repair` take the same server options too, and `repair` also takes the
 lemma-window and tool options (`--strategy`, `--window-size`,
@@ -391,10 +582,14 @@ server options.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `DIR` | — | The conjecture directory: a name under the workspace root's `conjectures/` holding a `conjecture.md`, or a path to it. Taken by `run` and `parse`. |
-| `--model NAME` | required | Sent as the `model` field of every request. On a hosted API, the model to use (e.g. `gpt-4o`); a llama-server ignores it and serves the model it loaded. Not what certificates record — see [Backend](#backend). |
-| `--host URL` | required | OpenAI-compatible base URL — a local llama-server, or a hosted API's base (e.g. `https://api.openai.com`, without the `/v1` suffix — it is added automatically). |
+| `--model NAME` | required unless routed | Sent as the `model` field of every request. On a hosted API, the model to use (e.g. `gpt-4o`); a llama-server ignores it and serves the model it loaded. Not what certificates record — see [Backend](#backend). With `--host`, it serves every role `.proofs-local.json` does not route elsewhere; with a routed `default`, neither is needed. See [Model routing](#model-routing). |
+| `--host URL` | required unless routed | The API's base URL as its docs give it, version path included — nothing is appended but the route (`chat/completions`, `models`): `http://localhost:8080/v1` for a llama-server or vLLM, `https://api.openai.com/v1`, `https://openrouter.ai/api/v1`, `https://generativelanguage.googleapis.com/v1beta/openai` for Gemini. A llama-server's `/props` is probed at the base without its final `/v1`. With `--backend anthropic` it defaults to `https://api.anthropic.com` (a host with or without its `/v1`). Given with `--model`. |
+| `--temperature T` | none | Sampling temperature for every call to the `--model` model. By default none is sent and the server's own applies, which is almost always right. A model in `llm.models` takes a `temperature` field instead. |
+| `--effort LEVEL` | none | Reasoning effort for every call to the `--model` model, where its API takes one — see [Model routing](#model-routing) for the levels. By default none is sent and the server's own applies. |
+| `--with-fallback` | off | Send a call its model cannot serve — quota or credit used up, or no answer through the retries — to the fallback model (`llm.routes.fallback`, else the default route's), per call. A verification check restarts on the fallback, so its certificate names one model. Without it, a spent quota stops the command. See [Model routing](#model-routing). |
+| `--route ROLE=NAME` | none | Route a role (or a glob over roles, or the `extract`/`compact` stage) to the model `NAME` in `llm.models`, for this command. Repeatable. See [Model routing](#model-routing). |
 | `--api-key KEY` | none | Sent as `Authorization: Bearer <key>`. Needed for a hosted API; leave unset for a plain local llama-server. |
-| `--backend {auto,llamacpp,openai}` | `auto` | Which dialect of the OpenAI-compatible endpoint to speak: the full llama.cpp option set (with thinking suppressed for schema calls), or the standard OpenAI set. `auto` takes the probe's answer; the other two force it, for when the probe can't see the real server. |
+| `--backend {auto,llamacpp,openai,anthropic}` | `auto` | Which dialect of the OpenAI-compatible endpoint to speak: the full llama.cpp option set (with thinking suppressed for schema calls), or the standard OpenAI set. `auto` takes the probe's answer; `llamacpp` and `openai` force it, for when the probe can't see the real server. `anthropic` speaks the Anthropic Messages API instead, with `--host` defaulting to `https://api.anthropic.com` — see [Backend](#backend). |
 | `--max-iterations N` | `run.max_iterations`, -1 | Loop iterations before the run stops (per loop in a parallel run). `-1` runs until the conjecture is settled or you interrupt it. See [Settings](#settings). |
 | `--max-proof-attempts N` | `run.max_proof_attempts`, 3 | Prover rounds per lemma before it is given up. `-1` never gives a lemma up. |
 | `--max-rejected-lemmas N` | `run.max_rejected_lemmas`, 4 | How many of the most recently rejected lemmas — ones that went through every prover round without being proved — the planning agents are shown, by statement only. `0` shows none. |
@@ -644,10 +839,11 @@ names it, so the resumed loop continues in it.
 Limits describe the machine, not the conjecture, so they live in
 gitignored files, each a JSON object holding only the keys it overrides:
 `<workspace>/.proofs-local.json` for the machine (`proofs init` writes it
-with every key at its default), and
-`conjectures/NAME/limits.json` for one conjecture on it, which wins key by
-key. A `--code-*` flag beats both for one run; `proofs limits NAME` prints
-what is in effect and where each value came from.
+with every key at its default), and `conjectures/NAME/.proofs-local.json`
+for one conjecture on it, which wins key by key (`conjectures/NAME/limits.json`,
+its older name for the limits alone, still works, below it). A `--code-*`
+flag beats them all for one run; `proofs limits NAME` prints what is in
+effect and where each value came from.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -1163,10 +1359,11 @@ proofs/
     locking.py         # the run lock
   workspace/
     config.py          # the user's global config (~/.config/proofs/config): user.id, user.name, user.email
-    settings.py        # the run's settings in .proofs-local.json (run.*, tools.*, llm.*)
+    settings.py        # the run's settings in the .proofs-local.json files (run.*, tools.*, llm.*)
     layout.py          # the workspace (init, root discovery, the .gitignore block), per-conjecture directories, prompt resolution
   loops/               # everything that calls a model
     reasoning.py       # reason() and extract(): one model call, the context-wall rescue
+    models.py          # the models a command talks to: routing built, probed, attached
     json_repair.py     # reclaiming JSON from a reply that is not clean JSON
     prompts.py         # prompt assembly: the lemma window, the agents' views, fitting the window
     strategies.py      # --strategy: which proved lemmas the agents are shown, and when
@@ -1183,7 +1380,9 @@ proofs/
     verdicts.py        # reading a verdict, what it records, the re-execution policy
     citations.py       # checking a proof's citations
   llm/
-    __init__.py        # connect(): make and probe the backend, settle the context window
+    __init__.py        # connect(): make and probe a backend, settle its context window
+    anthropic.py       # the Anthropic Messages API transport
+    routing.py         # model routing: llm.models / llm.routes, which model serves each role
     base.py            # the Backend interface the loops call, and the types that cross it
     openai_compat.py   # the OpenAI-compatible transport (llama.cpp or a hosted API)
   tools/
@@ -1224,7 +1423,7 @@ A workspace, as `proofs init` and `proofs new` lay it out:
 ```
 .proofs                # the workspace marker (format = 2)
 .gitignore             # your own rules, plus the proofs block proofs init writes
-.proofs-local.json     # gitignored: this machine's code limits and run settings, from proofs init
+.proofs-local.json     # gitignored: this machine's code limits, run settings and model routes, from proofs init
 conjectures/
   algebra_example/
     conjecture.md          # required: the statement
@@ -1238,7 +1437,8 @@ conjectures/
     prover.md              # optional per-conjecture prompt override
     flake.nix, flake.lock  # optional, committed: the maintainer's code tools
     tools.lock             # committed with them: the tools and versions runs may use
-    limits.json            # optional, gitignored: this machine's code limits for this conjecture
+    .proofs-local.json     # optional, gitignored: this machine's settings, limits and routes for this conjecture
+    limits.json            # optional, gitignored: the code limits alone (the older name)
     scratch/<user_id>/<run_id>/  # gitignored: the scripts of a run's live proof loops, one directory per agent
     code/<user_id>/<run_id>/       # committed: the scripts that proofs rest on, named by hash
     computations/<user_id>/<run_id>/000001.jsonl  # committed: each run's executions of them
@@ -1254,7 +1454,7 @@ directory, and is created if it is not there):
 - it writes `DIR/.proofs`, which records the layout version, `format = 2`;
 - it writes `DIR/.proofs-local.json`, this machine's [code limits](#limits)
   and [run settings](#settings), set to the built-in defaults for you to
-  edit;
+  edit, and empty [model routes](#model-routing);
 - it writes the proofs block of `DIR/.gitignore`: the rules that keep each
   user's local files — `references/`, `comments.md`, checkpoints, lock and
   temp files, `.env` — out of git. The block sits between
@@ -1426,7 +1626,11 @@ reported and kept — raise the budget and re-run to continue from it.
 
 The run's tunables live beside the code limits in the workspace's
 gitignored `.proofs-local.json` (`proofs init` writes every key at its
-default). Each key's flag beats the file for one command. `proofs run`
+default). A conjecture can override any of them on this machine in its own
+`conjectures/NAME/.proofs-local.json`, also gitignored, holding only the
+keys it changes; it wins key by key over the workspace's. Each key's flag
+beats both files for one command. The same files hold the
+[model routes](#model-routing). `proofs run`
 takes them all; `proofs verify` takes the `tools.*` and `llm.*` ones, and
 `proofs repair` those and `--max-proof-attempts`. Every key but
 `run.max_rejected_lemmas` and `run.citation_recheck_base` takes `-1` for no limit, in the file or a flag

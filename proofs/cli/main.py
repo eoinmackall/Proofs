@@ -90,6 +90,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import flags
+from .. import llm
 from ..core import migrate, prune, startup, status, streams
 from ..export import command as export_command
 from ..loops import repair, verify
@@ -209,7 +210,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Make DIR a proofs workspace: create DIR/conjectures/, write "
             "the .proofs marker and a .proofs-local.json holding the default "
-            "code limits and run settings, and write or update the proofs block of "
+            "code limits and run settings (and empty model routes), and "
+            "write or update the proofs block of "
             "DIR/.gitignore (lines outside the block are left alone). Safe "
             "to re-run: existing files other than the block are kept. A DIR "
             "inside another workspace is refused."
@@ -275,10 +277,11 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Show each code limit (code.timeout, code.memory, code.jobs, "
             "...) in effect for runs on DIR, and where it comes from: "
-            "conjectures/NAME/limits.json, the workspace's "
-            ".proofs-local.json, or the built-in default. Both files are "
-            "gitignored JSON objects holding only the keys they override; "
-            "--code-* flags override both for one run."
+            "conjectures/NAME/.proofs-local.json, conjectures/NAME/limits.json "
+            "(its older name), the workspace's .proofs-local.json, or the "
+            "built-in default. The files are gitignored JSON objects holding "
+            "only the keys they override; --code-* flags override them all "
+            "for one run."
         ),
     )
     p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
@@ -639,11 +642,7 @@ def _cmd_verify(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         root=str(root),
         run_code=args.run_code,
         user_id=args.user_id,
-        model=args.model,
-        host=args.host,
-        api_key=args.api_key,
-        backend=args.backend,
-        num_ctx=args.num_ctx,
+        model_flags=flags.model_flags(args),
         verbose=args.verbose,
         parser=parser,
         parallel=args.parallel_verifiers,
@@ -700,11 +699,7 @@ def _cmd_repair(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         window_size=args.window_size,
         path=args.path,
         user_id=args.user_id,
-        model=args.model,
-        host=args.host,
-        api_key=args.api_key,
-        backend=args.backend,
-        num_ctx=args.num_ctx,
+        model_flags=flags.model_flags(args),
         verbose=args.verbose,
         parser=parser,
     )
@@ -730,11 +725,7 @@ def _cmd_repair_all(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         window_size=args.window_size,
         root=str(root),
         user_id=args.user_id,
-        model=args.model,
-        host=args.host,
-        api_key=args.api_key,
-        backend=args.backend,
-        num_ctx=args.num_ctx,
+        model_flags=flags.model_flags(args),
         verbose=args.verbose,
         parser=parser,
     )
@@ -882,6 +873,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         # A stream that cannot be read — a git conflict left in it, a line
         # that is not a record — stops every command, named by file and line.
         args.parser.error(str(e))
+    except llm.QuotaExhausted as e:
+        # A model's quota used up, with nothing to fall back to
+        # (--with-fallback): no command can go on, and none should retry.
+        who = e.model.label() if e.model is not None else "a model"
+        print(f"{args.parser.prog}: error: the quota, credit or spend limit "
+              f"of {who} is used up ({e}). Top it up, or route its roles "
+              f"to another model.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

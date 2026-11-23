@@ -7,7 +7,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .. import llm
 from ..core import certificates, merkle, refutations
@@ -23,8 +23,13 @@ from ..validity.steps import VERIFIER_AGENTS, role_of, verifier_steps
 from ..workspace import layout as workspace
 from ..workspace import settings as settings_mod
 from .prompts import computations_block, verifier_context
-from .reasoning import REQUEST_TIMEOUT, _recorded_model, _wait_for_server
-from .verifiers import _run_verifier, fan_out, stopping, verifier_prompt
+from . import models as models_mod
+from .reasoning import (
+    VERIFIER_ROLE, VERIFIER_ROLES, _recorded_model, _wait_for_server, pinned,
+)
+from .verifiers import (
+    _run_verifier, fan_out, stopping, verifier_prompt, with_verifier_failover,
+)
 
 # proofs verify / proofs repair: the exit code when a verifier gave no
 # verdict (the server failed, or the reply could not be read). Distinct from
@@ -150,6 +155,23 @@ def verify_stored_lemma(
     verifier_sys: Dict[str, str],
     verbose: bool,
 ) -> Tuple[str, Optional[str]]:
+    """_verify_stored_lemma, with any verifier pins a failed-over check
+    (--with-fallback) sets kept for its refutation or certificate and
+    dropped after it: the next lemma starts on the verifiers' own model."""
+    with pinned(ctx, {}):
+        return _verify_stored_lemma(ctx, dag, references, lemma_id,
+                                    conjecture_text, verifier_sys, verbose)
+
+
+def _verify_stored_lemma(
+    ctx,
+    dag: Any,
+    references: List[Dict[str, Any]],
+    lemma_id: str,
+    conjecture_text: str,
+    verifier_sys: Dict[str, str],
+    verbose: bool,
+) -> Tuple[str, Optional[str]]:
     """The three verifier checks on a lemma that is already in the DAG,
     with the refutation bookkeeping around them (see refutations.py).
 
@@ -250,14 +272,15 @@ def verify_stored_lemma(
         ctx.ui.log(f"  Every computation of {lemma_id} reproduced; recorded in "
             f"the run's computations stream.", verbose)
 
-    outcome, justification = review_stored(
+    outcome, justification = with_verifier_failover(ctx, lambda: review_stored(
         ctx, dag, references, lemma_id, conjecture_text, verifier_sys, verbose, on_file,
-    )
+    ), verbose)
     if outcome == "no_verdict":
         return outcome, justification
     if outcome == "rejected":
         path = refutations.record(
-            ctx.paths.conjecture_root, lemma_id, h, ctx.user, _recorded_model(ctx),
+            ctx.paths.conjecture_root, lemma_id, h, ctx.user,
+            _recorded_model(ctx, VERIFIER_ROLE),
             "reject", justification, node["file"],
         )
         ctx.run.dag = ctx.dag.with_refutation(path, refutations.load(path))
@@ -410,7 +433,7 @@ def _accept_stored(
     try:
         line = certificates.record(
             writer(ctx, certificates.DIR_NAME), lemma_id, h, ctx.user,
-            _recorded_model(ctx),
+            _recorded_model(ctx, VERIFIER_ROLE),
         )
     except OSError as e:
         # The acceptance is only as good as its record: without the
@@ -428,7 +451,8 @@ def _accept_stored(
         return "no_verdict", f"the certificate could not be written: {e}"
     ctx.run.dag = ctx.dag.with_certificate(line)
     ctx.ui.log(
-        f"Certificate for {lemma_id}: accepted by {ctx.user} (model {_recorded_model(ctx)}).",
+        f"Certificate for {lemma_id}: accepted by {ctx.user} "
+        f"(model {_recorded_model(ctx, VERIFIER_ROLE)}).",
         verbose,
     )
     dismissed = []
@@ -452,15 +476,12 @@ def _verify_session(
     *,
     conjecture_dir: str,
     user_id: str,
-    model: str,
-    host: Optional[str],
-    api_key: Optional[str],
-    backend_choice: str,
-    num_ctx: Optional[int],
+    model_flags: "llm.Flags",
     verbose: bool,
     parser: argparse.ArgumentParser,
     parallel: int = 1,
     settings_flags: Optional[Dict[str, Any]] = None,
+    roles: Sequence[str] = VERIFIER_ROLES,
 ) -> None:
     """The shared setup of proofs verify and proofs repair: the backend
     and the conjecture's paths, the run's, minus the run's — no
@@ -472,29 +493,25 @@ def _verify_session(
     of record in any certificate issued and any refutation written.
 
     The certificates and refutations this session writes name the model
-    _recorded_model() reports, not the --model request. parallel is
-    --parallel: how many of a lemma's verifiers run at once. settings_flags
-    is settings_mod.flag_values of the command's args: the settings flags
-    passed, over .proofs-local.json.
+    _recorded_model() reports for the verifiers, not the request.
+    model_flags is the command's backend flags (cli/flags.py, model_flags),
+    routed with the .proofs-local.json files (loops/models.py). parallel
+    is --parallel: how many of a lemma's verifiers run at once.
+    settings_flags is settings_mod.flag_values of the command's args: the
+    settings flags passed, over the .proofs-local.json files. roles are
+    the roles the command calls, whose models are connected: the
+    verifiers for proofs verify; repair adds the prover and the reviser.
     """
+    conjecture = Path(conjecture_dir).resolve()
     try:
         ctx.settings = settings_mod.resolve(
-            workspace.find_root(Path(conjecture_dir).resolve()),
-            settings_flags,
+            workspace.find_root(conjecture), settings_flags, conjecture,
         )
-    except settings_mod.SettingsError as e:
+        models_mod.connect(ctx, ctx.settings, model_flags, verbose, roles)
+    except (settings_mod.SettingsError, llm.RoutingError,
+            llm.ProbeError) as e:
         parser.error(str(e))
     ctx.settings.parallel_verifiers = parallel
-    ctx.model.name = model
-    try:
-        connection = llm.connect(
-            model, host, REQUEST_TIMEOUT, api_key, backend_choice, num_ctx,
-        )
-    except llm.AuthError as e:
-        parser.error(str(e))
-    ctx.attach_model(connection)
-    if connection.notes:
-        ctx.ui.log(connection.notes, verbose)
     ctx.user = user_id
     try:
         paths = workspace.resolve(conjecture_dir, user_id)
@@ -512,11 +529,7 @@ def verify_entry(
     root: str,
     full: bool,
     user_id: str,
-    model: str,
-    host: Optional[str],
-    api_key: Optional[str],
-    backend: str,
-    num_ctx: Optional[int],
+    model_flags: "llm.Flags",
     verbose: bool,
     parser: argparse.ArgumentParser,
     run_code: bool = False,
@@ -546,8 +559,7 @@ def verify_entry(
     ctx.code.run_code = run_code
     _verify_session(
         ctx,
-        conjecture_dir=root, user_id=user_id, model=model, host=host,
-        api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
+        conjecture_dir=root, user_id=user_id, model_flags=model_flags,
         verbose=verbose, parser=parser, parallel=parallel,
         settings_flags=settings_flags,
     )
@@ -608,11 +620,7 @@ def verify_uncertified_entry(
     root: str,
     run_code: bool,
     user_id: str,
-    model: str,
-    host: Optional[str],
-    api_key: Optional[str],
-    backend: str,
-    num_ctx: Optional[int],
+    model_flags: "llm.Flags",
     verbose: bool,
     parser: argparse.ArgumentParser,
     code: Optional[Code] = None,
@@ -643,8 +651,7 @@ def verify_uncertified_entry(
     ctx.code.run_code = run_code
     _verify_session(
         ctx,
-        conjecture_dir=root, user_id=user_id, model=model, host=host,
-        api_key=api_key, backend_choice=backend, num_ctx=num_ctx,
+        conjecture_dir=root, user_id=user_id, model_flags=model_flags,
         verbose=verbose, parser=parser, parallel=parallel,
         settings_flags=settings_flags,
     )

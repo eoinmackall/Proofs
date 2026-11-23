@@ -11,8 +11,10 @@ Its pieces:
               is resolved
     settings  the tunables: flags over .proofs-local.json over the
               defaults (workspace.settings.Settings)
-    model     the backend and what the run has learned about the model
-              (Model); None for the commands that call no model
+    models    the models the command talks to and the role each serves,
+              with what the run has learned about each
+              (llm.routing.Models: models.for_role(role)); None for the
+              commands that call no model
     code      the run_code machinery, when the command was given --tools
               (Code)
     run       state the whole process shares and mutates: the mode, the
@@ -24,7 +26,7 @@ Its pieces:
               installed)
 
 The pieces are created as the command needs them: a command that calls no
-model never makes a Model, one without --tools never fills Code.
+model never makes Models, one without --tools never fills Code.
 """
 
 from __future__ import annotations
@@ -63,30 +65,6 @@ class Paths:
             comments_file=str(paths.comments),
             prompt_paths={name: str(p) for name, p in paths.prompts.items()},
         )
-
-
-@dataclass
-class Model:
-    """The backend and what the run has learned about the model it serves.
-    The flags are properties of the model, learned once and kept for the
-    rest of the process."""
-
-    # The --model name, sent as the "model" field of every request.
-    name: str = ""
-    # The llm.Backend that owns the HTTP conversation, and what its
-    # capability probe found.
-    backend: Any = None
-    profile: Any = None
-    # Native tool calls: None until the server refuses one, then False.
-    native_tools_ok: Optional[bool] = None
-    # Schema-constrained extraction proved incompatible with the model's
-    # default thinking (see extract()).
-    schema_mode_broken: bool = False
-    # The model needs its reasoning trace sent back on tool-call turns
-    # (see reason()).
-    echo_reasoning: bool = False
-    # A server context 400 was already reported this run.
-    context_failure_seen: bool = False
 
 
 @dataclass
@@ -192,6 +170,16 @@ class LoopState:
     # verification (loops/verifiers.py, fan_out): once it fires, the
     # thread's next model request raises reasoning.Cancelled instead.
     cancel: Any = None
+    # Model fallback (--with-fallback, loops/reasoning.py): the roles this
+    # thread's calls are pinned to another model for, by role — a call
+    # failed over, or a verification check restarted on the fallback
+    # (fan_out hands a check's pins to its verifier threads); the model
+    # that served each role's latest answer, which is the one its record
+    # names; and how to fit each role's prompt again for another model's
+    # window (prompts._fit_prompt): (the prompt it fitted, a refit).
+    pinned: Dict[str, Any] = field(default_factory=dict)
+    served: Dict[str, Any] = field(default_factory=dict)
+    fitted: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -203,7 +191,7 @@ class Context:
     run_id: str = ""
     paths: Paths = field(default_factory=Paths)
     settings: Settings = field(default_factory=Settings)
-    model: Model = field(default_factory=Model)
+    models: Any = None
     code: Code = field(default_factory=Code)
     run: RunState = field(default_factory=RunState)
     loop: LoopState = field(default_factory=LoopState)
@@ -218,13 +206,6 @@ class Context:
             self.run.dag = Dag.load(self)
         return self.run.dag
 
-    def attach_model(self, connection: Any) -> None:
-        """Take the model a command talks to (llm.connect's Connection):
-        the backend, its probe, and the context window settled from them."""
-        self.model.backend = connection.backend
-        self.model.profile = connection.profile
-        self.settings.num_ctx = connection.num_ctx
-
     def status(self, **fields: str) -> None:
         """Update this thread's row on the status board (ui.status): role,
         lemma, attempt, event."""
@@ -236,23 +217,3 @@ class Context:
         clone = copy.copy(self)
         clone.loop = LoopState(**loop_fields)
         return clone
-
-    @property
-    def reasoning_options(self) -> Dict[str, Any]:
-        """The options of a reasoning call (reason()). Sampling is left to
-        the model's own card: the presence penalty in particular is
-        harmful here (mathematics repeats its symbols), so it is never
-        sent. num_predict is set per call; temperature per role."""
-        return {"num_ctx": self.settings.num_ctx}
-
-    @property
-    def extract_options(self) -> Dict[str, Any]:
-        """The options of an extraction call (extract()): mechanical and
-        grammar-constrained, so greedy, with no presence penalty — the
-        stage copies, it doesn't write."""
-        return {
-            "temperature": 0.0,
-            "presence_penalty": 0.0,
-            "min_p": 0.0,
-            "num_ctx": self.settings.num_ctx,
-        }

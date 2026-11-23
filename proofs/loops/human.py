@@ -24,7 +24,8 @@ from ..validity import verdicts
 from ..validity.citations import check_citations
 from ..validity.steps import VERIFIER_AGENTS, role_of
 from .prompts import _wrap, render, verifier_context
-from .verifiers import _run_verifier
+from .reasoning import VERIFIER_ROLE, _recorded_model, pinned
+from .verifiers import _run_verifier, with_verifier_failover
 
 
 def _operator_citation_check(
@@ -119,32 +120,45 @@ def _verify_operator_proof(
         f"Proposed proof:\n{proof}"
     )
     ctx.status(lemma=lemma_id, attempt="")
-    for step, agent in enumerate(VERIFIER_AGENTS, 1):
-        role = role_of(agent)
-        decision, justification = _run_verifier(
-            ctx,
-            role, verifier_sys[agent], verifier_user, verbose,
-        )
-        ctx.ui.log(
-            f"Verifier {step}/{len(VERIFIER_AGENTS)} ({role}): "
-            f"{decision.upper() or '???'} — {justification}",
-            verbose,
-        )
-        if decision == verdicts.REJECT:
+
+    def run_check() -> bool:
+        """The three checks; whether all accepted. Run again from the
+        start on the fallback model when a verifier's call fails over
+        (--with-fallback), so the certificate names one model."""
+        for step, agent in enumerate(VERIFIER_AGENTS, 1):
+            role = role_of(agent)
+            decision, justification = _run_verifier(
+                ctx,
+                role, verifier_sys[agent], verifier_user, verbose,
+            )
             ctx.ui.log(
-                f"Your proof of {lemma_id} was rejected by {role}; nothing "
-                f"was added. Back to the menu.",
+                f"Verifier {step}/{len(VERIFIER_AGENTS)} ({role}): "
+                f"{decision.upper() or '???'} — {justification}",
                 verbose,
             )
+            if decision == verdicts.REJECT:
+                ctx.ui.log(
+                    f"Your proof of {lemma_id} was rejected by {role}; nothing "
+                    f"was added. Back to the menu.",
+                    verbose,
+                )
+                return False
+            if decision != verdicts.ACCEPT:
+                ctx.ui.log(
+                    f"No verdict on your proof of {lemma_id} from {role} (the "
+                    f"server failed or the reply could not be read); nothing "
+                    f"was added. Back to the menu.",
+                    verbose,
+                )
+                return False
+        return True
+
+    with pinned(ctx, {}):
+        if not with_verifier_failover(ctx, run_check, verbose):
             return None
-        if decision != verdicts.ACCEPT:
-            ctx.ui.log(
-                f"No verdict on your proof of {lemma_id} from {role} (the "
-                f"server failed or the reply could not be read); nothing "
-                f"was added. Back to the menu.",
-                verbose,
-            )
-            return None
+        # The model the check ran on, for the certificate the caller
+        # issues: the fallback's, if the check was restarted there.
+        verifier_model = _recorded_model(ctx, VERIFIER_ROLE)
     ctx.ui.log(
         f"Your proof of {lemma_id} passed all {len(VERIFIER_AGENTS)} "
         f"verifier checks. Adding to DAG.",
@@ -155,6 +169,7 @@ def _verify_operator_proof(
         "proof": proof,
         "cited_lemmas": list(cited_lemmas),
         "cited_references": list(cited_refs),
+        "_verifier_model": verifier_model,
     }
     return lemma_id, node, _verified_hash(dag, node)
 

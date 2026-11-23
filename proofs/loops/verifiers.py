@@ -11,7 +11,9 @@ from ..validity import verdicts
 from .json_repair import parse_json_or_none
 from .mode import check_mode_toggle
 from .prompts import verifier_tools
-from .reasoning import Cancelled, extract, reason
+from .reasoning import (
+    VERIFIER_ROLES, Cancelled, VerifierFailover, extract, reason,
+)
 from .schemas import VERIFIER_SCHEMA
 
 
@@ -57,7 +59,7 @@ def _run_verifier(
     if unread is not None:
         return unread
     # The verifier prompts demand raw JSON output; extraction is the fallback.
-    res = parse_json_or_none(review)
+    res = parse_json_or_none(review, expect=("decision",))
     if res is None:
         res = extract(
             ctx,
@@ -91,6 +93,35 @@ class _QuietWhenCancelled:
     def status(self, *args: Any, **kwargs: Any) -> None:
         if not self._cancel.is_set():
             self._ui.status(*args, **kwargs)
+
+
+def with_verifier_failover(ctx, run_check: Callable[[], Any],
+                           verbose: bool) -> Any:
+    """run_check() — one verification check — and, when one of its
+    verifier calls fails over (--with-fallback: VerifierFailover), the
+    whole check again from the start with every verifier pinned to the
+    fallback model, so the check, and the certificate or refutation it
+    leads to, rests on one model. The pins stay on ctx's thread when this
+    returns, for the record the check leads to: the caller scopes them
+    (pinned() or unpin_verifiers()). A check already on the fallback does
+    not fail over again (reasoning._fallback_for)."""
+    while True:
+        try:
+            return run_check()
+        except VerifierFailover as e:
+            ctx.ui.log(
+                f"  A verifier's model cannot serve the check ({e.why}); "
+                f"running the whole check again on the fallback, "
+                f"{e.model.label()}.",
+                verbose,
+            )
+            ctx.loop.pinned.update({role: e.model for role in VERIFIER_ROLES})
+
+
+def unpin_verifiers(ctx) -> None:
+    """Send ctx's verifiers back to their own model (a new check)."""
+    for role in VERIFIER_ROLES:
+        ctx.loop.pinned.pop(role, None)
 
 
 def stopping(ctx) -> bool:
@@ -197,6 +228,9 @@ class fan_out:
         sctx = self.ctx.for_loop(
             agent=row, code_loop=self.ctx.loop.code_loop,
             code_dir=code_dir, cancel=self._cancel,
+            # A check restarted on the fallback model runs every verifier
+            # there (reasoning.VerifierFailover).
+            pinned=dict(self.ctx.loop.pinned),
         )
         sctx.ui = _QuietWhenCancelled(self.ctx.ui, self._cancel)
         try:

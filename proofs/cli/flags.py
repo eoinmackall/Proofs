@@ -8,6 +8,7 @@ import argparse
 
 from typing import Iterable
 
+from ..llm import routing
 from ..workspace import settings as settings_mod
 from ..workspace.settings import (
     DEFAULT_NUM_CTX, DEFAULT_TOOL_MODE, DEFAULT_WINDOW_SIZE,
@@ -60,29 +61,54 @@ def _window_size(text: str) -> int:
     return n
 
 
+def _temperature(text: str) -> float:
+    """--temperature's value: a number of at least 0."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{value} is below 0")
+    return value
+
+
 def add_backend_flags(parser: argparse.ArgumentParser) -> None:
-    """--host, --api-key, --model, --backend and --num-ctx: which model the
-    command talks to, over which dialect, in how large a window. Taken by
-    proofs run, parse, verify and repair."""
+    """--host, --api-key, --model, --backend, --num-ctx, --temperature,
+    --effort and --route: which models the command talks to, over which
+    dialect, in how large a window.
+    Taken by proofs run, parse, verify and repair; model_flags reads them
+    back. The first five describe one model, the default route; the
+    .proofs-local.json files can route roles to others (llm/routing.py),
+    and a file that routes a default makes them optional."""
     parser.add_argument(
-        "--host", required=True,
-        help="OpenAI-compatible base URL: a local llama-server, or a hosted "
-             "API's base (e.g. https://api.openai.com, without the /v1 "
-             "suffix — it is added automatically). Required.",
+        "--host", default=None,
+        help="The API's base URL as its docs give it, version path "
+             "included; nothing is appended but the route "
+             "(chat/completions): http://localhost:8080/v1 for a "
+             "llama-server or vLLM, https://api.openai.com/v1, "
+             "https://openrouter.ai/api/v1, "
+             "https://generativelanguage.googleapis.com/v1beta/openai for "
+             "Gemini. With --backend anthropic it defaults to "
+             "https://api.anthropic.com. Needed with --model, unless "
+             ".proofs-local.json routes a default model "
+             "(llm.routes.default).",
     )
     parser.add_argument(
         "--api-key", default=None,
         help="API key sent as 'Authorization: Bearer <key>'. Needed for a "
              "hosted API; with none given, no key is sent. Leave unset for a "
-             "plain local llama-server (or one launched without --api-key).",
+             "plain local llama-server (or one launched without --api-key). "
+             "A model in llm.models names an environment variable instead "
+             "(api_key_env).",
     )
     parser.add_argument(
-        "--model", required=True,
+        "--model", default=None,
         help="Model name: the --alias llama-server was launched with, or the "
-             "provider's model id (e.g. gpt-4o). Required.",
+             "provider's model id (e.g. gpt-4o). With --host, it serves "
+             "every role .proofs-local.json does not route elsewhere.",
     )
     parser.add_argument(
-        "--backend", choices=("auto", "llamacpp", "openai"), default="auto",
+        "--backend", choices=routing.BACKENDS, default=None,
         help=(
             "Which dialect of the OpenAI-compatible endpoint to speak. "
             "auto (default): probe /props — an answer means llama.cpp (full "
@@ -90,7 +116,9 @@ def add_backend_flags(parser: argparse.ArgumentParser) -> None:
             "means a generic endpoint (standard OpenAI fields). llamacpp / "
             "openai force one side of that decision, for when the probe "
             "can't see the real server (a proxy in front of llama-server, a "
-            "provider that happens to serve /props)."
+            "provider that happens to serve /props). anthropic: the "
+            "Anthropic Messages API instead (--host defaults to "
+            "https://api.anthropic.com)."
         ),
     )
     parser.add_argument(
@@ -103,6 +131,59 @@ def add_backend_flags(parser: argparse.ArgumentParser) -> None:
             "default; against a probed llama-server it is clamped to the "
             "ceiling."
         ),
+    )
+    parser.add_argument(
+        "--temperature", type=_temperature, default=None, metavar="T",
+        help=(
+            "Sampling temperature sent with every call to the --model "
+            "model. By default none is sent and the server's own applies, "
+            "which is almost always what you want; a model in llm.models "
+            "takes a temperature field instead."
+        ),
+    )
+    parser.add_argument(
+        "--effort", default=None, metavar="LEVEL",
+        help=(
+            "Reasoning effort for every call to the --model model, where its "
+            "API takes one: low, medium, high, xhigh or max with --backend "
+            "anthropic (checked against what the model takes at startup); "
+            "none, minimal, low, medium, high or xhigh as reasoning_effort "
+            "otherwise. By default none is sent and the server's own "
+            "applies; a model in llm.models takes an effort field instead."
+        ),
+    )
+    parser.add_argument(
+        "--with-fallback", action="store_true",
+        help=(
+            "When a call's model cannot serve it — its quota or credit used "
+            "up, or no answer through the retries — send the call to the "
+            "fallback model: llm.routes.fallback (or --route "
+            "fallback=NAME), else the default route's. Per call: the next "
+            "call tries its own model first. A verification check restarts "
+            "on the fallback, so its certificate names one model. Without "
+            "it, a spent quota stops the command."
+        ),
+    )
+    parser.add_argument(
+        "--route", action="append", default=[], metavar="ROLE=NAME",
+        help=(
+            "Route ROLE (planner, prover, verifier_1, ..., a glob over them "
+            "such as verifier_*, the extract or compact stage, or the "
+            "fallback of --with-fallback) to the "
+            "model NAME in llm.models, for this command; repeatable. Every "
+            "verifier must route to one model."
+        ),
+    )
+
+
+def model_flags(args: argparse.Namespace) -> routing.Flags:
+    """The backend flags of parsed args (add_backend_flags), as the
+    routing table takes them."""
+    return routing.Flags(
+        host=args.host, model=args.model, api_key=args.api_key,
+        backend=args.backend, num_ctx=args.num_ctx,
+        temperature=args.temperature, effort=args.effort,
+        routes=tuple(args.route or ()), with_fallback=args.with_fallback,
     )
 
 
@@ -193,7 +274,7 @@ def add_settings_flags(parser: argparse.ArgumentParser,
             help=f"{_SETTINGS_HELP[key]}"
                  + ("" if key in settings_mod.BOUNDED or key in ("run.max_iterations", "run.citation_recheck_base")
                     else "; -1 for no limit")
-                 + f" (default: {key} in "
-                 f"{settings_mod.LOCAL_FILENAME}, "
+                 + f" (default: {key} in the conjecture's or the "
+                 f"workspace's {settings_mod.LOCAL_FILENAME}, "
                  f"{settings_mod.DEFAULTS[key]} built in)",
         )

@@ -207,13 +207,13 @@ from typing import List, Optional
 from .. import llm
 from ..cli.flags import (
     add_backend_flags, add_lemma_window_flags, add_settings_flags,
-    add_tool_flags,
+    add_tool_flags, model_flags,
 )
 from ..loops.mode import DEFAULT_MODE, HOTKEY_KEYS
 from ..loops.parallel import run_parallel
-from ..loops.reasoning import (
-    REQUEST_TIMEOUT, _fail_context_length, _recorded_model,
-)
+from ..loops.models import attach as attach_models
+from ..loops.models import build as build_models
+from ..loops.reasoning import _fail_context_length, _fail_quota
 from ..loops.serial import run_loop
 from ..tools.run_code.setup import add_code_flags, setup_code
 from ..ui import live
@@ -319,10 +319,18 @@ def main(
     ctx.ui, ui_note = live.choose(args.ui, args.verbose)
     if ui_note:
         ctx.ui.log(f"note: {ui_note}", err=True)
-    # The settings first: flags over .proofs-local.json over the defaults.
+    # The settings first: flags over the conjecture's .proofs-local.json
+    # over the workspace's over the defaults — so the conjecture's
+    # directory before them, and the model routing, which is checked
+    # (offline) before anything slow: a typo in a route is reported before
+    # the sandbox relaunch and the probes.
     try:
-        ctx.settings = settings_mod.resolve(root, settings_mod.flag_values(args))
-    except settings_mod.SettingsError as e:
+        conjecture_dir = workspace.conjecture_dir(args.conjecture, root)
+        ctx.settings = settings_mod.resolve(
+            root, settings_mod.flag_values(args), conjecture_dir)
+        models = build_models(ctx.settings, model_flags(args))
+    except (workspace.ConjectureNotFound, settings_mod.SettingsError,
+            llm.RoutingError) as e:
         parser.error(str(e))
     # Before the backend probe: with --tools this re-execs the command
     # inside the sandbox, and the probe is the relaunched process's to make.
@@ -333,23 +341,15 @@ def main(
     ctx.settings.window_size = args.window_size
     ctx.settings.tool_mode = args.tool_mode
 
-    ctx.model.name = args.model
     ctx.run.mode = args.mode
 
-    # Backend first: the probe tells us the real context ceiling, which an
-    # explicit --num-ctx is clamped to (llm.connect). Doing this before
-    # resolving paths also means a dead server is reported before a
-    # missing directory.
+    # The models next: each probe tells the real context ceiling, which an
+    # explicit window is clamped to (llm.connect), and a dead server is
+    # reported before the run's files are touched.
     try:
-        connection = llm.connect(
-            args.model, args.host, REQUEST_TIMEOUT, args.api_key,
-            args.backend, args.num_ctx,
-        )
-    except llm.AuthError as e:
+        attach_models(ctx, models, args.verbose)
+    except (llm.ProbeError, llm.RoutingError) as e:
         parser.error(str(e))
-    ctx.attach_model(connection)
-    if connection.notes:
-        ctx.ui.log(connection.notes, args.verbose)
 
     # The run's user, before the paths: the run's streams are named after it,
     # and every lemma the run commits is stored under it. The model never
@@ -375,7 +375,7 @@ def main(
         f"run {run.id}" + (" (continuing it)" if run.resumed else " (new)"),
         args.verbose,
     )
-    ctx.ui.header(conjecture=paths.root.name, model=_recorded_model(ctx),
+    ctx.ui.header(conjecture=paths.root.name, model=ctx.models.summary(),
                   run=run.id)
     # The DAG is built once, here (a stream that cannot be read stops the
     # run with its file and line), and what the build found worth saying
@@ -422,6 +422,9 @@ def main(
             run_loop(ctx, verbose=args.verbose)
     except llm.ContextLengthError as e:
         _fail_context_length(ctx, e)
+        sys.exit(1)
+    except llm.QuotaExhausted as e:
+        _fail_quota(ctx, e)
         sys.exit(1)
     finally:
         ctx.ui.close()

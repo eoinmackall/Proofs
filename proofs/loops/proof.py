@@ -26,11 +26,15 @@ from .prompts import (
     prover_context, verifier_context,
 )
 from .reasoning import (
-    _incomplete_report, _reason_until_answered, _recorded_model, _same_model,
-    _wait_for_server, compaction_passes, extract,
+    VERIFIER_ROLE, _incomplete_report, _reason_until_answered,
+    _recorded_model, _requested_model, _same_model, _served_model,
+    _wait_for_server, compaction_passes, extract, pinned,
 )
 from .schemas import REVISER_SCHEMA
-from .verifiers import _run_verifier, fan_out, stopping, verifier_prompt
+from .verifiers import (
+    _run_verifier, fan_out, stopping, unpin_verifiers, verifier_prompt,
+    with_verifier_failover,
+)
 
 
 def _parse_reviser_decision(ctx, revision_text: str, verbose: bool) -> Dict[str, Any]:
@@ -42,7 +46,8 @@ def _parse_reviser_decision(ctx, revision_text: str, verbose: bool) -> Dict[str,
     """
     if not revision_text:
         return {}
-    res = parse_json_or_none(revision_text)
+    res = parse_json_or_none(
+        revision_text, expect=("action", "statement_revision", "new_statement"))
     if res is None:
         res = extract(
             ctx,
@@ -75,6 +80,13 @@ def _restore_failed(ctx, flight, why: str, verbose: bool) -> None:
 
 
 def run_proof_loop(ctx, **kwargs) -> Dict[str, Any]:
+    """_run_proof_loop, with the thread's model pins (--with-fallback) put
+    back as they were when it returns."""
+    with pinned(ctx, {}):
+        return _run_proof_loop(ctx, **kwargs)
+
+
+def _run_proof_loop(ctx, **kwargs) -> Dict[str, Any]:
     """_proof_loop (which documents the loop), in the loop's own code
     directory (tools/run_code/files.py): the one the resumed round saved,
     or a new one. The directory goes when the lemma settles — proved, out
@@ -255,6 +267,9 @@ def _proof_loop(
     # reviser can reset it: a lemma it decomposes into a smaller one starts
     # its own prover rounds from 1 (see the new_lemma branch below).
     while settings_mod.within(attempt, ctx.settings.max_proof_attempts):
+        # Each attempt's check starts on the verifiers' own model: a
+        # fallback (--with-fallback) lasts one check and its certificate.
+        unpin_verifiers(ctx)
         if should_stop is not None and should_stop():
             return {
                 "proved": False,
@@ -396,7 +411,8 @@ def _proof_loop(
         # round's is the one saved with its proof, which a resumed run on
         # another model did not write ("" from a checkpoint that predates
         # the field: not known).
-        prover_model = saved["prover_model"] if restoring else _recorded_model(ctx)
+        prover_model = (saved["prover_model"] if restoring
+                        else _served_model(ctx, "prover"))
 
         if prover_status == "too_large":
             # The prompt, not the lemma, is what does not fit: the lemma
@@ -591,7 +607,7 @@ def _proof_loop(
         proof = proof_text
         cited_lemmas: List[str] = []
         cited_refs: List[str] = []
-        prover_res = parse_json_or_none(proof_text)
+        prover_res = parse_json_or_none(proof_text, expect=("proof",))
         raw_cited_lemmas: Any = None
         raw_cited_refs: Any = None
         raw_code_runs: Any = None
@@ -865,124 +881,137 @@ def _proof_loop(
             f"Proposed proof:\n{proof}"
             + computations_block(ctx, {"code": code}, code_sources)
         )
-        reject_just: Optional[str] = None
-        stopped = False
         steps = verifier_steps({"code": code})
-        # The verdicts a resumed round saved: each counts only while the
-        # proof's hash is the one it checked and it came from the model
-        # this run uses; any other is dropped and its verifier runs again.
-        kept = [
-            v for v in in_flight_state["verdicts"]
-            if v.get("hash") == verified_hash
-            and _same_model(ctx, v.get("model", ""), v.get("requested", ""))
-        ]
-        if len(kept) < len(in_flight_state["verdicts"]):
-            # The parent may now be rejected or revised; do not lose completed
-            # checks of its original citations if its batch is abandoned.
-            citation_checks.recover_checks(ctx, [in_flight_state])
-            ctx.ui.log(
-                f"  {len(in_flight_state['verdicts']) - len(kept)} saved "
-                f"verdict(s) on {lemma_id} no longer apply (the proof's hash "
-                f"or the model changed); those verifiers run again.",
-                verbose,
-            )
-        in_flight_state["verdicts"] = kept
-        saved_verdicts = {v["agent"]: v for v in kept}
-        # A saved rejection (or missing verdict) settles the round as it
-        # did when it came in; any other saved verdict stands in for its
-        # verifier, and the rest run.
-        missing: Optional[Tuple[int, str]] = None
-        for step, agent in enumerate(steps, 1):
-            prior = saved_verdicts.get(agent)
-            if prior is None:
-                continue
-            decision, justification = prior["decision"], prior["justification"]
-            ctx.ui.log(
-                f"Verifier {step}/{len(steps)} ({role_of(agent)}): "
-                f"{decision.upper() or '???'} (saved) — {justification}",
-                verbose,
-            )
-            if decision == verdicts.REJECT and reject_just is None:
-                reject_just = justification
-                ctx.status(event=f"verifier {step}/{len(steps)} rejected")
-            elif decision != verdicts.ACCEPT and missing is None:
-                missing = (step, justification)
-        to_run = [] if reject_just is not None or missing is not None else [
-            agent for agent in steps if agent not in saved_verdicts
-        ]
-        prompts = {agent: verifier_prompt(ctx, verifier_sys, agent)
-                   for agent in to_run}
 
-        def run_step(step_ctx, agent: str) -> Optional[Tuple[str, str]]:
-            """One verifier, the server's outages waited out: its verdict,
-            or None when should_stop fired while waiting. An unreachable
-            server is waited out and the same step retried: the proof is
-            not at fault, and keeping it saves re-running the prover."""
-            step, role = steps.index(agent) + 1, role_of(agent)
-            while True:
-                decision, justification = _run_verifier(
-                    step_ctx, role, prompts[agent], verifier_user, verbose,
-                )
-                if decision != verdicts.UNAVAILABLE:
-                    return decision, justification
-                step_ctx.ui.log(
-                    f"Verifier {step}/{len(steps)} ({role}): "
-                    f"{decision.upper()} — {justification}",
+        def run_check() -> Tuple[Optional[str], bool, Optional[Tuple[int, str]]]:
+            """The round's verifier checks: (the rejection's justification,
+            whether a stop came while waiting, the first missing verdict).
+            Run again from the start on the fallback model when a
+            verifier's call fails over (with_verifier_failover); the
+            verdicts the verifiers' own model gave are then dropped by the
+            saved-verdict filter, as no longer from the model in use."""
+            reject_just: Optional[str] = None
+            stopped = False
+            # The verdicts a resumed round saved: each counts only while the
+            # proof's hash is the one it checked and it came from the model
+            # this run uses; any other is dropped and its verifier runs again.
+            kept = [
+                v for v in in_flight_state["verdicts"]
+                if v.get("hash") == verified_hash
+                and _same_model(ctx, VERIFIER_ROLE, v.get("model", ""),
+                                v.get("requested", ""))
+            ]
+            if len(kept) < len(in_flight_state["verdicts"]):
+                # The parent may now be rejected or revised; do not lose completed
+                # checks of its original citations if its batch is abandoned.
+                citation_checks.recover_checks(ctx, [in_flight_state])
+                ctx.ui.log(
+                    f"  {len(in_flight_state['verdicts']) - len(kept)} saved "
+                    f"verdict(s) on {lemma_id} no longer apply (the proof's hash "
+                    f"or the model changed); those verifiers run again.",
                     verbose,
                 )
-                if not _wait_for_server(
-                    step_ctx, role,
-                    lambda: stopping(step_ctx) or (
-                        should_stop is not None and should_stop()),
-                    verbose,
-                ):
-                    return None
-
-        # Parallel verifiers (ctx.settings.parallel_verifiers): the first
-        # rejection settles the round, as the first one does in step
-        # order, and the rest are not waited for; a missing verdict starts
-        # no further verifier but waits for the running ones, since a
-        # rejection among them is the better reason to give the reviser.
-        with fan_out(ctx, to_run, run_step, ctx.settings.parallel_verifiers) as results:
-            if results.parallel:
-                ctx.status(role=f"{results.workers} verifiers")
-            for agent, outcome in results:
-                if outcome is None:
-                    stopped = True
-                    break
-                decision, justification = outcome
-                step = steps.index(agent) + 1
+            in_flight_state["verdicts"] = kept
+            saved_verdicts = {v["agent"]: v for v in kept}
+            # A saved rejection (or missing verdict) settles the round as it
+            # did when it came in; any other saved verdict stands in for its
+            # verifier, and the rest run.
+            missing: Optional[Tuple[int, str]] = None
+            for step, agent in enumerate(steps, 1):
+                prior = saved_verdicts.get(agent)
+                if prior is None:
+                    continue
+                decision, justification = prior["decision"], prior["justification"]
                 ctx.ui.log(
                     f"Verifier {step}/{len(steps)} ({role_of(agent)}): "
-                    f"{decision.upper() or '???'} — {justification}",
+                    f"{decision.upper() or '???'} (saved) — {justification}",
                     verbose,
                 )
-                # Checkpoint: the verdict, as soon as it is in.
-                in_flight_state["verdicts"].append({
-                    "agent": agent,
-                    "decision": decision,
-                    "justification": justification,
-                    "model": _recorded_model(ctx),
-                    "requested": ctx.model.name,
-                    "hash": verified_hash,
-                })
-                if decision != verdicts.ACCEPT:
-                    in_flight_state["stage"] = "revise"
-                on_round(in_flight_state)
-                if decision == verdicts.REJECT:
-                    rest = results.abandoned()
-                    if rest:
-                        ctx.ui.log(
-                            f"Not waiting for "
-                            f"{', '.join(role_of(a) for a in rest)}.",
-                            verbose,
-                        )
-                    ctx.status(event=f"verifier {step}/{len(steps)} rejected")
+                if decision == verdicts.REJECT and reject_just is None:
                     reject_just = justification
-                    break
-                if decision != verdicts.ACCEPT and missing is None:
+                    ctx.status(event=f"verifier {step}/{len(steps)} rejected")
+                elif decision != verdicts.ACCEPT and missing is None:
                     missing = (step, justification)
-                    results.drain()
+            to_run = [] if reject_just is not None or missing is not None else [
+                agent for agent in steps if agent not in saved_verdicts
+            ]
+            prompts = {agent: verifier_prompt(ctx, verifier_sys, agent)
+                       for agent in to_run}
+
+            def run_step(step_ctx, agent: str) -> Optional[Tuple[str, str]]:
+                """One verifier, the server's outages waited out: its verdict,
+                or None when should_stop fired while waiting. An unreachable
+                server is waited out and the same step retried: the proof is
+                not at fault, and keeping it saves re-running the prover."""
+                step, role = steps.index(agent) + 1, role_of(agent)
+                while True:
+                    decision, justification = _run_verifier(
+                        step_ctx, role, prompts[agent], verifier_user, verbose,
+                    )
+                    if decision != verdicts.UNAVAILABLE:
+                        return decision, justification
+                    step_ctx.ui.log(
+                        f"Verifier {step}/{len(steps)} ({role}): "
+                        f"{decision.upper()} — {justification}",
+                        verbose,
+                    )
+                    if not _wait_for_server(
+                        step_ctx, role,
+                        lambda: stopping(step_ctx) or (
+                            should_stop is not None and should_stop()),
+                        verbose,
+                    ):
+                        return None
+
+            # Parallel verifiers (ctx.settings.parallel_verifiers): the first
+            # rejection settles the round, as the first one does in step
+            # order, and the rest are not waited for; a missing verdict starts
+            # no further verifier but waits for the running ones, since a
+            # rejection among them is the better reason to give the reviser.
+            with fan_out(ctx, to_run, run_step, ctx.settings.parallel_verifiers) as results:
+                if results.parallel:
+                    ctx.status(role=f"{results.workers} verifiers")
+                for agent, outcome in results:
+                    if outcome is None:
+                        stopped = True
+                        break
+                    decision, justification = outcome
+                    step = steps.index(agent) + 1
+                    ctx.ui.log(
+                        f"Verifier {step}/{len(steps)} ({role_of(agent)}): "
+                        f"{decision.upper() or '???'} — {justification}",
+                        verbose,
+                    )
+                    # Checkpoint: the verdict, as soon as it is in.
+                    in_flight_state["verdicts"].append({
+                        "agent": agent,
+                        "decision": decision,
+                        "justification": justification,
+                        "model": _recorded_model(ctx, VERIFIER_ROLE),
+                        "requested": _requested_model(ctx, VERIFIER_ROLE),
+                        "hash": verified_hash,
+                    })
+                    if decision != verdicts.ACCEPT:
+                        in_flight_state["stage"] = "revise"
+                    on_round(in_flight_state)
+                    if decision == verdicts.REJECT:
+                        rest = results.abandoned()
+                        if rest:
+                            ctx.ui.log(
+                                f"Not waiting for "
+                                f"{', '.join(role_of(a) for a in rest)}.",
+                                verbose,
+                            )
+                        ctx.status(event=f"verifier {step}/{len(steps)} rejected")
+                        reject_just = justification
+                        break
+                    if decision != verdicts.ACCEPT and missing is None:
+                        missing = (step, justification)
+                        results.drain()
+            return reject_just, stopped, missing
+
+        reject_just, stopped, missing = with_verifier_failover(
+            ctx, run_check, verbose)
         if reject_just is None and missing is not None and not stopped:
             step, reject_just = missing
             ctx.status(event=f"verifier {step}/{len(steps)} gave no verdict")
@@ -998,6 +1027,9 @@ def _proof_loop(
                 f"verifier checks.",
                 verbose,
             )
+            # The model the check ran on, for its certificate: the
+            # fallback's, if the check was restarted there.
+            proved_node["_verifier_model"] = _recorded_model(ctx, VERIFIER_ROLE)
             if audit_citations and (in_flight_state['stage'] == 'citations' or
                                     (cited_lemmas and ctx.settings.citation_recheck_base != -1)):
                 # Canonical edges also for pre-feature prover checkpoints.

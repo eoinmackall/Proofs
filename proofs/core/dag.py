@@ -72,7 +72,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..loops.json_repair import _FENCE_RE
-from ..loops.reasoning import _recorded_model
+from ..loops.reasoning import VERIFIER_ROLE, _recorded_model
 from ..tools.run_code import computations
 from ..workspace import config
 from . import audits, certificates, citations, merkle, refutations, resolution, streams, suspension
@@ -707,8 +707,9 @@ def _record(ctx, kind: str, lemma_id: str, node: Dict[str, Any]) -> Dict[str, An
     statement and proof normalized: the one place a lemma's text is
     normalized, so the load can hash it as stored. Its model is the one
     that wrote the proof (node["_model"], which the proof loop sets; this
-    run's otherwise), left out when not known; no hash covers it."""
-    model = str(node["_model"] if "_model" in node else _recorded_model(ctx))
+    run's prover's otherwise), left out when not known; no hash covers it."""
+    model = str(node["_model"] if "_model" in node
+                else _recorded_model(ctx, "prover"))
     record = {
         "type": kind,
         "id": lemma_id,
@@ -811,8 +812,11 @@ def _certify_before_write(
     and the commit — the certificate would cover a version nobody verified,
     so none is issued and the lemma stays suspended until proofs verify
     checks it. A certificate that cannot be written does not undo the
-    acceptance: the lemma is committed anyway, suspended."""
-    model = _recorded_model(ctx)
+    acceptance: the lemma is committed anyway, suspended. Its model is the
+    one the check ran on (node["_verifier_model"], which the proof loop
+    sets: a check restarted on the fallback ran there), else this run's
+    verifiers'."""
+    model = str(node.get("_verifier_model") or _recorded_model(ctx, VERIFIER_ROLE))
     try:
         h = ctx.dag.hash_of(lemma_id, node)
     except merkle.MerkleCycleError as e:

@@ -72,12 +72,14 @@ from typing import Any, Dict, List, Optional
 
 from ..core.context import Context
 from ..core.dag import load_file
+from ..loops import models as models_mod
 from ..loops import reasoning
 from ..loops.json_repair import parse_json_or_none
 from .. import llm
-from ..cli.flags import add_backend_flags
+from ..cli.flags import add_backend_flags, model_flags
 from ..workspace import config
 from ..workspace import layout as workspace
+from ..workspace import settings as settings_mod
 
 # Files that could plausibly contain statements. Everything else in the
 # directory (images, pdfs, .gitkeep) is skipped with a note, not an error:
@@ -220,7 +222,7 @@ def parse_file(
         ctx.ui.log(f"  {filename}: the parser returned nothing.", verbose)
         return []
 
-    res = parse_json_or_none(content)
+    res = parse_json_or_none(content, expect=("references",))
     if res is None:
         res = reasoning.extract(
             ctx,
@@ -296,21 +298,24 @@ def run(
     )
     args = ap.parse_args(argv)
 
-    # The same backend setup as proofs run (llm.connect): probe first, then
-    # settle the context window.
+    # The same model setup as proofs run (loops/models.py): the settings
+    # and routes of the .proofs-local.json files, every model routed to
+    # probed, its context window settled. The parser's model sizes the
+    # files.
     ctx = Context()
-    ctx.model.name = args.model
     try:
-        connection = llm.connect(
-            args.model, args.host, reasoning.REQUEST_TIMEOUT, args.api_key,
-            args.backend, args.num_ctx,
-        )
-    except llm.AuthError as e:
+        conjecture_dir = workspace.conjecture_dir(args.conjecture, root)
+        ctx.settings = settings_mod.resolve(
+            workspace.find_root(conjecture_dir), None, conjecture_dir)
+        # proofs parse calls the parser alone.
+        models_mod.connect(ctx, ctx.settings, model_flags(args), args.verbose,
+                           roles=("parser",))
+    except (workspace.ConjectureNotFound, settings_mod.SettingsError,
+            llm.RoutingError, llm.ProbeError) as e:
         ap.error(str(e))
-    ctx.attach_model(connection)
-    num_ctx = ctx.settings.num_ctx
-    if connection.notes:
-        ctx.ui.log(connection.notes, args.verbose)
+        return
+    parser_model = ctx.models.for_role("parser")
+    num_ctx = parser_model.num_ctx
 
     # The run's user, before the paths: resolve() names the run's DAG
     # file after it, and the description the operator sees mentions whose
@@ -382,7 +387,7 @@ def run(
         if not text:
             ctx.ui.log(f"  {path.name}: empty, skipping.", args.verbose)
             continue
-        est = ctx.model.backend.estimate_tokens(text)
+        est = parser_model.backend.estimate_tokens(text)
         if est > int(MAX_FILE_FRACTION * num_ctx):
             ctx.ui.log(
                 f"  skipping {path.name}: ~{est} tokens leaves no room for "
@@ -399,7 +404,8 @@ def run(
             # a bad file: say so once, with the server's own number, and
             # stop. references.md keeps its previous contents — re-run
             # with the corrected budget and everything re-parses.
-            ctx.ui.log(reasoning._context_length_message(e, ctx.settings.num_ctx))
+            ctx.ui.log(reasoning._context_length_message(
+                e, e.model or parser_model))
             raise SystemExit(1)
         for item in items:
             statement = str(item.get("formal statement") or "").strip()

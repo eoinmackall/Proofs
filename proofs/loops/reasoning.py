@@ -4,19 +4,20 @@
 
 from __future__ import annotations
 
+import contextlib
 import email.utils
 import json
 import random
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 import requests
 
 from .. import llm
 from .. import tools as tools_mod
 from ..workspace import settings as settings_mod
-from .json_repair import _THINK_RE, clean_json_text
+from .json_repair import _loads, clean_json_text, strip_thinking
 
 REQUEST_TIMEOUT = 5400       # 90 minutes: thinking models are slow, but a
 
@@ -27,15 +28,20 @@ class Cancelled(Exception):
     place of the next request, never in the middle of one."""
 
 
-def _chat(ctx, *args: Any, **kwargs: Any) -> "llm.Reply":
-    """backend.chat, unless the calling thread has been cancelled
+def _chat(ctx, m: "llm.Model", *args: Any, **kwargs: Any) -> "llm.Reply":
+    """m's backend.chat, unless the calling thread has been cancelled
     (LoopState.cancel): every request of reason() and extract() goes
     through here, so a cancelled verifier sends no further tool round,
-    retry or compaction pass."""
+    retry or compaction pass. A context-length refusal is tagged with m,
+    whose window it was (_fail_context_length)."""
     cancel = ctx.loop.cancel
     if cancel is not None and cancel.is_set():
         raise Cancelled()
-    return ctx.model.backend.chat(*args, **kwargs)
+    try:
+        return m.backend.chat(*args, **kwargs)
+    except (llm.ContextLengthError, llm.QuotaExhausted) as e:
+        e.model = m
+        raise
 
 
 def _retry_after(e: Exception) -> Optional[float]:
@@ -75,17 +81,18 @@ def _retry_pause(ctx, attempt: int, e: Exception, label: str,
         time.sleep(delay)
 
 
-def _native_tools(ctx) -> bool:
-    return ctx.settings.tool_mode == "auto" and ctx.model.native_tools_ok is not False
+def _native_tools(ctx, m: "llm.Model") -> bool:
+    return ctx.settings.tool_mode == "auto" and m.native_tools_ok is not False
 
 
-def _disable_native_tools(ctx, why: str, verbose: bool) -> None:
-    if ctx.model.native_tools_ok is not False:
-        ctx.model.native_tools_ok = False
+def _disable_native_tools(ctx, m: "llm.Model", why: str, verbose: bool) -> None:
+    if m.native_tools_ok is not False:
+        m.native_tools_ok = False
         ctx.ui.log(
-            f"The server refused native tool calls ({why[:200]}); using "
-            f"the JSON tool protocol for the rest of the run. Launch "
-            f"llama-server with --jinja for native tool calls.",
+            f"The server of {m.label()} refused native tool calls "
+            f"({why[:200]}); using the JSON tool protocol with it for the "
+            f"rest of the run. Launch llama-server with --jinja for native "
+            f"tool calls.",
             verbose,
         )
 
@@ -108,23 +115,54 @@ RETRY_CAP_SECONDS = 60
 RETRY_AFTER_CAP_SECONDS = 300
 
 
-# Per-role reasoning temperatures, sent with every call. Every role reason()
-# is called with must be listed: there is no fallback. Greedy decoding
-# degrades thinking models, so none of these is 0.
-TEMPERATURES = {
-    "planner": 0.7,
-    "prover": 0.6,     # Slightly tighter: rigour over exploration.
-    "verifier_1": 0.8,
-    "verifier_2": 0.8,
-    "verifier_3": 0.8,   # Looser, so the three independent checks don't
-                        # collapse into one review of the first pass.
-    "coding_verifier": 0.8,   # The fourth check, for proofs with code:
-                              # sampled like the other three.
-    "reviser": 0.7,    # Diagnosing a failure is planning-scale judgement.
-    "parser": 0.3,     # Extracting from a fixed source, not exploring.
-    "parallel_planner": 0.3,          # Steering a run, not exploring one.
-    "parallel_lemma_generator": 0.6,  # Proposing lemmas is generation.
+# Every role reason() and extract() are called with: the roles llm.routes
+# routes (llm/routing.py). There is no fallback, so a new agent is listed
+# here. And the ones that must share a model: every verifier, since a
+# certificate records one model for the whole check. VERIFIER_ROLE stands
+# for them all where a verifier's model is recorded or compared.
+ROLES = (
+    "planner", "prover", "verifier_1", "verifier_2", "verifier_3",
+    "coding_verifier", "reviser", "parser", "parallel_planner",
+    "parallel_lemma_generator",
+)
+VERIFIER_ROLES = ("verifier_1", "verifier_2", "verifier_3", "coding_verifier")
+VERIFIER_ROLE = VERIFIER_ROLES[0]
+SAME_MODEL = (
+    (VERIFIER_ROLES, "a certificate records one model for the whole check"),
+)
+
+
+# extract()'s sampling: greedy, with every penalty off. The stage copies its
+# source — it writes nothing new — and a server's launch-time sampling (a
+# model card's presence penalty, say) would push a copy of mathematics,
+# which repeats its symbols, to paraphrase. The one exception to leaving
+# sampling to the server; sent only where the API takes it, and dropped
+# for the rest of the run by a server that refuses it.
+_GREEDY_OPTIONS: Dict[str, Any] = {
+    "temperature": 0.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repeat_penalty": 1.0,
+    "min_p": 0.0,
 }
+
+
+def _call_options(m: "llm.Model") -> Dict[str, Any]:
+    """The options of every call on m (reason(), extract(), a compaction
+    pass). Sampling is left to the server and the model's own card: no
+    temperature, penalty or sampler field is sent unless the model's entry
+    sets one (llm.models.NAME.temperature, or --temperature) — a model's
+    defaults are tuned for it, and a strict API (current Claude models,
+    OpenAI's reasoning models) refuses a field it does not take.
+    Likewise the reasoning effort (llm.models.NAME.effort, or --effort),
+    which each backend sends in its API's own field. num_predict is set per
+    call."""
+    options: Dict[str, Any] = {"num_ctx": m.num_ctx}
+    if m.spec.temperature is not None:
+        options["temperature"] = m.spec.temperature
+    if m.spec.effort is not None:
+        options["effort"] = m.spec.effort
+    return options
 
 
 # Pi-style compaction on the context wall: a truncated call is resumed by
@@ -203,56 +241,136 @@ def _lookup_room(num_ctx: int) -> int:
 _REJECTED_STATUSES = (400, 422)
 
 
-def _recorded_model(ctx) -> str:
-    """The model name certificates and refutations record: the model that
-    did the work, as the backend's recorded_model() reads it — the file a
-    llama-server loaded, or the model a hosted API's reply names — rather
-    than the --model request, which a llama-server ignores. The --model name
-    before a backend exists."""
-    return ctx.model.backend.recorded_model() if ctx.model.backend is not None else ctx.model.name
+def _model_for(ctx, role: str) -> "llm.Model":
+    """The model role's calls go to on this thread: the model it is pinned
+    to (a failed-over call, a verification check restarted on the
+    fallback: LoopState.pinned), else the one it is routed to."""
+    return ctx.loop.pinned.get(role) or ctx.models.for_role(role)
 
 
-def _same_model(ctx, model: str, requested: str) -> bool:
+def _stage_model(ctx, stage: str, role: str) -> "llm.Model":
+    """The model a stage of role's call goes to: the stage's own route,
+    else role's model (_model_for)."""
+    return ctx.models.stage_route(stage) or _model_for(ctx, role)
+
+
+class VerifierFailover(Exception):
+    """A verifier's call failed over (--with-fallback). A certificate names
+    one model for its whole check, so the call is not sent to the fallback
+    on its own: the check catches this, pins every verifier to model and
+    runs again from the start (verifiers.with_verifier_failover)."""
+
+    def __init__(self, model: "llm.Model", why: str) -> None:
+        super().__init__(why)
+        self.model = model
+        self.why = why
+
+
+def _fallback_for(ctx, m: "llm.Model") -> Optional["llm.Model"]:
+    """The model a call that m could not serve goes to: the fallback
+    (--with-fallback), unless there is none or m is it — then there is
+    nothing to fall back to, and the call keeps its retry behaviour."""
+    fallback = ctx.models.fallback if ctx.models is not None else None
+    return None if fallback is None or fallback is m else fallback
+
+
+@contextlib.contextmanager
+def pinned(ctx, pins: Mapping[str, "llm.Model"]) -> Iterator[None]:
+    """ctx's thread with pins added to its pinned roles, put back as they
+    were on the way out."""
+    saved = dict(ctx.loop.pinned)
+    ctx.loop.pinned.update(pins)
+    try:
+        yield
+    finally:
+        ctx.loop.pinned.clear()
+        ctx.loop.pinned.update(saved)
+
+
+def _fail_quota(ctx, e: "llm.QuotaExhausted", stop: Any = None) -> None:
+    """Run-level handling of a spent quota with nothing to fall back to:
+    one message per model, then the stop the caller names. Logged
+    unconditionally, like a context-length stop."""
+    m = e.model
+    said = f"quota:{m.name}" if m is not None else "quota"
+    if said not in ctx.run.said:
+        ctx.run.said.add(said)
+        who = m.label() if m is not None else "the model"
+        ctx.ui.log(
+            f"\nThe API of {who} refused a call: its quota, credit or spend "
+            f"limit is used up ({e}). Waiting does not bring it back: top it "
+            f"up, or route its roles to another model. The checkpoint is "
+            f"safe; re-running resumes from the last safe boundary."
+        )
+    if stop is not None:
+        stop()
+
+
+def _served_model(ctx, role: str) -> str:
+    """The recorded name of the model that served role's latest answer on
+    this thread (a failed-over call's fallback), else _recorded_model."""
+    m = ctx.loop.served.get(role)
+    return m.recorded() if m is not None else _recorded_model(ctx, role)
+
+
+def _recorded_model(ctx, role: str) -> str:
+    """The model name certificates and refutations record for work role
+    did: the model routed to it, as its backend's recorded_model() reads it
+    — the file a llama-server loaded, or the model a hosted API's reply
+    names — rather than the request, which a llama-server ignores. "" for
+    a command that calls no model."""
+    return _model_for(ctx, role).recorded() if ctx.models is not None else ""
+
+
+def _requested_model(ctx, role: str) -> str:
+    """The model name role's requests carry, saved beside the recorded one
+    (_same_model)."""
+    return _model_for(ctx, role).requested if ctx.models is not None else ""
+
+
+def _same_model(ctx, role: str, model: str, requested: str) -> bool:
     """Whether work recorded with (model, requested) — the recorded model
-    and the --model request of the run that did it — came from the model
-    this run uses. By the recorded model whenever the server has said what
-    it runs (a llama-server ignores --model, so the request names nothing
+    and the request of the run that did it — came from the model this run
+    routes role to. By the recorded model whenever the server has said
+    what it runs (a llama-server ignores the request, so it names nothing
     there); by the request only before it has, when the recorded model is
     the request itself and a hosted API's reply would add a version suffix
     the saved name has."""
-    backend = ctx.model.backend
-    if backend is not None and backend.recorded_model_known():
-        return model == backend.recorded_model()
-    return requested == ctx.model.name
+    m = _model_for(ctx, role)
+    if m.recorded_known():
+        return model == m.recorded()
+    return requested == m.requested
 
 
 def _context_length_message(
-    e: "llm.ContextLengthError", budget: int
+    e: "llm.ContextLengthError", m: "llm.Model"
 ) -> str:
-    """What to tell the operator when the server 400s a call as too long.
+    """What to tell the operator when m's server 400s a call as too long.
 
     The limit in it is the server's own number, read from the body of its
     400 — a measurement, not this run's budget; the budget is what the run
-    asked for. Naming both, and only the flag that fixes it, keeps the
-    failure from looking like a model or a network problem."""
+    asked for (m's window). Naming both, and only the setting that fixes
+    it, keeps the failure from looking like a model or a network problem."""
+    budget = m.num_ctx
     if e.prompt_tokens is not None and e.prompt_tokens >= e.server_limit:
         return (
-            f"\nThe server rejected a call as too long: the prompt alone "
-            f"({e.prompt_tokens} tokens) already exceeds its context window "
-            f"({e.server_limit} tokens), and this run budgets {budget}. No "
-            f"--num-ctx value fixes a prompt that no longer fits — the DAG "
-            f"has grown past the model's window. Re-run against a server "
-            f"launched with a larger --max-model-len, or start a fresh DAG "
-            f"for this conjecture."
+            f"\nThe server of {m.label()} rejected a call as too long: the "
+            f"prompt alone ({e.prompt_tokens} tokens) already exceeds its "
+            f"context window ({e.server_limit} tokens), and this run budgets "
+            f"{budget}. No window setting fixes a prompt that no longer fits "
+            f"— the DAG has grown past the model's window. Re-run against a "
+            f"server launched with a larger --max-model-len, route the role "
+            f"to a model with a larger window, or start a fresh DAG for this "
+            f"conjecture."
         )
     return (
-        f"\nThe server rejected a call as too long: its context window is "
-        f"{e.server_limit} tokens (the server's own number, from its 400), "
-        f"but this run budgets {budget}, so every call whose prompt plus "
-        f"generation budget outruns the window is rejected outright — a "
-        f"rejection the compaction rescue never sees, because it only "
-        f"triggers on a truncated reply. Re-run with --num-ctx "
-        f"{e.server_limit}, matched to the server's --max-model-len."
+        f"\nThe server of {m.label()} rejected a call as too long: its "
+        f"context window is {e.server_limit} tokens (the server's own "
+        f"number, from its 400), but this run budgets {budget}, so every "
+        f"call whose prompt plus generation budget outruns the window is "
+        f"rejected outright — a rejection the compaction rescue never sees, "
+        f"because it only triggers on a truncated reply. To match the "
+        f"server's --max-model-len, {m.num_ctx_fix(e.server_limit)}."
     )
 
 
@@ -263,10 +381,17 @@ def _fail_context_length(ctx, e: "llm.ContextLengthError",
     state; serial mode exits from main instead). The checkpoint is
     untouched — it holds the last safe boundary, which is exactly where a
     re-run with a corrected --num-ctx should resume from. Logged
-    unconditionally: a fatal the operator must see is not verbose noise."""
-    if not ctx.model.context_failure_seen:
-        ctx.model.context_failure_seen = True
-        ctx.ui.log(_context_length_message(e, ctx.settings.num_ctx))
+    unconditionally: a fatal the operator must see is not verbose noise.
+    The message names the model whose server refused (e.model, set by
+    _chat), once per model."""
+    m = e.model
+    said = f"context-length:{m.name}" if m is not None else "context-length"
+    if said not in ctx.run.said:
+        ctx.run.said.add(said)
+        if m is not None:
+            ctx.ui.log(_context_length_message(e, m))
+        else:
+            ctx.ui.log(f"\nThe server rejected a call as too long: {e}")
         ctx.ui.log(
             "The checkpoint is safe; re-running resumes from the last "
             "safe boundary.",
@@ -275,8 +400,9 @@ def _fail_context_length(ctx, e: "llm.ContextLengthError",
         stop()
 
 
-def _headroom(ctx, messages: List[Dict[str, str]], num_ctx: int) -> int:
-    """Tokens available for generation after the prompt, with a safety margin.
+def _headroom(m: "llm.Model", messages: List[Dict[str, str]]) -> int:
+    """Tokens m's window has available for generation after the prompt,
+    with a safety margin.
 
     num_ctx caps prompt + generation together, so this is the most a response
     can ever get: anything more is cut off by the context window, not the
@@ -293,12 +419,12 @@ def _headroom(ctx, messages: List[Dict[str, str]], num_ctx: int) -> int:
     COMPACT_THRESHOLD * num_ctx: the model may think and write until the window
     is COMPACT_THRESHOLD full, and only then is it cut off for compaction.
     """
-    return _room(_estimate_tokens(ctx, messages), num_ctx)
+    return _room(_estimate_tokens(m, messages), m.num_ctx)
 
 
-def _estimate_tokens(ctx, messages: List[Dict[str, Any]]) -> int:
+def _estimate_tokens(m: "llm.Model", messages: List[Dict[str, Any]]) -> int:
     """The size in tokens of a list of messages, estimated from their
-    characters and the running chars/token ratio (see _headroom)."""
+    characters and m's running chars/token ratio (see _headroom)."""
     # A tool-call turn carries its calls beside an often-empty content, and
     # sometimes its reasoning trace (reason()'s Model.echo_reasoning).
     chars = sum(
@@ -306,7 +432,7 @@ def _estimate_tokens(ctx, messages: List[Dict[str, Any]]) -> int:
         + llm.reasoning_chars(m)
         for m in messages
     )
-    ratio = ctx.model.backend.chars_per_token()
+    ratio = m.backend.chars_per_token()
     return int(chars / max(ratio, 1.0)) + 1
 
 
@@ -336,13 +462,19 @@ COMPACT_SYSTEM = (
 
 def _split_inline_thinking(content: str, thinking: str) -> Tuple[str, str]:
     """Recover (content, thinking) when the model inlined its reasoning
-    instead of separating it."""
-    if not thinking and "\u003cthink\u003e" in content:
-        m = re.search(r"\u003cthink\u003e(.*?)\u003c/think\u003e", content, re.DOTALL)
-        if m:
-            thinking = m.group(1).strip()
-        content = _THINK_RE.sub("", content).strip()
-    return content, thinking
+    instead of separating it: in <think>...</think>, or — when the chat
+    template opened <think> in the prompt and the server ran without a
+    reasoning parser — as everything before a closing </think> that has
+    no opening tag."""
+    if thinking or ("\u003cthink\u003e" not in content
+                    and "\u003c/think\u003e" not in content):
+        return content, thinking
+    m = re.search(r"\u003cthink\u003e(.*?)\u003c/think\u003e", content, re.DOTALL)
+    if m:
+        thinking = m.group(1).strip()
+    elif "\u003c/think\u003e" in content and "\u003cthink\u003e" not in content:
+        thinking = content.rsplit("\u003c/think\u003e", 1)[0].strip()
+    return strip_thinking(content).strip(), thinking
 
 
 def _summary_room(num_ctx: int) -> int:
@@ -375,13 +507,12 @@ def _compact_messages(part: str, prev: str, tail: str, part_no: int,
     ]
 
 
-def _compact_budget(ctx, prev: str, tail: str) -> int:
-    """Tokens of trace one compaction call can take: the window left after
-    the call's fixed text (system prompt, framing, the summary so far, the
-    answer's tail) and the room kept for the summary it writes."""
-    num_ctx = ctx.extract_options["num_ctx"]
-    fixed = _estimate_tokens(ctx, _compact_messages("", prev, tail, 1, False))
-    return _room(fixed, num_ctx) - _summary_room(num_ctx)
+def _compact_budget(m: "llm.Model", prev: str, tail: str) -> int:
+    """Tokens of trace one compaction call on m can take: the window left
+    after the call's fixed text (system prompt, framing, the summary so
+    far, the answer's tail) and the room kept for the summary it writes."""
+    fixed = _estimate_tokens(m, _compact_messages("", prev, tail, 1, False))
+    return _room(fixed, m.num_ctx) - _summary_room(m.num_ctx)
 
 
 def _take_lines(lines: List[str], start: int, max_chars: int) -> int:
@@ -399,22 +530,34 @@ def _take_lines(lines: List[str], start: int, max_chars: int) -> int:
     return end
 
 
-def _compact_pass(ctx, part: str, prev: str, tail: str,
+def _compact_pass(ctx, m: "llm.Model", part: str, prev: str, tail: str,
                   part_no: int, last: bool, verbose: bool) -> str:
-    """One summarisation pass over part of the cut-off trace.
+    """One summarisation pass over part of the cut-off trace, on m.
 
     Returns the folded summary, or `prev` unchanged on any failure: the
     compaction must never lose what it already had, and it is a rescue, not a
-    new stage that can fail the call.
+    new stage that can fail the call — a pass the server refuses as too long
+    for its window keeps `prev` too. A spent quota is raised, for
+    _compact_trace to take the passes to the fallback.
     """
     messages = _compact_messages(part, prev, tail, part_no, last)
-    options = {
-        **ctx.extract_options,
-        "num_predict": _headroom(ctx, messages, ctx.extract_options["num_ctx"]),
-    }
+    room = _headroom(m, messages)
+    # A chunk is sized to leave _summary_room for the summary (a quarter
+    # of a small window); far less than that means the estimate was off
+    # and the pass would be cut short or refused.
+    if room < min(COMPACT_MIN_ROOM, _summary_room(m.num_ctx) // 2):
+        ctx.ui.log(f"  compaction chunk {part_no} leaves only ~{room} tokens of "
+                   f"{m.label()}'s window; keeping the previous summary.",
+                   verbose)
+        return prev
+    options = {**_call_options(m), "num_predict": room}
     try:
-        reply = _chat(ctx, messages, think=None, schema=None,
+        reply = _chat(ctx, m, messages, think=None, schema=None,
                       options=options)
+    except llm.ContextLengthError as e:
+        ctx.ui.log(f"  compaction chunk {part_no} is too long for "
+                   f"{m.label()} ({e}); keeping the previous summary.", verbose)
+        return prev
     except (requests.RequestException, ValueError, KeyError) as e:
         ctx.ui.log(f"  compaction chunk {part_no} transport error: {e}",
             verbose)
@@ -435,10 +578,12 @@ def _compact_trace(ctx, role: str, thinking: str, tail: str, verbose: bool,
     compaction round's result across, so a trace compacted in several rounds
     (a continuation that itself hit the wall) never loses what the first
     rounds established. Returns the summary, or prev_summary unchanged when
-    the trace was empty or nothing survived the passes."""
+    the trace was empty or nothing survived the passes. The passes go to
+    the model the compact stage is routed to, role's by default."""
     if not thinking.strip():
         return prev_summary
-    ratio = ctx.model.backend.chars_per_token()
+    m = _stage_model(ctx, "compact", role)
+    ratio = m.backend.chars_per_token()
     ctx.ui.log(f"  {role} trace (~{int(len(thinking) / ratio)} tokens) too "
         f"big to re-send; summarising it.", verbose)
     lines = thinking.split("\n")
@@ -446,15 +591,29 @@ def _compact_trace(ctx, role: str, thinking: str, tail: str, verbose: bool,
     start, part_no = 0, 0
     while start < len(lines):
         # Sized per chunk: the summary folded into the next call grows.
-        budget = _compact_budget(ctx, summary, tail)
+        budget = _compact_budget(m, summary, tail)
         end = _take_lines(lines, start, max(int(budget * ratio), 1000))
         part = "\n".join(lines[start:end])
         part_no += 1
         last = end == len(lines)
         ctx.ui.log(f"  compaction chunk {part_no}: ~{int(len(part) / ratio)} "
             f"tokens of trace{' (last)' if last else ''}.", verbose)
-        summary = _compact_pass(ctx, part, summary, tail, part_no, last,
-                                verbose)
+        try:
+            summary = _compact_pass(ctx, m, part, summary, tail, part_no,
+                                    last, verbose)
+        except llm.QuotaExhausted:
+            # The compaction model's quota used up: the rest of the trace
+            # goes to the fallback (--with-fallback), chunked again from
+            # here for its window, or the refusal goes up to the command.
+            fallback = _fallback_for(ctx, m)
+            if fallback is None:
+                raise
+            ctx.ui.log(f"  compaction: {m.label()}'s quota is used up; "
+                       f"summarising the rest on the fallback, "
+                       f"{fallback.label()}.", verbose)
+            m, ratio = fallback, fallback.backend.chars_per_token()
+            part_no -= 1
+            continue
         start = end
     return summary
 
@@ -498,6 +657,7 @@ def _resume_compacted(
     """
     if max_passes is None:
         max_passes = ctx.settings.max_compaction_passes
+    m = _model_for(ctx, role)
     answer = content
     summary = ""
 
@@ -546,25 +706,24 @@ def _resume_compacted(
         # re-sent in full, then the compaction (trace summary + verbatim
         # answer-so-far) rides on top. The two are different fixes, so keep
         # them separate in the log.
-        _ratio = ctx.model.backend.chars_per_token()
+        _ratio = m.backend.chars_per_token()
         ctx.ui.log(
             f"  {role} continuation prompt: task~{int(len(user_prompt)/_ratio)}"
             f" + summary~{int(len(summary)/_ratio)}"
             f" + answer~{int(len(answer)/_ratio)} tokens",
             verbose,
         )
-        room = _headroom(ctx, messages, ctx.reasoning_options["num_ctx"])
+        room = _headroom(m, messages)
         if room < COMPACT_MIN_ROOM:
             ctx.ui.log(f"  {role} compaction left only ~{room} tokens of room; "
                 f"not enough to continue.", verbose)
             return "", _partial()
         options = {
-            **ctx.reasoning_options,
-            "temperature": TEMPERATURES[role],
+            **_call_options(m),
             "num_predict": room,
         }
         try:
-            reply = _chat(ctx, messages, think=True, schema=None,
+            reply = _chat(ctx, m, messages, think=True, schema=None,
                           options=options)
         except (requests.RequestException, ValueError, KeyError) as e:
             ctx.ui.log(f"  {role} continuation transport error: {e}", verbose)
@@ -664,12 +823,56 @@ def reason(
     tools: Optional["tools_mod.ToolSet"] = None,
 ) -> Tuple[str, str, Optional[Dict[str, str]]]:
     """_reason, with the tools it was offered closed when the call ends
-    (ToolSet.close: a reviser's or a verifier's scripts go with it)."""
+    (ToolSet.close: a reviser's or a verifier's scripts go with it), and
+    the fallback (--with-fallback) taken when the role's model cannot
+    serve the call: its quota is used up (llm.QuotaExhausted, at once), or
+    it never answered through the retries ("unavailable"). Per call: the
+    next call goes to the role's own model first.
+
+    The call is sent again from the start, pinned to the fallback. Its
+    prompt is fitted again for the fallback's window when it is the one
+    _fit_prompt last fitted for the role on this thread; otherwise it is
+    sent as it is, and "too_large" if it does not fit. A verifier's call
+    is not sent on: VerifierFailover restarts its whole check on the
+    fallback, since a certificate names one model. With no fallback — or
+    the role already on it — a spent quota is raised to the command and a
+    silent server is "unavailable", as without the flag."""
+    toolsets = [tools]
     try:
-        return _reason(ctx, system_prompt, user_prompt, role, verbose, tools)
+        m = _model_for(ctx, role)
+        try:
+            result = _reason(ctx, system_prompt, user_prompt, role, verbose, tools)
+        except llm.QuotaExhausted as e:
+            # Only a refusal by the role's own model fails the call over:
+            # a stage's model (compaction) fails over by itself, and one
+            # that reaches here had nothing to fall back to.
+            fallback = _fallback_for(ctx, m) if e.model in (None, m) else None
+            if fallback is None:
+                raise
+            why = f"its quota is used up ({e})"
+        else:
+            fallback = (_fallback_for(ctx, m) if result[1] == "unavailable"
+                        else None)
+            if fallback is None:
+                ctx.loop.served[role] = m
+                return result
+            why = "it did not answer through its retries"
+        if role in VERIFIER_ROLES:
+            raise VerifierFailover(fallback, f"{m.label()}: {why}")
+        ctx.ui.log(f"  {role}: {m.label()} cannot serve the call ({why}); "
+                   f"sending it to the fallback, {fallback.label()}.", verbose)
+        with pinned(ctx, {role: fallback}):
+            fitted = ctx.loop.fitted.get(role)
+            if fitted is not None and fitted[0] == user_prompt:
+                user_prompt, tools = fitted[1]()
+                toolsets.append(tools)
+            result = _reason(ctx, system_prompt, user_prompt, role, verbose, tools)
+        ctx.loop.served[role] = fallback
+        return result
     finally:
-        if tools:
-            tools.close()
+        for toolset in toolsets:
+            if toolset:
+                toolset.close()
 
 
 def _reason(
@@ -746,13 +949,16 @@ def _reason(
     works is sent exactly as it would be without the rescue.
     """
     ctx.status(role=role_label(role))
+    # The model routed to this role (llm/routing.py): every request of the
+    # call, and the budgets they are sized by, are its.
+    m = _model_for(ctx, role)
     base_system = system_prompt
     # The tools as offered, for the fold notes of a task re-sent without
     # them (tools itself is dropped when they close).
     offered_tools = tools
-    num_ctx = ctx.reasoning_options["num_ctx"]
+    num_ctx = m.num_ctx
     reserve = _reserve(num_ctx)
-    native = bool(tools) and _native_tools(ctx)
+    native = bool(tools) and _native_tools(ctx, m)
     if tools and not native:
         system_prompt = base_system + "\n\n" + tools.json_protocol()
     # user_prompt is the task without tools: the tools' hints ride on it
@@ -774,7 +980,7 @@ def _reason(
         another lookup result before the reserve."""
         return room - reserve - _RESULT_FRAME_TOKENS < _MIN_RESULT_TOKENS
 
-    if tools and _no_lookup_room(_room(_estimate_tokens(ctx, messages), num_ctx)):
+    if tools and _no_lookup_room(_room(_estimate_tokens(m, messages), num_ctx)):
         # The task alone already reaches into the reply's reserve: no
         # lookup could fit, so none is offered — not the tools field, not
         # the protocol in the system prompt.
@@ -786,7 +992,7 @@ def _reason(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        room = _room(_estimate_tokens(ctx, messages), num_ctx)
+        room = _room(_estimate_tokens(m, messages), num_ctx)
         if room >= COMPACT_MIN_ROOM:   # else the loop's too_large says it
             ctx.ui.log(f"  {role}: closing lookups, ~{room:,} tokens left for the "
                 f"answer.", verbose)
@@ -794,10 +1000,7 @@ def _reason(
     # takes them away says so. max_rounds: the rounds it may spend.
     offered = bool(tools)
     max_rounds = tools.max_rounds() if tools else ctx.settings.max_tool_rounds
-    options: Dict[str, Any] = {
-        **ctx.reasoning_options,
-        "temperature": TEMPERATURES[role],
-    }
+    options: Dict[str, Any] = _call_options(m)
     # The tool calls made and their results, as text: what a compaction
     # rescue folds into the task it re-sends.
     tool_notes: List[str] = []
@@ -805,7 +1008,7 @@ def _reason(
     # The reasoning trace of each native tool-call turn, by the turn's index
     # in messages: sent with it only while echo is on.
     traces: Dict[int, Dict[str, Any]] = {}
-    echo = ctx.model.echo_reasoning
+    echo = m.echo_reasoning
     # switched: the traces have been switched on or off this call, the
     # rescue's first step; probing: switched on, and not yet shown to help.
     # folded: the tool conversation has been folded, its second.
@@ -820,9 +1023,9 @@ def _reason(
 
     def _used(outgoing: List[Dict[str, Any]]) -> int:
         if measured is None:
-            return _estimate_tokens(ctx, outgoing)
+            return _estimate_tokens(m, outgoing)
         tokens, sent = measured
-        return tokens + (_estimate_tokens(ctx, outgoing[sent:])
+        return tokens + (_estimate_tokens(m, outgoing[sent:])
                          if len(outgoing) > sent else 0)
 
     def _spare() -> int:
@@ -834,7 +1037,7 @@ def _reason(
         """The characters the next tool result may take: the room left
         before the reserve, less the result's framing."""
         return int((_spare() - _RESULT_FRAME_TOKENS)
-                   * ctx.model.backend.chars_per_token())
+                   * m.backend.chars_per_token())
 
     def _room_line() -> str:
         """The line every tool result ends with: the room the prompt has
@@ -962,17 +1165,17 @@ def _reason(
                 # Always offering: a native call whose lookups are closed
                 # has been folded above, and sends no tools.
                 reply = _chat(
-                    ctx,
+                    ctx, m,
                     outgoing, think=True, schema=None, options=options,
                     tools=tools.specs(),
                 )
             else:
-                reply = _chat(ctx, messages, think=True, schema=None,
+                reply = _chat(ctx, m, messages, think=True, schema=None,
                               options=options)
         except llm.ToolsUnsupported as e:
             # The server takes no native tools: the JSON protocol from here
             # on, for this call and every later one. Not an attempt spent.
-            _disable_native_tools(ctx, str(e), verbose)
+            _disable_native_tools(ctx, m, str(e), verbose)
             native = False
             measured = None
             system_prompt = base_system + "\n\n" + tools.json_protocol()
@@ -1008,10 +1211,11 @@ def _reason(
         hit_ceiling = reply.truncated
         if probing and (reply.tool_calls or content.strip()):
             probing = False
-            if not ctx.model.echo_reasoning:
-                ctx.model.echo_reasoning = True
-                ctx.ui.log("The model needs its reasoning sent back with its tool "
-                    "calls; sending it for the rest of the run.", verbose)
+            if not m.echo_reasoning:
+                m.echo_reasoning = True
+                ctx.ui.log(f"{m.label()} needs its reasoning sent back with "
+                    f"its tool calls; sending it for the rest of the run.",
+                    verbose)
 
         if native and reply.tool_calls and not hit_ceiling:
             if offer:
@@ -1137,7 +1341,45 @@ def extract(
     disables reasoning outright for this call, because on llama.cpp it is
     thinking that voids the grammar. That is the backend's problem, not
     this function's.
+
+    The call goes to the model the extract stage is routed to, role's by
+    default (llm/routing.py). With --with-fallback it is sent once more to
+    the fallback when that model's quota is used up or it never answered;
+    an extraction records nothing, so it needs no restart of anything.
     """
+    m = _stage_model(ctx, "extract", role)
+    try:
+        result, answered = _extract(ctx, m, instruction, source_text, schema,
+                                    role, verbose)
+    except llm.QuotaExhausted as e:
+        fallback = _fallback_for(ctx, m)
+        if fallback is None:
+            raise
+        why = f"its quota is used up ({e})"
+    else:
+        fallback = None if answered else _fallback_for(ctx, m)
+        if fallback is None:
+            return result
+        why = "it did not answer through its retries"
+    ctx.ui.log(f"  {role} extraction: {m.label()} cannot serve it ({why}); "
+               f"sending it to the fallback, {fallback.label()}.", verbose)
+    # The source fitted the extraction model's window, not necessarily the
+    # fallback's: one that leaves no room for the copy is not sent.
+    room = _headroom(fallback, [{"content": source_text}])
+    if room < COMPACT_MIN_ROOM:
+        ctx.ui.log(f"  {role} extraction: the text leaves only ~{room} tokens "
+                   f"of {fallback.label()}'s window; not sending it.", verbose)
+        return {}
+    return _extract(ctx, fallback, instruction, source_text, schema, role,
+                    verbose)[0]
+
+
+def _extract(
+    ctx, m: "llm.Model", instruction: str, source_text: str,
+    schema: Dict[str, Any], role: str, verbose: bool,
+) -> Tuple[Dict[str, Any], bool]:
+    """extract() on m: (the object, whether the server ever answered)."""
+    answered = False
     system = (
         "You convert a mathematician's written work into JSON. Copy the "
         "content faithfully: do not add claims, do not evaluate the "
@@ -1155,10 +1397,13 @@ def extract(
     # reclaims JSON from free-form output on the fallback path. The conflict
     # is a property of the model, not of one call, so once
     # discovered it's remembered for the rest of the run.
-    use_schema = not ctx.model.schema_mode_broken
+    use_schema = not m.schema_mode_broken
 
     for attempt in settings_mod.counts(ctx.settings.llm_max_retries, start=1):
-        options = dict(ctx.extract_options)
+        options = _call_options(m)
+        greedy = m.backend.accepts_sampling and not m.greedy_refused
+        if greedy:
+            options.update(_GREEDY_OPTIONS)
         call_messages = messages
         if not use_schema:
             # Free-form mode: the schema moves from grammar to prompt.
@@ -1176,20 +1421,45 @@ def extract(
         # window. That may be less than the source itself — the source plus a
         # copy of it do not always both fit — which is window physics, not a
         # budget to be nudged.
-        options["num_predict"] = _headroom(ctx, call_messages, options["num_ctx"])
+        options["num_predict"] = _headroom(m, call_messages)
 
         content: Optional[str] = None
         try:
             # think is left as None throughout: whichever server we are on,
             # this stage wants the grammar honoured, and the backend knows
             # what that costs. No new mathematics happens here.
-            reply = _chat(
-                ctx,
-                call_messages,
-                think=None,
-                schema=schema if use_schema else None,
-                options=options,
-            )
+            try:
+                reply = _chat(
+                    ctx, m,
+                    call_messages,
+                    think=None,
+                    schema=schema if use_schema else None,
+                    options=options,
+                )
+            except requests.HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if not (greedy and status in _REJECTED_STATUSES):
+                    raise
+                # The server refused the request, perhaps for the greedy
+                # fields (a reasoning model that takes no temperature):
+                # sent again without them, in this same attempt, and never
+                # sent to this model again. Greedy sampling is a
+                # nicety; it never costs the extraction.
+                m.greedy_refused = True
+                ctx.ui.log(f"  {role} extraction: {m.label()} refused the "
+                           f"request (HTTP {status}); sending it without the "
+                           f"greedy sampling fields, for the rest of the run.",
+                           verbose)
+                options = {k: v for k, v in options.items()
+                           if k not in _GREEDY_OPTIONS}
+                reply = _chat(
+                    ctx, m,
+                    call_messages,
+                    think=None,
+                    schema=schema if use_schema else None,
+                    options=options,
+                )
+            answered = True
             content = reply.content or ""
             if reply.truncated:
                 ctx.ui.log(f"  {role} extraction hit the token ceiling.", verbose)
@@ -1207,10 +1477,11 @@ def extract(
                     verbose,
                 )
                 use_schema = False
-                ctx.model.schema_mode_broken = True
+                m.schema_mode_broken = True
                 continue
 
-            parsed = json.loads(clean_json_text(content))
+            parsed = _loads(clean_json_text(
+                content, expect=schema.get("required")))
             if not isinstance(parsed, dict):
                 # A bare value (a string, a list of strings) is no answer
                 # to an object schema; every caller reads the result with
@@ -1221,8 +1492,23 @@ def extract(
                     f"as no answer.",
                     verbose,
                 )
-                return {}
-            return parsed
+                return {}, True
+            required = [k for k in schema.get("required") or ()]
+            if required and not any(k in parsed for k in required):
+                # An object, but not the answer: none of the fields asked
+                # for. Asked again, like an unreadable reply.
+                ctx.ui.log(f"  {role} extraction returned an object without "
+                           f"the fields asked for (attempt {attempt}).", verbose)
+                messages = messages[:2] + [
+                    {"role": "assistant", "content": content[:1500]},
+                    {"role": "user", "content": (
+                        f"That object has none of the fields asked for "
+                        f"({', '.join(required)}). Reply with ONLY the JSON "
+                        f"object, with those fields, no fences and no "
+                        f"commentary.")},
+                ]
+                continue
+            return parsed, True
         except (requests.RequestException, KeyError, TypeError) as e:
             ctx.ui.log(f"  {role} extraction transport error (attempt {attempt}): {e}", verbose)
             if settings_mod.below(attempt, ctx.settings.llm_max_retries):
@@ -1244,7 +1530,7 @@ def extract(
                 ]
 
     ctx.ui.log(f"  {role} extraction failed after all retries.", verbose)
-    return {}
+    return {}, answered
 
 
 def _wait_for_server(ctx, role: str, should_stop, verbose: bool) -> bool:

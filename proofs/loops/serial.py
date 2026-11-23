@@ -338,7 +338,8 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
                     continue
 
                 # planner.md demands raw JSON output; extraction is only the fallback.
-                planner_res = parse_json_or_none(plan_text)
+                planner_res = parse_json_or_none(
+                    plan_text, expect=("candidate_lemmas",))
                 if planner_res is None:
                     planner_res = extract(
                         ctx,

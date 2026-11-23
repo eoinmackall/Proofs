@@ -17,7 +17,8 @@ a small surface:
 Everything that differs between servers — which endpoint, which fields a
 request may carry, how thinking is switched off, how a server says a
 prompt is too long or that it takes no tools — lives behind it, in the
-implementation (one, for now: openai_compat.py). The errors a caller acts
+implementations: openai_compat.py (llama.cpp and the OpenAI-compatible
+APIs) and anthropic.py (the Anthropic Messages API). The errors a caller acts
 on are the ones here: ContextLengthError (a mis-sized window: stop, don't
 retry) and ToolsUnsupported (switch to the JSON tool protocol).
 """
@@ -41,15 +42,29 @@ class Profile:
     context_limit: int = 65536     # ceiling of the server's KV cache (tokens).
                                    # --num-ctx must fit inside this.
     probe_ok: bool = False         # False => everything below is a guess
+    # Whether context_limit was read off the server (llama.cpp's /props,
+    # the Anthropic Models API) rather than a default: an explicit window
+    # is clamped to a probed one only (llm.connect).
+    context_probed: bool = False
     # Transport facts, set by probe(). is_llama_cpp decides the option set;
-    # key_verified / auth_error report how a supplied API key was received.
+    # key_verified reports that a supplied API key was accepted, and error
+    # why the server cannot serve this model at all (unreachable, a wrong
+    # base URL, a key rejected or missing, an unknown model): every call
+    # would fail the same way, so llm.connect stops the command on it.
     # backend is what --backend asked for, probed_llama_cpp what the /props
     # probe found, is_llama_cpp the two reconciled — chat() reads only that.
     backend: str = "auto"
     probed_llama_cpp: bool = False
     is_llama_cpp: bool = False
     key_verified: bool = False
-    auth_error: Optional[str] = None
+    error: Optional[str] = None
+    # Whether the server's model list names the requested model (None: not
+    # checked — a llama-server serves whatever it loaded, whatever the
+    # request names); a few of the names it does list, for the warning, and
+    # how many it lists in all.
+    model_listed: Optional[bool] = None
+    listed: List[str] = field(default_factory=list)
+    listed_count: int = 0
     # Calibration seed, not capability: how many characters of prompt text
     # one token of context roughly buys. probe() seeds the backend's running
     # estimate with it (Backend.chars_per_token), which note_usage() revises
@@ -61,9 +76,8 @@ class Profile:
 # There is deliberately no per-model sampling table here. The sampler values
 # a model's card recommends (top_k, top_p, ...) cannot be probed off the
 # server, but rather than hardcode a handful we let a model run on its own
-# card and defaults, and only the per-call options the loops build
-# (Context.reasoning_options, Context.extract_options) are sent on top of the
-# server's own. num_predict is the same idea — a per-call budget sized by
+# card and defaults: the loops send no sampling field unless a model's entry
+# sets its temperature (loops/reasoning.py, _call_options). num_predict is the same idea — a per-call budget sized by
 # the workload (loops/reasoning.py), not a model property.
 
 
@@ -84,12 +98,28 @@ class ContextLengthError(RuntimeError):
                  prompt_tokens: Optional[int] = None) -> None:
         self.server_limit = server_limit
         self.prompt_tokens = prompt_tokens
+        # The routing.Model whose server refused the call, set by the
+        # caller that knows it (loops/reasoning.py, _chat); None otherwise.
+        self.model: Any = None
         super().__init__(
             f"server rejected the call: its context window is "
             f"{server_limit} tokens"
             + (f" but the prompt alone is {prompt_tokens} tokens"
                if prompt_tokens is not None else "")
         )
+
+
+class QuotaExhausted(RuntimeError):
+    """The API refused a call because the account's quota, credit or spend
+    limit is used up — not a rate limit, which passes: waiting does not
+    bring this one back, so the call is not retried. The loops fail it
+    over to the fallback model (--with-fallback) or stop the command.
+    model is the routing.Model whose API refused, set by the caller that
+    knows it (loops/reasoning.py, _chat)."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.model: Any = None
 
 
 @dataclass
@@ -105,6 +135,9 @@ class ToolCall:
 # The keys a reply's reasoning trace can come under, in the order chat()
 # reads them (see the note there).
 REASONING_KEYS = ("reasoning_content", "reasoning")
+# The key an Anthropic reply's whole content rides under on a tool-call turn
+# (anthropic.py): its thinking blocks must go back unchanged.
+ANTHROPIC_CONTENT_KEY = "anthropic_content"
 
 
 def reasoning_chars(message: Dict[str, Any]) -> int:
@@ -112,7 +145,11 @@ def reasoning_chars(message: Dict[str, Any]) -> int:
     server (reason() sends it with a tool-call turn when the model needs
     it): prompt text, so a prompt-size count must include it. 0 for every
     other message."""
-    return sum(len(str(message[k])) for k in REASONING_KEYS if message.get(k))
+    n = sum(len(str(message[k])) for k in REASONING_KEYS if message.get(k))
+    for block in message.get(ANTHROPIC_CONTENT_KEY) or ():
+        if isinstance(block, dict) and block.get("type") == "thinking":
+            n += len(str(block.get("thinking") or ""))
+    return n
 
 
 @dataclass
@@ -145,6 +182,14 @@ class Backend(abc.ABC):
 
     #: The model name requests carry (--model).
     model: str
+    #: Whether a reply's reasoning must go back with its tool calls from
+    #: the first round (Model.echo_reasoning starts from it): the Anthropic
+    #: API's thinking blocks. Elsewhere reason() learns it when needed.
+    echoes_reasoning: bool = False
+    #: Whether the API takes sampling fields at all (temperature,
+    #: penalties): not the Anthropic API's current version, which refuses
+    #: them on every model, so extract() sends it no greedy override.
+    accepts_sampling: bool = True
 
     def __init__(self) -> None:
         self._chars_per_token = 4.0
@@ -174,6 +219,11 @@ class Backend(abc.ABC):
         """Whether recorded_model() names what the server runs, rather
         than falling back to the --model request before the server has
         said."""
+
+    def effort_error(self, effort: str) -> Optional[str]:
+        """Why the model does not take this effort level, as the probe
+        read it; None when it does, or when nothing was probed."""
+        return None
 
     def seed_chars_per_token(self, value: float) -> None:
         """Start the running estimate from a model's calibrated value."""

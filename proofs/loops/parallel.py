@@ -60,7 +60,9 @@ from .prompts import (
 )
 from .citation_checks import recover_checks
 from .proof import run_proof_loop
-from .reasoning import Cancelled, _fail_context_length, extract, reason
+from .reasoning import (
+    Cancelled, _fail_context_length, _fail_quota, extract, reason,
+)
 from .schemas import PARALLEL_LEMMA_GENERATOR_SCHEMA, PARALLEL_PLANNER_SCHEMA
 
 LOOP_RESTART_DELAY = 10
@@ -372,7 +374,11 @@ class ParallelState:
         self.ctx = ctx
         self.conjecture = conjecture
         self.verbose = verbose
-        self.batch = batch_size(ctx.settings.num_ctx, len(loop_ids))
+        # Sized by the window of the model the generator is routed to:
+        # the batch is its call's to write.
+        self.batch = batch_size(
+            ctx.models.for_role("parallel_lemma_generator").num_ctx,
+            len(loop_ids))
         self.buffer = LemmaBuffer(len(loop_ids) + 2 * self.batch,
                                   marked_cap=self.ctx.code.loops)
         self.buffer.on_change = self.write_checkpoint
@@ -1081,7 +1087,8 @@ def _plan_round(
         )
         state.hold_until_changed("planner", inputs, epoch)
         return False
-    plan_res = parse_json_or_none(text) if text else None
+    plan_res = (parse_json_or_none(text, expect=("plan_summary", "priorities"))
+                if text else None)
     if plan_res is None and text:
         plan_res = extract(
             ctx,
@@ -1210,7 +1217,8 @@ def _generate_round(
         )
         state.hold_until_changed("generator", inputs)
         return
-    batch = parse_json_or_none(text) if text else None
+    batch = (parse_json_or_none(text, expect=("candidate_lemmas",))
+             if text else None)
     if batch is None and text:
         batch = extract(
             ctx,
@@ -1782,6 +1790,11 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
                     # A mis-sized window, not a crash: every restart would
                     # 400 the same way.
                     _fail_context_length(lctx, e, stop=state.request_stop)
+                    return
+                except llm.QuotaExhausted as e:
+                    # A spent quota with nothing to fall back to: every
+                    # restart would be refused the same way.
+                    _fail_quota(lctx, e, stop=state.request_stop)
                     return
                 except Exception as e:
                     # Logged unconditionally: a crash the operator must see

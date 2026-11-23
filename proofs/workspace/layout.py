@@ -8,8 +8,9 @@ directory to the first one with the marker (find_root()), the way git finds
 Layout:
 
     .proofs                        <- the marker: "format = 2"
-    .proofs-local.json             <- gitignored: this machine's code limits (limits.py) and run
-                                      settings (settings.py), written by init
+    .proofs-local.json             <- gitignored: this machine's code limits (limits.py), run
+                                      settings (settings.py) and model routes (llm/routing.py),
+                                      written by init
     .gitignore                     <- holds the proofs block (GITIGNORE_RULES)
     conjectures/
       algebra_example/
@@ -25,7 +26,9 @@ Layout:
         prover.md                  <- optional per-conjecture prompt override
         flake.nix, flake.lock      <- optional, committed: the maintainer's code tools
         tools.lock                 <- committed with them: the tools runs may use (codetools.py)
-        limits.json                <- optional, gitignored: this machine's limits here (limits.py)
+        .proofs-local.json         <- optional, gitignored: this machine's settings, limits and model
+                                      routes for this conjecture, over the workspace's (settings.py)
+        limits.json                <- optional, gitignored: the code limits alone, the older name (limits.py)
         scratch/<user_id>/<run_id>/  <- gitignored: the scripts of a run's live proof loops (run_code/files.py)
         code/<user_id>/<run_id>/   <- committed: the scripts cited proofs rest on (computations.py)
       some_other_problem/
@@ -173,7 +176,9 @@ conjectures/*/computations/*/*/*.tmp
 conjectures/*/refutations/.*.tmp
 conjectures/*/references.md.*.tmp
 # Code tools (codetools.py, execution.py): every execution's script and
-# log, and the per-machine limits — the machine's, never the conjecture's.
+# log, and the per-machine limits and settings — the machine's, never the
+# conjecture's. .proofs-local.json, unanchored, covers the workspace's and
+# every conjecture's.
 conjectures/*/scratch/
 conjectures/*/limits.json
 .proofs-local.json
@@ -266,7 +271,8 @@ def init(directory: Path) -> Tuple[Path, bool]:
     local = root / limits.LOCAL_FILENAME
     if not local.exists():
         local.write_text(
-            json.dumps({**limits.DEFAULTS, **settings.DEFAULTS}, indent=2)
+            json.dumps({**limits.DEFAULTS, **settings.DEFAULTS,
+                        **{k: {} for k in settings.ROUTING_KEYS}}, indent=2)
             + "\n",
             encoding="utf-8",
         )
@@ -364,6 +370,32 @@ def agents_dir() -> Path:
     return Path(__file__).resolve().parents[1] / AGENTS_DIR
 
 
+def conjecture_dir(name: str, project_root: Optional[Path] = None) -> Path:
+    """The absolute directory of the conjecture name names, in any form
+    resolve() takes; ConjectureNotFound when it is not there or has no
+    conjecture.md. For what is read before the run's paths are (the
+    conjecture's .proofs-local.json)."""
+    stripped = name.rstrip("/\\") or name
+    if is_bare_name(name):
+        if project_root is None:
+            raise NotInWorkspace()
+        guess = project_root / CONJECTURES_ROOT / stripped
+    else:
+        guess = Path(stripped)
+    if not guess.is_dir():
+        raise ConjectureNotFound(
+            f"No conjecture directory {name!r}. "
+            f"Available: {', '.join(available(project_root)) or '(none)'}"
+        )
+    root = guess.resolve()
+    if not (root / CONJECTURE_FILENAME).is_file():
+        raise ConjectureNotFound(
+            f"{root} has no {CONJECTURE_FILENAME}. "
+            f"Available: {', '.join(available(project_root)) or '(none)'}"
+        )
+    return root
+
+
 def resolve(
     name: str,
     user_id: str,
@@ -388,27 +420,8 @@ def resolve(
     name is there, else from the defaults shipped in the package — see
     agents_dir().
     """
-    stripped = name.rstrip("/\\") or name
-    if is_bare_name(name):
-        if project_root is None:
-            raise NotInWorkspace()
-        guess = project_root / CONJECTURES_ROOT / stripped
-    else:
-        guess = Path(stripped)
-    if guess.is_dir():
-        root = guess.resolve()
-    else:
-        raise ConjectureNotFound(
-            f"No conjecture directory {name!r}. "
-            f"Available: {', '.join(available(project_root)) or '(none)'}"
-        )
-
+    root = conjecture_dir(name, project_root)
     conjecture = root / CONJECTURE_FILENAME
-    if not conjecture.is_file():
-        raise ConjectureNotFound(
-            f"{root} has no {CONJECTURE_FILENAME}. "
-            f"Available: {', '.join(available(project_root)) or '(none)'}"
-        )
     # load_file() returns "" for a missing file, which run_loop() reports as
     # "conjecture is empty" — true but misleading. Checking here means a typo
     # in the directory name says so.

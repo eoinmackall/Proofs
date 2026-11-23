@@ -16,8 +16,8 @@ from ..core.dag import load_file, new_lemma_id
 from ..tools.run_code import computations
 from . import strategies
 from .reasoning import (
-    COMPACT_MIN_ROOM, _estimate_tokens, _lookup_room, _native_tools, _reserve,
-    _room,
+    COMPACT_MIN_ROOM, _estimate_tokens, _lookup_room, _model_for,
+    _native_tools, _reserve, _room,
 )
 
 # request a server accepted and then dropped must not stall the run longer.
@@ -255,7 +255,10 @@ def _fit_prompt(
     — the conjecture, the references block, the lemma or proof being
     worked on), since then something other than the window is too large.
     """
-    num_ctx = ctx.reasoning_options["num_ctx"]
+    # The window and the chars/token estimate of the model role is routed
+    # to, or pinned to (a fallback).
+    m = _model_for(ctx, role)
+    num_ctx = m.num_ctx
     limit = num_ctx - _reserve(num_ctx) - _lookup_room(num_ctx)
 
     def estimate(user_prompt: str, tools: Optional["tools_mod.ToolSet"]) -> int:
@@ -263,9 +266,9 @@ def _fit_prompt(
         if tools:
             # What reason() adds while it offers the tools: the specs or the
             # protocol, and the hints on the task.
-            extra = (json.dumps(tools.specs()) if _native_tools(ctx)
+            extra = (json.dumps(tools.specs()) if _native_tools(ctx, m)
                      else tools.json_protocol()) + tools.prompt_hints()
-        return _estimate_tokens(ctx, [
+        return _estimate_tokens(m, [
             {"content": system_prompt}, {"content": user_prompt},
             {"content": extra},
         ])
@@ -287,6 +290,11 @@ def _fit_prompt(
         sizes = tuple(n // 2 for n in sizes)
         user_prompt, tools = build_with(sizes)
         used = estimate(user_prompt, tools)
+    # How to fit this prompt again, should its call fail over to a model
+    # with another window (reasoning.reason): kept with the prompt it
+    # fitted, so it is used only for exactly that prompt.
+    ctx.loop.fitted[role] = (user_prompt, lambda: _fit_prompt(
+        ctx, role, system_prompt, build, verbose, parts))
     if sizes != configured:
         ctx.ui.log(
             f"  {role}: showing at most {sum(sizes)} lemmas instead of "
@@ -298,7 +306,7 @@ def _fit_prompt(
         # Only reached with every size at 0: the room limit is below
         # half the window, so the loop above ran to the end.
         sized = {"the system prompt": system_prompt, **(parts or {})}
-        ratio = max(ctx.model.backend.chars_per_token(), 1.0)
+        ratio = max(m.backend.chars_per_token(), 1.0)
         largest = sorted(
             ((label, int(len(text) / ratio)) for label, text in sized.items()
              if len(text) >= ratio),

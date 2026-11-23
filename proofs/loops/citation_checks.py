@@ -10,7 +10,10 @@ from ..core.audits import Check
 from ..core.dag import Dag, writer
 from ..core.interrupts import _commit_section
 from ..validity.steps import verifier_steps
-from .reasoning import _recorded_model, _same_model
+from .reasoning import (
+    VERIFIER_ROLE, VERIFIER_ROLES, VerifierFailover, _recorded_model,
+    _requested_model, _same_model, pinned,
+)
 from .verify import review_stored
 
 
@@ -34,26 +37,45 @@ def _review_one(ctx, dag: Dag, check: Check, checkpoint: Callable[[], None],
     if objections != check.get("objections", {}):
         check["verdicts"] = []  # agents must have read the same objections
     check["objections"] = objections
-    kept = [v for v in check["verdicts"] if v["decision"] == "accept"
-            and v["hash"] == check["hash"] and _same_model(ctx, v["model"], v["requested"])]
-    check["verdicts"] = kept
     steps = set(verifier_steps(dag.lemmas[lid]))
+    # A verifier's call that fails over (--with-fallback) restarts the
+    # check on the fallback: the verdicts the verifiers' own model gave no
+    # longer match the model in use, and are dropped by the filter below,
+    # so their verifiers run again there. The pins go when the check does.
+    with pinned(ctx, {}):
+        while True:
+            kept = [v for v in check["verdicts"] if v["decision"] == "accept"
+                    and v["hash"] == check["hash"]
+                    and _same_model(ctx, VERIFIER_ROLE, v["model"], v["requested"])]
+            check["verdicts"] = kept
 
-    def progress(agent: str, decision: str, why: str) -> None:
-        with _commit_section(ctx):  # the received verdict and its checkpoint belong together
-            model = _recorded_model(ctx)
-            kept.append({"agent": agent, "model": model, "requested": ctx.model.name,
-                         "decision": decision, "justification": why, "hash": check["hash"]})
-            if decision == "reject":
-                check.update(outcome="rejected", justification=why, model=model)
-            elif steps <= {v["agent"] for v in kept}:
-                check.update(outcome="accepted", model=model)
-            checkpoint()
+            def progress(agent: str, decision: str, why: str,
+                         kept: list = kept) -> None:
+                with _commit_section(ctx):  # the received verdict and its checkpoint belong together
+                    model = _recorded_model(ctx, VERIFIER_ROLE)
+                    kept.append({"agent": agent, "model": model,
+                                 "requested": _requested_model(ctx, VERIFIER_ROLE),
+                                 "decision": decision, "justification": why, "hash": check["hash"]})
+                    if decision == "reject":
+                        check.update(outcome="rejected", justification=why, model=model)
+                    elif steps <= {v["agent"] for v in kept}:
+                        check.update(outcome="accepted", model=model)
+                    checkpoint()
 
-    return review_stored(
-        ctx, dag, dag.references, lid, conjecture, verifier_sys, verbose, on_file,
-        accepted=[v["agent"] for v in kept], on_verdict=progress, should_stop=interrupted,
-    )
+            try:
+                return review_stored(
+                    ctx, dag, dag.references, lid, conjecture, verifier_sys, verbose, on_file,
+                    accepted=[v["agent"] for v in kept], on_verdict=progress,
+                    should_stop=interrupted,
+                )
+            except VerifierFailover as e:
+                ctx.ui.log(
+                    f"  A verifier's model cannot serve the check of {lid} "
+                    f"({e.why}); running it again on the fallback, "
+                    f"{e.model.label()}.",
+                    verbose,
+                )
+                ctx.loop.pinned.update({role: e.model for role in VERIFIER_ROLES})
 
 
 def run_checks(ctx, state: dict[str, Any], save: Callable[[dict[str, Any]], None],
