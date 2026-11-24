@@ -212,9 +212,11 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
         if x - 20 - 0.55 * LABEL * len(text) >= SIDE / 2:
             ax.text(x - 20, y, text, ha="right", va="center", **style)
         else:
-            # No room to its left (the strip is the widest row): above it.
-            ax.text(x - rad[first], y - rad[first] - 10, text, ha="left",
-                    va="bottom", **style)
+            # No room to its left (the strip is the widest row): under it,
+            # left-aligned with its first lemma — nothing else is ever
+            # drawn below the strip, and BOTTOM leaves room.
+            ax.text(max(SIDE / 2, x - rad[first]), y + rad[first] + 10, text,
+                    ha="left", va="top", **style)
 
     y = 50.0
     for col, text, mark in entries:

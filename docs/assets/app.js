@@ -262,7 +262,61 @@
     });
   }
 
+  /* Manual Light / Dark Theme Toggle -------------------------------------- */
+  const THEME_KEY = "proofs-docs-theme";
+
+  function initThemeToggle() {
+    const btn = document.getElementById("theme-toggle");
+    if (!btn) return;
+    const mq = window.matchMedia("(prefers-color-scheme: light)");
+
+    function effective() {
+      const explicit = document.documentElement.dataset.theme;
+      if (explicit === "light" || explicit === "dark") return explicit;
+      return mq.matches ? "light" : "dark";
+    }
+
+    function syncLabel() {
+      const cur = effective();
+      const label = cur === "dark" ? "Switch to light theme" : "Switch to dark theme";
+      btn.setAttribute("aria-label", label);
+      btn.setAttribute("title", label);
+    }
+
+    function syncFrame(theme) {
+      const frame = document.getElementById("dag-frame");
+      if (!frame || frame.hidden) return;
+      try {
+        const fdoc = frame.contentDocument;
+        if (!fdoc) return;
+        const fcur = fdoc.documentElement.dataset.theme || (mq.matches ? "light" : "dark");
+        const fbtn = fdoc.getElementById("theme");
+        if (fbtn && fcur !== theme) fbtn.click();
+      } catch {
+        /* cross-origin or not loaded yet */
+      }
+    }
+
+    btn.addEventListener("click", () => {
+      const next = effective() === "dark" ? "light" : "dark";
+      document.documentElement.dataset.theme = next;
+      try {
+        localStorage.setItem(THEME_KEY, next);
+      } catch {
+        /* storage unavailable */
+      }
+      syncLabel();
+      syncFrame(next);
+    });
+
+    if (mq.addEventListener) {
+      mq.addEventListener("change", syncLabel);
+    }
+    syncLabel();
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
+    initThemeToggle();
     initSidebar();
     initSearch();
     initCopyButtons();

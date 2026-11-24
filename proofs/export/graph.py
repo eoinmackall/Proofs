@@ -63,19 +63,22 @@ SWEEPS = 8
 # The categorical slots, in this order. Users past the eighth share the
 # "other" colour rather than a generated hue. "light" and "dark" are the
 # dataviz reference palette; the two "proofs" palettes start from the
-# docs' cerulean (#2C639E), rose (#B8305F / #F04D86), green and amber and
-# were stepped until they pass the same checks (lightness band, chroma
-# floor, adjacent-pair CVD separation >= 8, contrast >= 3:1) against the
-# docs' surfaces, #121925 and #FFFFFF. The page's stylesheet
+# docs' cerulean (#2C639E), rose (#B8305F / #F04D86) and green, with the
+# docs' cream for the third slot, and were stepped until they pass the
+# adjacent-pair CVD separation check (>= 8) against the docs' surfaces,
+# #121925 and #FFFFFF. The cream is a deliberate exception to the
+# lightness band and chroma floor (it is pale and near-neutral by
+# design), and on white (proofs-light) it is a deeper sand at 2.2:1, the
+# palest that still reads as a node. The page's stylesheet
 # (page/graph.css) carries the same values: change both together.
 CATEGORICAL = {
     "light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
               "#e87ba4", "#008300", "#4a3aa7", "#e34948"],
     "dark": ["#3987e5", "#d95926", "#199e70", "#c98500",
              "#d55181", "#008300", "#9085e9", "#e66767"],
-    "proofs": ["#3B7AC0", "#E0457D", "#BE8428", "#1FA67E",
+    "proofs": ["#3B7AC0", "#E0457D", "#E6D8B8", "#1FA67E",
                "#8C6FE0", "#2FA3C4", "#E5683B", "#B85CC9"],
-    "proofs-light": ["#2C639E", "#C2386A", "#A87316", "#16936A",
+    "proofs-light": ["#2C639E", "#C2386A", "#C4AE80", "#16936A",
                      "#6B4FD0", "#1F86A6", "#D2582A", "#A04AB5"],
 }
 OTHER = {"light": "#898781", "dark": "#898781",

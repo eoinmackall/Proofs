@@ -23,8 +23,7 @@
   --hl: rgba(11, 11, 11, 0.85);
   --settle: #0b0b0b;
   --chip: #f0efec;
-  --on: #0b0b0b;
-  --on-ink: #fcfcfb;
+  --pressed: #e2e1dc;
   --u0: #2a78d6; --u1: #eb6834; --u2: #1baf7a; --u3: #eda100;
   --u4: #e87ba4; --u5: #008300; --u6: #4a3aa7; --u7: #e34948;
   --other: #898781;
@@ -44,8 +43,7 @@
   --hl: rgba(255, 255, 255, 0.85);
   --settle: #ffffff;
   --chip: #2c2c2a;
-  --on: #ffffff;
-  --on-ink: #1a1a19;
+  --pressed: #3b3b38;
   --u0: #3987e5; --u1: #d95926; --u2: #199e70; --u3: #c98500;
   --u4: #d55181; --u5: #008300; --u6: #9085e9; --u7: #e66767;
   --other: #898781;
@@ -65,9 +63,8 @@
   --hl: rgba(243, 238, 228, 0.9);
   --settle: #F3EEE4;
   --chip: #1D2739;
-  --on: #2C639E;
-  --on-ink: #F3EEE4;
-  --u0: #3B7AC0; --u1: #E0457D; --u2: #BE8428; --u3: #1FA67E;
+  --pressed: #2A3852;
+  --u0: #3B7AC0; --u1: #E0457D; --u2: #E6D8B8; --u3: #1FA67E;
   --u4: #8C6FE0; --u5: #2FA3C4; --u6: #E5683B; --u7: #B85CC9;
   --other: #6F7D92;
   --shadow: 0 12px 32px rgba(2, 9, 18, 0.45);
@@ -87,9 +84,8 @@
     --hl: rgba(24, 32, 44, 0.85);
     --settle: #18202C;
     --chip: #F1EEE7;
-    --on: #2C639E;
-    --on-ink: #FFFFFF;
-    --u0: #2C639E; --u1: #C2386A; --u2: #A87316; --u3: #16936A;
+    --pressed: #E4DFD3;
+    --u0: #2C639E; --u1: #C2386A; --u2: #C4AE80; --u3: #16936A;
     --u4: #6B4FD0; --u5: #1F86A6; --u6: #D2582A; --u7: #A04AB5;
     --other: #8A93A1;
     --shadow: 0 10px 28px rgba(30, 36, 48, 0.10);
@@ -131,16 +127,16 @@ header input, header button {
 header input { width: min(320px, 60vw); }
 header button { cursor: pointer; }
 header button:hover { background: var(--chip); }
-/* The theme switch: three buttons joined, the current one filled. */
+/* The theme switch: three buttons joined, the current one a deeper shade
+   of the theme's own surface (--pressed, past the --chip hover) rather
+   than a contrasting fill, so switching changes only the shades. */
 .seg { display: inline-flex; }
 header .seg button { border-radius: 0; margin-left: -1px; }
 header .seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
 header .seg button:last-child { border-radius: 0 6px 6px 0; }
 header .seg button[aria-pressed="true"] {
-  background: var(--on);
-  border-color: var(--on);
-  color: var(--on-ink);
-  position: relative;
+  background: var(--pressed);
+  font-weight: 600;
 }
 
 main { position: relative; flex: 1; min-height: 0; }

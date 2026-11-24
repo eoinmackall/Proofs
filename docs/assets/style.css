@@ -71,10 +71,9 @@
   --step-active: linear-gradient(160deg, rgba(44, 99, 158, 0.35), rgba(184, 48, 95, 0.25));
 }
 
-/* Light theme: follows the operating system setting. The exported DAG in the
-   home-page iframe follows the same setting on its own. */
+/* Light theme: follows OS setting unless forced dark, or when manually toggled light. */
 @media (prefers-color-scheme: light) {
-  :root {
+  :root:not([data-theme="dark"]) {
     color-scheme: light;
     --bg-abyss: #F3F0EA;
     --bg: #FBFAF7;
@@ -123,7 +122,63 @@
     --script-shadow: none;
     --step-active: linear-gradient(160deg, rgba(44, 99, 158, 0.10), rgba(184, 48, 95, 0.07));
   }
+
+  :root:not([data-theme="dark"]) .theme-toggle .icon-sun { display: none; }
+  :root:not([data-theme="dark"]) .theme-toggle .icon-moon { display: block; }
 }
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg-abyss: #F3F0EA;
+  --bg: #FBFAF7;
+  --bg-elevated: #FFFFFF;
+  --bg-card: #FFFFFF;
+  --bg-hover: #F1EEE7;
+  --border: #E3DED4;
+  --border-strong: #CDC6B9;
+
+  --accent: #2C639E;
+  --accent-bright: #2C639E;
+  --accent-text: #1F5A94;
+  --accent-soft: rgba(44, 99, 158, 0.10);
+
+  --text-primary: #18202C;
+  --text-body: #2C3441;
+  --text-muted: #4F5866;
+  --text-dim: #646D7C;
+
+  --highlight-deep: #B8305F;
+  --highlight: #C2386A;
+  --highlight-text: #A42A56;
+  --highlight-soft: rgba(184, 48, 95, 0.08);
+
+  --ok: #12805B;
+  --ok-soft: rgba(18, 128, 91, 0.10);
+  --warn: #96600A;
+  --warn-soft: rgba(150, 96, 10, 0.10);
+
+  --shadow: 0 10px 28px rgba(30, 36, 48, 0.10);
+
+  --on-accent: #FFFFFF;
+  --topbar-bg: rgba(251, 250, 247, 0.90);
+  --sidebar-bg: rgba(255, 255, 255, 0.72);
+  --stat-bg: #FBFAF7;
+  --subtle-hover: rgba(0, 0, 0, 0.04);
+  --row-hover: rgba(44, 99, 158, 0.06);
+  --backdrop: rgba(20, 26, 36, 0.35);
+  --glow-rose: rgba(240, 77, 134, 0.05);
+  --glow-blue: rgba(44, 99, 158, 0.06);
+  --hero-glow-rose: rgba(240, 77, 134, 0.07);
+  --hero-glow-blue: rgba(44, 99, 158, 0.08);
+  --wordmark-start: #1B2B45;
+  --wordmark-mid: #2C639E;
+  --wordmark-end: #B8305F;
+  --script-shadow: none;
+  --step-active: linear-gradient(160deg, rgba(44, 99, 158, 0.10), rgba(184, 48, 95, 0.07));
+}
+
+:root[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+:root[data-theme="light"] .theme-toggle .icon-moon { display: block; }
 
 [hidden] {
   display: none !important;
@@ -362,6 +417,37 @@ pre code {
 
 .topbar-spacer {
   flex: 1;
+}
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background var(--transition), border-color var(--transition), color var(--transition);
+}
+
+.theme-toggle:hover {
+  background: var(--bg-hover);
+  border-color: var(--highlight);
+  color: var(--text-primary);
+}
+
+.theme-toggle svg {
+  width: 17px;
+  height: 17px;
+}
+
+.theme-toggle .icon-moon {
+  display: none;
 }
 
 .github-link {

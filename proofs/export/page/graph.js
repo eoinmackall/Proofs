@@ -136,12 +136,16 @@
     draw();
   }
 
-  // What is drawn changed (the size, the theme): render at once, and show
-  // the picture as it fills in, since the one on screen is no longer right.
+  // What is drawn changed (the size, the theme): the picture on screen is
+  // no longer right, so render the new one at once — synchronously, inside
+  // a budget of SYNC_MS, which covers all but very large graphs, so it
+  // lands in the same frame as the page's own colours. Past the budget the
+  // rest is rendered in slices, shown as it fills in.
+  const SYNC_MS = 250;
   function rerender() {
     clearTimeout(settle);
     front.view = null;
-    render(true);
+    render(true, SYNC_MS);
   }
 
   function compose() {
@@ -162,10 +166,11 @@
     c.drawImage(p.n, 0, 0, W, H);
   }
 
-  // Render the current view into the picture not on screen, a slice per
-  // frame. A move cancels it (moved()); when it completes, it goes on
-  // screen. live shows it while it fills in.
-  function render(live) {
+  // Render the current view into the picture not on screen: first as much
+  // as fits in budget milliseconds at once, then a slice per frame. A move
+  // cancels it (moved()); when it completes, it goes on screen. live shows
+  // it while it fills in.
+  function render(live, budget = 0) {
     if (job) job.cancelled = true;
     const pic = pictures[0] === front ? pictures[1] : pictures[0];
     const j = job = { pic, live, cancelled: false, phase: 0, i: 0, view: { k, tx, ty } };
@@ -174,15 +179,24 @@
       x.setTransform(1, 0, 0, 1, 0, 0);
       x.clearRect(0, 0, c.width, c.height);
     }
+    const finish = () => {
+      pic.view = j.view;
+      front = pic;
+      job = null;
+      draw();
+    };
+    if (budget > 0) {
+      const until = performance.now() + budget;
+      while (performance.now() < until && j.phase < 3) slice(j);
+      // Done: paint it now, not at the next frame.
+      if (j.phase >= 3) { finish(); compose(); drawOver(); return; }
+    }
     const step = () => {
       if (j.cancelled) return;
       const until = performance.now() + SLICE_MS;
       while (performance.now() < until && j.phase < 3) slice(j);
       if (j.phase < 3) { if (j.live) draw(); requestAnimationFrame(step); return; }
-      pic.view = j.view;
-      front = pic;
-      job = null;
-      draw();
+      finish();
     };
     requestAnimationFrame(step);
   }
@@ -344,14 +358,25 @@
       }
     }
     permanentLabels(c);
+    // The strip's caption: left of its first lemma, or, with no room there
+    // on screen (the strip is the widest row, so at the fitted view its
+    // first lemma is near the edge), under it, left-aligned with it —
+    // nothing is ever drawn below the strip, past the id labels a close
+    // zoom puts under each lemma.
     if (D.strip) {
       const first = groups[groups.length - 1][0];
-      const d = N[first];
+      const d = N[first], text = "not yet connected";
       c.font = "italic 13px system-ui, -apple-system, sans-serif";
-      c.textAlign = "right";
-      c.textBaseline = "middle";
       c.fillStyle = C.muted;
-      c.fillText("not yet connected", sx(d) - 14, sy(d));
+      if (sx(d) - 14 - c.measureText(text).width >= 8) {
+        c.textAlign = "right";
+        c.textBaseline = "middle";
+        c.fillText(text, sx(d) - 14, sy(d));
+      } else {
+        c.textAlign = "left";
+        c.textBaseline = "top";
+        c.fillText(text, Math.max(8, sx(d) - rs(d)), sy(d) + rs(d) + (COL * k >= 56 ? 20 : 8));
+      }
     }
   }
 
