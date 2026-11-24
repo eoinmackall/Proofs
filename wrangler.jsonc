@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Must match the Worker's name in the Cloudflare dashboard.
+  "name": "proofs",
+  "compatibility_date": "2026-11-01",
+  // Static-only Worker: everything is served straight from docs/.
+  "assets": {
+    "directory": "./docs",
+    // /getting-started -> getting-started.html, /examples/ -> examples/index.html, etc.
+    "html_handling": "auto-trailing-slash"
+  }
+}
