@@ -18,7 +18,8 @@ light unless --theme asks for dark, proofs (the documentation site's
 palette, its dark variant) or proofs-light (its light one): an image has no
 viewer preference to follow, so the choice is made when it is drawn. A
 lemma that settles the conjecture is ringed twice in the ink and always
-labelled with what it settles.
+labelled with what it settles; a suspended lemma (exported only with
+--suspended) is filled with the theme's red and ringed in it.
 """
 
 from __future__ import annotations
@@ -53,6 +54,9 @@ EDGE_PX = 1.2
 # A settling lemma's two rings: their offsets past its radius, and width.
 SETTLE_RINGS = (6.0, 12.0)
 SETTLE_PX = 2.6
+# A suspended lemma's red ring: its offset past its radius, and width.
+SUSPENDED_RING = 5.0
+SUSPENDED_PX = 2.4
 
 
 def _lemmas(count: int) -> str:
@@ -88,10 +92,10 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
     t = g.THEMES[theme]
     nodes = graph["nodes"]
     edges = graph["edges"]
-    # The legend: a dot and "user (n lemmas)" per colour, then the hollow
-    # ring for a suspended lemma and the double ring for a settling one,
-    # when there is one. Each entry is (colour, text, mark), mark "fill",
-    # "hollow" or "settle".
+    # The legend: a dot and "user (n lemmas)" per colour, then the red
+    # ringed dot for a suspended lemma and the double ring for a settling
+    # one, when there is one. Each entry is (colour, text, mark), mark
+    # "fill", "suspended" or "settle".
     users = graph["users"]
     shown = users[:len(g.CATEGORICAL[theme])]
     entries = [(g.colour(theme, k), f"{u['id']} ({_lemmas(u['count'])})", "fill")
@@ -100,8 +104,9 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
         rest = sum(u["count"] for u in users[len(shown):])
         entries.append((g.OTHER[theme],
                         f"{len(users) - len(shown)} other users ({_lemmas(rest)})", "fill"))
-    if any(nd["suspended"] for nd in nodes):
-        entries.append((t["ink2"], "suspended", "hollow"))
+    held_count = sum(1 for nd in nodes if nd["suspended"])
+    if held_count:
+        entries.append((t["suspended"], f"suspended ({held_count})", "suspended"))
     for kind in ("proved", "disproved"):
         if any(nd.get("settles") == kind for nd in nodes):
             entries.append((t["ink2"], g.SETTLES_TEXT[kind], "settle"))
@@ -153,12 +158,18 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
             sizes, sizes, [0] * len(nodes), units="xy",
             offsets=[(X(nd["x"]), Y(nd["y"])) for nd in nodes],
             offset_transform=ax.transData,
-            facecolors=[t["surface"] if nd["suspended"] else g.colour(theme, nd["owner"])
+            facecolors=[t["suspended"] if nd["suspended"] else g.colour(theme, nd["owner"])
                         for nd in nodes],
-            edgecolors=[g.colour(theme, nd["owner"]) if nd["suspended"] else t["surface"]
-                        for nd in nodes],
-            linewidths=[1.6 * PT if nd["suspended"] else 1.0 * PT for nd in nodes],
-            zorder=2))
+            edgecolors=t["surface"], linewidths=1.0 * PT, zorder=2))
+        held = [i for i, nd in enumerate(nodes) if nd["suspended"]]
+        if held:
+            diam = [2 * (rad[i] + SUSPENDED_RING) for i in held]
+            ax.add_collection(EllipseCollection(
+                diam, diam, [0] * len(held), units="xy",
+                offsets=[(X(nodes[i]["x"]), Y(nodes[i]["y"])) for i in held],
+                offset_transform=ax.transData, facecolors="none",
+                edgecolors=t["suspended"], linewidths=SUSPENDED_PX * PT,
+                zorder=2.5))
         settling = [i for i, nd in enumerate(nodes) if nd.get("settles")]
         if settling:
             rings = [(i, off) for i in settling for off in SETTLE_RINGS]
@@ -186,7 +197,8 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
         else:
             text = g.short_id(nd["id"]) + ("" if top_row else f" ({nd['cited_by']})")
         w = 0.62 * LABEL * len(text) + 10
-        reach = rad[i] + (SETTLE_RINGS[-1] if settles else 0.0)
+        reach = rad[i] + (SETTLE_RINGS[-1] if settles
+                          else SUSPENDED_RING if nd["suspended"] else 0.0)
         for k in range(3):
             off = reach + 12 + k * h
             y = y0 - off if top_row else y0 + off
@@ -228,10 +240,15 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
                 ax.scatter([50], [y], s=(d * PT) ** 2, zorder=3,
                            facecolors="none", edgecolors=t["settle"],
                            linewidths=1.6 * PT)
+        elif mark == "suspended":
+            # A red dot inside its red ring, as on the graph.
+            ax.scatter([50], [y], s=(LEGEND * 0.45 * PT) ** 2, zorder=3,
+                       facecolors=col, edgecolors="none")
+            ax.scatter([50], [y], s=(LEGEND * 0.85 * PT) ** 2, zorder=3,
+                       facecolors="none", edgecolors=col, linewidths=2 * PT)
         else:
             ax.scatter([50], [y], s=(LEGEND * 0.55 * PT) ** 2, zorder=3,
-                       facecolors=t["surface"] if mark == "hollow" else col,
-                       edgecolors=col, linewidths=2 * PT)
+                       facecolors=col, edgecolors=col, linewidths=2 * PT)
         ax.text(72, y, text, va="center", fontsize=LEGEND * PT,
                 family="monospace", color=t["ink"])
         y += step

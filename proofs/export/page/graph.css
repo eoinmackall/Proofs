@@ -8,7 +8,10 @@
               OS setting — the same rule the site follows.
    The --u0..--u7 slots match graph.py's CATEGORICAL, which png.py draws
    with: change both together. --settle rings a lemma that settles the
-   conjecture: the ink, never a hue, since a hue on a node means its user. */
+   conjecture: the ink, never a hue, since a hue on a node means its user.
+   --suspended is the exception: a suspended lemma (exported only with
+   --suspended) is filled and ringed in a vibrant red, whoever proved it —
+   graph.py's THEMES "suspended", which png.py draws with. */
 :root {
   color-scheme: light;
   --page: #f9f9f7;
@@ -22,6 +25,7 @@
   --wash: rgba(252, 252, 251, 0.82);
   --hl: rgba(11, 11, 11, 0.85);
   --settle: #0b0b0b;
+  --suspended: #E10600;
   --chip: #f0efec;
   --pressed: #e2e1dc;
   --u0: #2a78d6; --u1: #eb6834; --u2: #1baf7a; --u3: #eda100;
@@ -42,6 +46,7 @@
   --wash: rgba(26, 26, 25, 0.84);
   --hl: rgba(255, 255, 255, 0.85);
   --settle: #ffffff;
+  --suspended: #FF3B30;
   --chip: #2c2c2a;
   --pressed: #3b3b38;
   --u0: #3987e5; --u1: #d95926; --u2: #199e70; --u3: #c98500;
@@ -62,6 +67,7 @@
   --wash: rgba(18, 25, 37, 0.84);
   --hl: rgba(243, 238, 228, 0.9);
   --settle: #F3EEE4;
+  --suspended: #FF3B3B;
   --chip: #1D2739;
   --pressed: #2A3852;
   --u0: #3B7AC0; --u1: #E0457D; --u2: #E6D8B8; --u3: #1FA67E;
@@ -83,6 +89,7 @@
     --wash: rgba(255, 255, 255, 0.84);
     --hl: rgba(24, 32, 44, 0.85);
     --settle: #18202C;
+    --suspended: #E10600;
     --chip: #F1EEE7;
     --pressed: #E4DFD3;
     --u0: #2C639E; --u1: #C2386A; --u2: #C4AE80; --u3: #16936A;
@@ -157,7 +164,12 @@ main { position: relative; flex: 1; min-height: 0; }
 }
 #legend div { display: flex; align-items: center; gap: 8px; }
 .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
-.dot.hollow { background: transparent !important; border: 2px solid var(--ink2); }
+/* A suspended lemma: red, ringed in red with a ring of surface between. */
+.dot.suspended {
+  width: 8px; height: 8px; margin: 0 1px;
+  background: var(--suspended) !important;
+  box-shadow: 0 0 0 1.5px var(--wash), 0 0 0 3px var(--suspended);
+}
 /* A settling lemma's double ring, drawn with rings of surface between. */
 .dot.settle {
   width: 6px; height: 6px; margin: 0 4px;
@@ -224,6 +236,8 @@ main { position: relative; flex: 1; min-height: 0; }
   margin-left: 6px;
 }
 .badge.settle { border-color: var(--settle); color: var(--ink); font-weight: 600; }
+.badge.suspended { border-color: var(--suspended); color: var(--suspended); font-weight: 600; }
+#panel .why { color: var(--suspended); margin: 0; padding-left: 18px; }
 .links { display: flex; flex-wrap: wrap; gap: 4px; }
 .links button, .links span {
   font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

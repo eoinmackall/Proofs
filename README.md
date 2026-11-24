@@ -477,7 +477,7 @@ One command, twelve subcommands:
 | `proofs status DIR LEMMA_ID` | a conjecture, a lemma id | Lists the lemma's citation closure: each lemma's hash, stream file, valid certificates with how many times each was issued, and suspension; then whether the conjecture is settled. |
 | `proofs limits DIR` | a conjecture directory | Prints the [code limits](#limits) in effect on this machine and where each comes from. |
 | `proofs tools lock\|check DIR` | a conjecture directory | `lock`: the maintainer's tool — writes `tools.lock` from the conjecture's `flake.nix`. `check`: whether each declared tool is on PATH at its version, and whether the sandbox starts. See [Code tools](#code-tools-sage-python). |
-| `proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex\|html\|png [--theme THEME]` | a conjecture, an optional lemma id or user, the output directory, an optional file name, the format | Writes the DAG into OUT_DIR as a LaTeX document in dependency order, an interactive citation graph, or a static image of it. |
+| `proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex\|html\|png [--theme THEME] [--suspended]` | a conjecture, an optional lemma id or user, the output directory, an optional file name, the format | Writes the DAG into OUT_DIR as a LaTeX document in dependency order, an interactive citation graph, or a static image of it. Suspended lemmas are left out unless `--suspended` is given. |
 
 Every command works inside a **workspace**, the directory `proofs init`
 marks with a `.proofs` file. A bare `NAME` always means `conjectures/NAME`
@@ -505,7 +505,7 @@ picks what it writes:
   file that opens offline. Lemmas sit in rows by the longest citation chain
   beneath them — so everything a lemma cites is below it and everything
   citing it above — coloured by user, sized by how often they are cited,
-  hollow when suspended. A lemma that settles the conjecture (the same test
+  red and ringed in red when suspended (with `--suspended`). A lemma that settles the conjecture (the same test
   `proofs status` makes) is ringed twice, always labelled "proves the
   conjecture" or "disproves the conjecture", and badged in its side panel.
   Hovering a lemma highlights its edges and shows its
@@ -524,6 +524,14 @@ picks what it writes:
   names `dark`, `proofs` (the docs' palette, dark variant) or
   `proofs-light`. It needs matplotlib — in the Nix environment, `pip
   install '.[png]'` otherwise.
+
+[Suspended](#suspension) lemmas are left out of every format by default.
+Suspension spreads up the citations, so no exported lemma cites a lemma
+that was left out. `--suspended` includes them: the graph fills each one
+with a vibrant red and rings it in red, whoever proved it, and its side
+panel lists why it is suspended. The LaTeX document tags its heading
+"(suspended)" in red and gives the reasons under it. A suspended
+`LEMMA_ID` without `--suspended` is an error.
 
 Every run acts as a **user**, named by a `user.id` that names its streams,
 begins the ids of the lemmas it commits, and is recorded in its certificates
@@ -585,6 +593,7 @@ proofs export algebra_example alice/3f9a2c1b4d5e6f70/a41c07 --format latex -o ~/
 
 # the citation graph: interactive in a browser, or as an image
 proofs export algebra_example --format html -o ~/graphs
+proofs export algebra_example --format html --suspended -o ~/graphs
 proofs export algebra_example --format png --theme dark -o ~/graphs
 
 # start a new conjecture (conjectures/standard_d/ under the workspace

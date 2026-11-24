@@ -7,7 +7,9 @@ it, what cites it above) and shows its statement; clicking pins it in a
 side panel with its proof, what it cites and what cites it, and an option
 to highlight its full chain. Wheel or pinch zooms, dragging pans, the
 search box finds a lemma by id or hex suffix. A lemma that settles the
-conjecture is ringed twice and always labelled.
+conjecture is ringed twice and always labelled; a suspended lemma
+(exported only with --suspended) is red and ringed in red, and its panel
+says why it is suspended.
 
 Three themes, on a Light / Dark / Theme switch: neutral light, neutral
 dark, and Theme — the documentation site's palette (docs/assets/style.css),
@@ -36,7 +38,7 @@ import json
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Mapping
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 __all__ = ["THEMES", "render"]
 
@@ -108,10 +110,13 @@ def render(
     conjecture_name: str,
     scope: str,
     theme: str = "proofs",
+    suspended: Optional[Mapping[str, Sequence[str]]] = None,
 ) -> str:
     """The page for graph (graph.layout's result) with labels (graph.labelled's
     nodes), lemmas mapping each id to its node with its proof, opening in
-    theme (a THEMES key)."""
+    theme (a THEMES key). suspended maps each suspended lemma to why it is
+    suspended, for its panel."""
+    suspended = suspended or {}
     if theme not in THEMES:
         raise ValueError(f"the page's theme is one of {', '.join(THEMES)}, not {theme!r}")
     nodes = []
@@ -121,6 +126,7 @@ def render(
             "id": nd["id"], "o": nd["owner"], "row": nd["row"],
             "x": nd["x"], "y": nd["y"], "r": nd["r"], "n": nd["cited_by"],
             "s": nd["suspended"], "res": nd.get("settles"), "ext": nd["external"],
+            "why": list(suspended.get(nd["id"], ())) if nd["suspended"] else [],
             "refs": _cited_refs(node),
             "st": str(node.get("statement") or "").strip(),
             "pf": str(node.get("proof") or "").strip(),

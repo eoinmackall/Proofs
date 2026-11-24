@@ -126,6 +126,7 @@ def render(
     conjecture: str = "",
     date: Optional[str] = None,
     computations: Optional[Mapping[str, Mapping[str, Any]]] = None,
+    suspended: Optional[Mapping[str, Sequence[str]]] = None,
 ) -> str:
     """The LaTeX document of the given lemmas, in the given order.
 
@@ -144,8 +145,11 @@ def render(
     the document (another user's, in a single-user export) is shown by its
     id. references is the reference collection (references.md's objects).
     An id in order that lemmas does not hold is skipped rather than
-    rendered empty.
+    rendered empty. suspended maps each suspended lemma in order (only
+    exported with --suspended) to why it is suspended: its heading is
+    tagged "suspended" in red and the reasons are listed under it.
     """
+    suspended = suspended or {}
     position: Dict[str, int] = {}
     body: List[str] = []
     cited_code: List[str] = []
@@ -154,12 +158,17 @@ def render(
         if not isinstance(node, Mapping):
             continue
         position[lid] = i
-        body.append(f"\\section*{{Lemma {i}: \\texttt{{{tex_escape(lid)}}}}}")
+        tag = " \\suspendedtag" if lid in suspended else ""
+        body.append(f"\\section*{{Lemma {i}: \\texttt{{{tex_escape(lid)}}}{tag}}}")
         # Steps the counter the heading's number names, so \label below
         # is a real target and \ref{lem:..} prints this lemma's number.
         body.append("\\refstepcounter{lem}")
         body.append(f"\\label{{lem:{i}}}")
         body.append("")
+        if lid in suspended:
+            why = "; ".join(tex_escape(r) for r in suspended[lid]) or "suspended"
+            body.append(f"\\textcolor{{suspended}}{{\\textbf{{Suspended:}} {why}.}}")
+            body.append("")
         statement = str(node.get("statement") or "").strip()
         proof = str(node.get("proof") or "").strip()
         if statement:
@@ -223,6 +232,11 @@ def render(
         "\\usepackage{amssymb}",
         "\\usepackage{amsthm}",
         "\\usepackage[margin=2.5cm]{geometry}",
+        "\\usepackage{xcolor}",
+        "",
+        # A suspended lemma's mark (only exported with --suspended).
+        "\\definecolor{suspended}{HTML}{E10600}",
+        "\\newcommand{\\suspendedtag}{\\textcolor{suspended}{(suspended)}}",
         "",
         "\\newtheorem{lemma}{Lemma}",
         # A counter the lemma sections step so their \label has a real

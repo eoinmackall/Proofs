@@ -50,7 +50,7 @@
     C = {
       surface: v("--surface"), ink: v("--ink"), ink2: v("--ink2"),
       muted: v("--muted"), edgeInk: v("--edge-ink"), edgeAlpha: parseFloat(v("--edge-alpha")) || 0.1,
-      wash: v("--wash"), hl: v("--hl"), settle: v("--settle"),
+      wash: v("--wash"), hl: v("--hl"), settle: v("--settle"), suspended: v("--suspended"),
       users: [0, 1, 2, 3, 4, 5, 6, 7].map((i) => v("--u" + i)), other: v("--other"),
     };
   }
@@ -59,6 +59,11 @@
   // in d.res, ringed twice at these offsets past its radius, and labelled.
   const SETTLE_RINGS = [3.5, 7];
   const SETTLES_TEXT = { proved: "proves the conjecture", disproved: "disproves the conjecture" };
+  // A suspended lemma (d.s, exported only with --suspended): filled with
+  // --suspended whoever proved it, and ringed in it at this offset.
+  const SUSPENDED_RING = 3;
+  // How far past its radius a lemma's own rings reach.
+  const ringReach = (d) => (d.res ? SETTLE_RINGS[1] : d.s ? SUSPENDED_RING : 0);
   const userVar = (o) => (o < 8 ? `var(--u${o})` : "var(--other)");
 
   // ----------------------------------------------------------------- view
@@ -260,31 +265,42 @@
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  // Nodes batched by (owner, suspended): one path, one fill and one ring
-  // stroke per batch; then the settling lemmas' double rings, in one
-  // stroke. Off-screen nodes are skipped.
+  // Nodes batched by owner, the suspended ones in a batch of their own
+  // (key -1): one path, one fill and one ring stroke per batch; then the
+  // suspended lemmas' red rings and the settling lemmas' double rings, a
+  // stroke each. Off-screen nodes are skipped.
   function paintNodes(c, list) {
-    const batches = new Map(), rings = [];
+    const batches = new Map(), rings = [], held = [];
     for (const i of list) {
       const d = N[i], x = sx(d), y = sy(d), r = rs(d);
-      const reach = r + (d.res ? SETTLE_RINGS[1] + 1 : 0);
+      const reach = r + ringReach(d) + 1;
       if (x < -reach || x > W + reach || y < -reach || y > H + reach) continue;
       if (d.res) rings.push(x, y, r);
-      const key = d.o * 2 + (d.s ? 1 : 0);
+      if (d.s) held.push(x, y, r);
+      const key = d.s ? -1 : d.o;
       if (!batches.has(key)) batches.set(key, []);
       batches.get(key).push(x, y, r);
     }
     for (const [key, pts] of batches) {
-      const col = userColour(key >> 1), hollow = key & 1;
       c.beginPath();
       for (let j = 0; j < pts.length; j += 3) {
         c.moveTo(pts[j] + pts[j + 2], pts[j + 1]);
         c.arc(pts[j], pts[j + 1], pts[j + 2], 0, 2 * Math.PI);
       }
-      c.fillStyle = hollow ? C.surface : col;
+      c.fillStyle = key < 0 ? C.suspended : userColour(key);
       c.fill();
-      c.strokeStyle = hollow ? col : C.surface;
-      c.lineWidth = hollow ? 1.6 : 1;
+      c.strokeStyle = C.surface;
+      c.lineWidth = 1;
+      c.stroke();
+    }
+    if (held.length) {
+      c.beginPath();
+      for (let j = 0; j < held.length; j += 3) {
+        c.moveTo(held[j] + held[j + 2] + SUSPENDED_RING, held[j + 1]);
+        c.arc(held[j], held[j + 1], held[j + 2] + SUSPENDED_RING, 0, 2 * Math.PI);
+      }
+      c.strokeStyle = C.suspended;
+      c.lineWidth = 1.5;
       c.stroke();
     }
     if (rings.length) {
@@ -328,7 +344,7 @@
     c.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
     for (const i of D.labels) {
       const d = N[i], top = isTop(d) || !!d.res;
-      const r = rs(d) + (d.res ? SETTLE_RINGS[1] : 0);
+      const r = rs(d) + ringReach(d);
       const text = d.res ? `${shortId(d.id)} · ${SETTLES_TEXT[d.res]}`
         : shortId(d.id) + (top ? "" : ` (${d.n})`);
       const w = c.measureText(text).width + 8, x = sx(d);
@@ -425,8 +441,8 @@
     c.fillRect(0, 0, W, H);
     strokeEdges(c, edges, C.hl, 1.4);
     paintNodes(c, nodes.sort((a, b) => N[a].r - N[b].r));
-    // The focus ring, outside a settling lemma's own rings.
-    const d = N[f], fr = rs(d) + (d.res ? SETTLE_RINGS[1] + 3.5 : 3);
+    // The focus ring, outside a lemma's own rings.
+    const d = N[f], fr = rs(d) + ringReach(d) + (d.res || d.s ? 3.5 : 3);
     c.beginPath();
     c.arc(sx(d), sy(d), fr, 0, 2 * Math.PI);
     c.strokeStyle = C.hl;
@@ -567,7 +583,7 @@
     const d = N[i], m = el("div", "meta");
     m.textContent = `${D.users[d.o].id} · cites ${cites[i].length} · cited by ${citers[i].length}`;
     if (d.res) m.append(el("span", "badge settle", SETTLES_TEXT[d.res]));
-    if (d.s) m.append(el("span", "badge", "suspended"));
+    if (d.s) m.append(el("span", "badge suspended", "suspended"));
     return m;
   }
 
@@ -599,8 +615,8 @@
         continue;
       }
       const b = el("button");
-      const dot = el("span", "dot");
-      dot.style.background = userVar(N[j].o);
+      const dot = el("span", N[j].s ? "dot suspended" : "dot");
+      if (!N[j].s) dot.style.background = userVar(N[j].o);
       b.append(dot, document.createTextNode(shortId(id)));
       b.title = id;
       b.addEventListener("click", () => { pin(j); centre(j); });
@@ -617,8 +633,8 @@
     const d = N[i];
     panel.replaceChildren();
     const head = el("div", "head");
-    const dot = el("span", "dot");
-    dot.style.background = userVar(d.o);
+    const dot = el("span", d.s ? "dot suspended" : "dot");
+    if (!d.s) dot.style.background = userVar(d.o);
     dot.style.marginTop = "5px";
     const close = el("button", "close", "×");
     close.setAttribute("aria-label", "Close");
@@ -642,6 +658,11 @@
     box.append(cb, count);
     panel.append(box);
 
+    if (d.s) {
+      const why = el("ul", "why");
+      for (const r of d.why.length ? d.why : ["suspended"]) why.append(el("li", "", r));
+      section("Suspended — not to be relied on", why);
+    }
     const st = el("div", "tex");
     if (d.st) st.innerHTML = tex(i, "st");
     else st.append(el("span", "empty", "No statement recorded."));
@@ -820,7 +841,7 @@
   }
   if (N.some((d) => d.s)) {
     const row = el("div");
-    row.append(el("span", "dot hollow"), el("span", "", "suspended"));
+    row.append(el("span", "dot suspended"), el("span", "", `suspended (${N.filter((d) => d.s).length})`));
     legend.append(row);
   }
   for (const kind of ["proved", "disproved"]) {

@@ -21,6 +21,7 @@ The layout is layered, dependencies at the bottom:
     colour  the user whose run proved it (owner_of), in a fixed order:
             users by lemma count, most first, so a user keeps its colour
             between exports of the same DAG unless the counts reorder.
+            A suspended lemma is drawn in the theme's red instead.
     settles a lemma that settles the conjecture (resolution.find) is
             marked "proved" or "disproved", for the renderers to ring and
             always label.
@@ -85,20 +86,28 @@ OTHER = {"light": "#898781", "dark": "#898781",
          "proofs": "#6F7D92", "proofs-light": "#8A93A1"}
 # The chart chrome both renderers draw with. settle is the double ring
 # around a lemma that settles the conjecture: the ink, never a hue, since
-# a hue on a node means its user.
+# a hue on a node means its user. suspended is the one exception: a
+# suspended lemma (exported only with --suspended) is filled with a
+# vibrant red and ringed in it, whoever proved it, so it stands out as
+# not to be relied on; the ring keeps it apart from a user whose slot is
+# a red. The page's stylesheet carries the same values as --suspended.
 THEMES = {
     "light": {"surface": "#fcfcfb", "ink": "#0b0b0b", "ink2": "#52514e",
               "muted": "#898781", "edge": "#0b0b0b", "edge_alpha": 0.10,
-              "highlight": "#0b0b0b", "settle": "#0b0b0b"},
+              "highlight": "#0b0b0b", "settle": "#0b0b0b",
+               "suspended": "#E10600"},
     "dark": {"surface": "#1a1a19", "ink": "#ffffff", "ink2": "#c3c2b7",
              "muted": "#898781", "edge": "#ffffff", "edge_alpha": 0.12,
-             "highlight": "#ffffff", "settle": "#ffffff"},
+             "highlight": "#ffffff", "settle": "#ffffff",
+             "suspended": "#FF3B30"},
     "proofs": {"surface": "#121925", "ink": "#F3EEE4", "ink2": "#BDBDBD",
                "muted": "#92A2B8", "edge": "#DCEBFA", "edge_alpha": 0.12,
-               "highlight": "#F3EEE4", "settle": "#F3EEE4"},
+               "highlight": "#F3EEE4", "settle": "#F3EEE4",
+               "suspended": "#FF3B3B"},
     "proofs-light": {"surface": "#FFFFFF", "ink": "#18202C", "ink2": "#4F5866",
                      "muted": "#646D7C", "edge": "#1B2B45", "edge_alpha": 0.10,
-                     "highlight": "#18202C", "settle": "#18202C"},
+                     "highlight": "#18202C", "settle": "#18202C",
+                     "suspended": "#E10600"},
 }
 # What a settling lemma's label and legend entry say, by resolution kind.
 SETTLES_TEXT = {"proved": "proves the conjecture",
@@ -238,7 +247,7 @@ def layout(
             "y": round(y, 2),
             "r": round(rad[i], 2),
             "cited_by": k,
-            "suspended": lid in suspended,
+             "suspended": lid in suspended,
             "settles": settles.get(lid),
             "external": external[i],
         })

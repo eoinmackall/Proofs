@@ -10,7 +10,7 @@
     proofs prune DIR                  remove refuted lemmas [--with-dependents]
     proofs migrate [DIR]              convert a format-1 workspace to streams
     proofs status DIR LEMMA_ID        a lemma's closure: hashes, certificates
-    proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex|html|png [--theme THEME]
+    proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex|html|png [--theme THEME] [--suspended]
                                     write the DAG as LaTeX, an interactive graph or an image
     proofs limits DIR                 show the code limits in effect, and their sources
     proofs tools lock DIR             write DIR's tools.lock from its flake (maintainer)
@@ -56,7 +56,8 @@ point, where the command's own docstring says what it does:
     (--user), or a lemma and everything it cites — into the directory
     -o/--out names, created if it is not there yet, as -n/--name or a
     name after what is exported. -o/--out is required: the document is the
-    user's artifact, not the project's data.
+    user's artifact, not the project's data. Suspended lemmas are left out
+    unless --suspended asks for them, marked in red.
   * init (workspace.init) creates DIR/conjectures/, writes the .proofs
     marker and writes or updates the proofs block of DIR/.gitignore. It
     is safe to re-run, and refuses a DIR inside another workspace.
@@ -441,7 +442,8 @@ def build_parser() -> argparse.ArgumentParser:
             "image of that graph (--format png, needs matplotlib). The file "
             "is written into the -o/--out directory (created if it is not "
             "there yet), named by -n/--name or, without it, after what is "
-            "exported."
+            "exported. Suspended lemmas are left out unless --suspended "
+            "asks for them."
         ),
     )
     p.add_argument("dir", metavar="DIR", help=_DIR_HELP)
@@ -480,6 +482,12 @@ def build_parser() -> argparse.ArgumentParser:
              "its Light / Dark / Theme switch (default proofs: the docs' "
              "palette, following the viewer's OS setting); proofs-light is "
              "for images only.",
+    )
+    p.add_argument(
+        "--suspended", action="store_true",
+        help="Include suspended lemmas, drawn in red in the graph and "
+             "marked, with the reasons, in the document. Default: they are "
+             "left out.",
     )
     p.set_defaults(func=_cmd_export, parser=p)
     return parser
@@ -850,6 +858,7 @@ def _cmd_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         fmt=args.fmt,
         theme=args.theme,
         name=args.name,
+        include_suspended=args.suspended,
     )
     sys.exit(rc)
 

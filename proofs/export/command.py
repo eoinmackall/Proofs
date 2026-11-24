@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..core import resolution
 from ..core.context import Context
@@ -66,6 +66,7 @@ def export_entry(
     fmt: str,
     theme: Optional[str] = None,
     name: Optional[str] = None,
+    include_suspended: bool = False,
 ) -> int:
     """proofs export NAME [LEMMA_ID] [--user USER_ID] --format FORMAT:
     write the chosen lemmas into out_dir (-o/--out, created if it is not
@@ -84,6 +85,13 @@ def export_entry(
     order proofs verify --full verifies in. No model is involved: the
     document is a function of the files. Returns the exit code: 0 when the
     document was written.
+
+    Suspended lemmas (core/suspension.py) are left out unless
+    include_suspended (--suspended) asks for them; then they are drawn in
+    red in the graph and marked, with the reasons, in the document.
+    Suspension spreads up the citations, so leaving them out never leaves
+    an exported lemma citing one; a suspended LEMMA_ID without
+    --suspended is an error, since nothing of it would be exported.
     """
     try:
         file_name("proof.tex", name, fmt)
@@ -100,27 +108,47 @@ def export_entry(
     ctx.ui.log(workspace.describe(paths))
     dag = ctx.dag
     lemmas = dag.lemmas
+    susp = dag.suspension()
+    # The lemmas the export may draw from: all of them with --suspended,
+    # else the unsuspended ones.
+    pool = set(lemmas) if include_suspended else set(lemmas) - susp.suspended
     if lemma_id is not None:
         if lemma_id not in lemmas:
             parser.error(f"{lemma_id} is not a lemma of the DAG {root}")
-        order = _citation_closure(dag, lemma_id)
+        if lemma_id not in pool:
+            parser.error(
+                f"{lemma_id} is suspended ({'; '.join(susp.reasons(lemma_id))}); "
+                f"pass --suspended to export it")
+        order = [lid for lid in _citation_closure(dag, lemma_id) if lid in pool]
         default = latex.name_for(lemma_id=lemma_id)
         scope = f"lemma {lemma_id} and everything it cites — {len(order)} lemma(s)"
+        candidates = set(order)
     elif owner is not None:
-        order = _dependency_order(dag, {lid for lid in lemmas if owner_of(lid) == owner})
+        candidates = {lid for lid in lemmas if owner_of(lid) == owner}
+        order = _dependency_order(dag, candidates & pool)
         default = latex.name_for(owner=owner)
         scope = f"{owner}'s lemmas — {len(order)} lemma(s)"
     else:
-        order = _dependency_order(dag, set(lemmas))
+        candidates = set(lemmas)
+        order = _dependency_order(dag, candidates & pool)
         users = {owner_of(lid) for lid in order}
         default = latex.name_for()
         scope = (f"the complete DAG — {len(order)} lemma(s) from "
                  f"{len(users)} user(s)")
+    suspended = {lid: susp.reasons(lid) for lid in order if lid in susp}
+    if suspended:
+        scope += f", {len(suspended)} suspended"
+    else:
+        left_out = len(candidates & susp.suspended)
+        if left_out:
+            scope += f" ({left_out} suspended left out)"
+            ctx.ui.log(f"Left out {left_out} suspended lemma(s); "
+                       f"--suspended includes them.")
     out_path = Path(out_dir) / file_name(default, name, fmt)
     if fmt != "latex":
-        return _export_graph(ctx, dag, order, scope, paths.root.name,
-                             load_file(paths.conjecture), out_path, fmt,
-                             theme, parser)
+        return _export_graph(ctx, dag, order, suspended, scope,
+                             paths.root.name, load_file(paths.conjecture),
+                             out_path, fmt, theme, parser)
     # The scripts the exported lemmas rest on, for the appendix: latex.py
     # renders from data, so they are read here.
     run_lines = computations.load_runs(paths.root)
@@ -147,6 +175,7 @@ def export_entry(
         lemmas={lid: {**lemmas[lid], "proof": proofs[lid]} for lid in order},
         references=dag.references,
         computations=code_shown,
+        suspended=suspended,
     )
     out = latex.write(out_path, document)
     ctx.ui.log(
@@ -171,17 +200,18 @@ def _settles(ctx: Context, dag, order, conjecture: str) -> Dict[str, str]:
     return {r.lemma_id: r.kind for r in found if r.lemma_id in exported}
 
 
-def _export_graph(ctx: Context, dag, order, scope: str, conjecture_name: str,
-                  conjecture: str, out: Path, fmt: str, theme: Optional[str],
-                  parser: argparse.ArgumentParser) -> int:
+def _export_graph(ctx: Context, dag, order, suspended: Dict[str, List[str]],
+                  scope: str, conjecture_name: str, conjecture: str, out: Path,
+                  fmt: str, theme: Optional[str], parser: argparse.ArgumentParser) -> int:
     """The citation graph of the lemmas in order, as the interactive page
-    or the image. A suspended lemma is drawn hollow, so the picture says
-    which results are not to be relied on yet; a lemma that settles the
-    conjecture is ringed and always labelled, so it says what is done."""
+    or the image. A suspended lemma (exported only with --suspended) is
+    drawn in red with a red ring, so the picture says which results are
+    not to be relied on yet; a lemma that settles the conjecture is ringed
+    and always labelled, so it says what is done. suspended maps each
+    suspended lemma in order to why it is suspended."""
     lemmas = dag.lemmas
-    suspended = {lid for lid in order if lid in dag.suspension()}
     settles = _settles(ctx, dag, order, conjecture)
-    laid_out = graph.layout(order, lemmas, suspended, settles)
+    laid_out = graph.layout(order, lemmas, set(suspended), settles)
     if fmt == "png":
         try:
             png.render_to(out, laid_out, title=conjecture_name,
@@ -197,10 +227,13 @@ def _export_graph(ctx: Context, dag, order, scope: str, conjecture_name: str,
             conjecture_name=conjecture_name,
             scope=scope,
             theme=theme or "proofs",
+            suspended=suspended,
         )
         latex.write(out, page)
     for lid, kind in settles.items():
         ctx.ui.log(f"Marked {lid}: it {graph.SETTLES_TEXT[kind]}.")
+    if suspended:
+        ctx.ui.log(f"Marked {len(suspended)} suspended lemma(s) in red.")
     ctx.ui.log(
         f"Exported the citation graph of {len(order)} lemma(s) "
         f"({len(laid_out['edges'])} citation(s)) to {out}."
