@@ -67,7 +67,7 @@
     <!--
       Example graphs: export with
         proofs export NAME -o docs/examples -n NAME --format html
-      and list each file in docs/examples/dags.json ({file, title, stats, size, command}).
+      and list each file in docs/examples/dags.json ({file, title, stats, size}).
       Overwriting an existing file updates the viewer in place; Prev/Next appear once
       the manifest lists more than one graph.
     -->
@@ -81,7 +81,7 @@
         <div class="showcase-bar">
           <div class="showcase-title">
             <span id="dag-viewer-title">Semisimplicity</span>
-            <span id="dag-viewer-stats" class="showcase-stats">1,141 lemmas · 2,855 citations · 3 contributors</span>
+            <span id="dag-viewer-stats" class="showcase-stats">1,196 lemmas · 2,958 citations · 3 contributors</span>
           </div>
           <div class="showcase-controls">
             <div class="dag-nav-group" role="group" aria-label="Switch example graph" hidden>
@@ -96,13 +96,9 @@
         <div class="dag-frame-wrap">
           <div id="dag-poster" class="dag-poster">
             <button id="dag-load" class="btn btn-primary" type="button">Load Interactive Graph</button>
-            <span id="dag-size" class="dag-poster-note">8.7 MB · math rendered with KaTeX, works offline</span>
+            <span id="dag-size" class="dag-poster-note">9.1 MB · math rendered with KaTeX, works offline</span>
           </div>
           <iframe id="dag-frame" class="dag-frame" title="Semisimplicity — interactive citation graph" hidden></iframe>
-        </div>
-
-        <div class="dag-footer-bar">
-          <span>Made with <code id="dag-viewer-command">proofs export semisimplicity -o examples -n semisimplicity --format html</code></span>
         </div>
       </div>
     </section>

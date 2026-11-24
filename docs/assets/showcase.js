@@ -11,9 +11,8 @@
     {
       file: "semisimplicity.html",
       title: "Semisimplicity",
-      stats: "1,141 lemmas · 2,855 citations · 3 contributors",
-      size: "8.7 MB",
-      command: "proofs export semisimplicity -o examples -n semisimplicity --format html"
+      stats: "1,196 lemmas · 2,958 citations · 3 contributors",
+      size: "9.1 MB"
     }
   ];
 
@@ -58,7 +57,6 @@
 
       setText($("dag-viewer-title"), title);
       setText($("dag-viewer-stats"), entry.stats);
-      setText($("dag-viewer-command"), entry.command);
       setText($("dag-size"), entry.size ? `${entry.size} · math rendered with KaTeX, works offline` : "");
       if ($("dag-viewer-count")) $("dag-viewer-count").textContent = `${idx + 1} / ${dags.length}`;
       if ($("dag-open-full")) $("dag-open-full").setAttribute("href", url);

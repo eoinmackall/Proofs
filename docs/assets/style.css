@@ -1131,23 +1131,6 @@ a.stat-item:hover {
   background: var(--bg-abyss);
 }
 
-.dag-footer-bar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem 1rem;
-  padding: 0.65rem 1.15rem;
-  background: var(--bg-abyss);
-  border-top: 1px solid var(--border);
-  font-size: 0.8rem;
-  color: var(--text-dim);
-}
-
-.dag-footer-bar code {
-  font-size: 0.78rem;
-}
-
 /* Interactive Loop Stepper ------------------------------------------------- */
 .loop-steps {
   display: grid;
