@@ -1,0 +1,9 @@
+[
+  {
+    "file": "semisimplicity.html",
+    "title": "Semisimplicity",
+    "stats": "1,141 lemmas · 2,855 citations · 3 contributors",
+    "size": "8.7 MB",
+    "command": "proofs export semisimplicity -o examples -n semisimplicity --format html"
+  }
+]

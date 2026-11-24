@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Getting Started — Proofs Docs</title>
+  <meta name="description" content="Install Proofs on Linux, macOS, or Windows with WSL, create a workspace, and follow a conjecture from its statement to a proof graph.">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <button id="menu-toggle" class="menu-btn" type="button" aria-label="Toggle navigation" aria-expanded="false">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <a class="brand" href="index.html">
+      <img src="assets/favicon.svg" alt="" width="28" height="28">
+      <span>Proofs</span>
+    </a>
+    <nav class="topbar-nav" aria-label="Primary">
+      <a href="index.html">Home</a>
+      <a href="getting-started.html" class="active" aria-current="page">Getting Started</a>
+      <a href="structure.html">Documentation</a>
+      <a href="reference.html">Reference</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <a class="github-link" href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>GitHub</span>
+    </a>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar" aria-label="Documentation">
+      <div class="search-wrap">
+        <input id="doc-search" class="search-input" type="search" placeholder="Search docs…" autocomplete="off" aria-label="Search documentation">
+        <span class="search-kbd">/</span>
+        <div id="search-results" class="search-results" hidden></div>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Overview</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="index.html">Home</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Getting Started</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="#quickstart">Quickstart</a></li>
+          <li><a class="nav-link" href="#installation">Installation</a></li>
+          <li><a class="nav-link" href="#workspaces">Workspaces</a></li>
+          <li><a class="nav-link" href="#backends">Backends &amp; Routing</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Documentation</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="structure.html">Structure</a></li>
+          <li><a class="nav-link" href="verification.html">Verification</a></li>
+          <li><a class="nav-link" href="collaboration.html">Collaboration</a></li>
+          <li><a class="nav-link" href="miscellaneous.html">Miscellaneous</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Reference</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="reference.html">CLI &amp; Settings</a></li>
+        </ul>
+      </div>
+    </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+
+    <div class="main-wrap">
+      <main id="main" class="content">
+        <div class="eyebrow">Guide</div>
+        <h1>Getting Started</h1>
+        <p class="lead">
+          Proofs works in a workspace, much like Git works in a repository. You install the <code>proofs</code> command once; each workspace is a separate directory for your conjectures and the arguments the models build. Here you’ll state a small conjecture about even numbers, run one iteration, and learn where to find the result.
+        </p>
+
+        <h2 id="quickstart">Quickstart</h2>
+        <p>
+          Use a terminal on Linux or macOS, or a Linux shell inside WSL 2 on Windows. See <a href="#installation">Installation</a> if you need to set one up. Choose <em>one</em> of the following ways to get the CLI. Either works with local and hosted models; neither downloads a model or starts a server.
+        </p>
+
+        <div class="tabs" data-tabs>
+          <div class="tab-list" role="tablist" aria-label="Installation method">
+            <button class="tab-btn" type="button" role="tab" aria-selected="true" aria-controls="qs-nix">Nix Flake (Recommended)</button>
+            <button class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="qs-pip">Python / pip</button>
+          </div>
+
+          <div id="qs-nix" class="tab-panel" role="tabpanel">
+            <p>With Nix and flakes enabled, open a shell that has Proofs and its dependencies on <code>PATH</code>. No clone is needed. Run the remaining commands in that shell; enter it again for a later session.</p>
+<pre><code>nix develop github:eoinmackall/proofs</code></pre>
+          </div>
+
+          <div id="qs-pip" class="tab-panel" role="tabpanel" hidden>
+            <p>With Git and Python 3.9 or newer, install from the source checkout into a virtual environment. In a later session you only need to repeat the activation line, not the clone or install.</p>
+<pre><code>git clone https://github.com/eoinmackall/proofs.git "$HOME/proofs-src"
+python3 -m venv "$HOME/.venvs/proofs"
+. "$HOME/.venvs/proofs/bin/activate"
+python -m pip install "$HOME/proofs-src"</code></pre>
+          </div>
+        </div>
+
+        <p>
+          Check that <code>proofs --help</code> lists the commands. Now choose a contributor ID (replace <code>alice</code> with yours) and create a workspace outside the program checkout. The ID is a one-time setting: it becomes the first part of every lemma ID you contribute.
+        </p>
+<pre><code>proofs config --global user.id alice
+proofs init ~/my-proofs
+cd ~/my-proofs
+proofs new parity</code></pre>
+        <p>
+          The new <code>conjectures/parity/conjecture.md</code> is empty. Write a statement with explicit hypotheses and a conclusion, not a prompt asking for a solution. You can use your editor, or fill the new file like this:
+        </p>
+<pre><code>printf '%s\n' 'For every integer n, if n^2 is even then n is even.' &gt; conjectures/parity/conjecture.md</code></pre>
+        <p>
+          Choose one endpoint for the run. If you already have a local model server, substitute its API base URL and the model name it serves. This example assumes the server is reachable from this shell:
+        </p>
+<pre><code>proofs run parity --host http://localhost:8080/v1 --model qwen3-32b --max-iterations 1</code></pre>
+        <p>
+          Alternatively, use a hosted endpoint. For OpenAI, first set <code>OPENAI_API_KEY</code> in your shell environment and choose a model your account can use. The provider receives the prompts and may charge for the calls:
+        </p>
+<pre><code>proofs run parity --host https://api.openai.com/v1 --model gpt-5 --api-key "$OPENAI_API_KEY" --max-iterations 1</code></pre>
+        <p>
+          One iteration tries a lemma; it can take several model calls and need not settle the conjecture. If nothing was accepted, repeat the command with a higher limit to continue. Without a limit the run can keep going until settlement; press Ctrl-C once to <a href="structure.html#checkpointing">pause and save your place</a>.
+        </p>
+        <p>
+          A commit message with a lemma ID means there’s an argument to read. The proof lives under <code>conjectures/parity/dags/</code> and its review record under <code>conjectures/parity/certificates/</code>. To read the proof alongside the lemmas it cites, export the graph:
+        </p>
+<pre><code>proofs export parity -o out --format html</code></pre>
+        <p>
+          Open <code>out/proof.html</code> in your browser and select a dot to read its proof. Export reads local files; you don’t need another model call. The <a href="index.html#example">example on the home page</a> shows what the same export looks like after many runs.
+        </p>
+
+        <h2 id="installation">Installation</h2>
+        <p>
+          The shell commands in this guide use Unix paths. Prepare your platform first, then use the Nix or pip tab in the <a href="#quickstart">Quickstart</a>. SageMath and a code sandbox are optional; neither is needed for a text-only proof.
+        </p>
+        <ul>
+          <li><strong>Linux:</strong> Use your usual terminal. The Nix shell supplies Python and, on Linux, <code>bwrap</code> (bubblewrap) for optional code execution. For pip, install Git and a Python 3.9+ interpreter with virtual environment support; on a recent Debian or Ubuntu system, <code>sudo apt install git python3 python3-venv</code> supplies these. Install <code>bubblewrap</code> separately if you later enable <code>--tools</code>.</li>
+          <li><strong>macOS:</strong> Use Terminal. The Nix flake has Intel and Apple Silicon targets. For pip, check <code>git --version</code> and <code>python3 --version</code>; install the Command Line Tools (<code>xcode-select --install</code>) for Git if needed, and a <a href="https://www.python.org/downloads/macos/">current Python for macOS</a> if yours is too old. Optional script execution uses <code>sandbox-exec</code>, not bubblewrap; see the <a href="miscellaneous.html#sandbox-limits">limits of the macOS sandbox</a> before enabling it.</li>
+          <li><strong>Windows:</strong> Use <a href="https://learn.microsoft.com/en-us/windows/wsl/install">Windows Subsystem for Linux (WSL 2)</a>. On a recent Windows system, run <code>wsl --install -d Ubuntu</code> in PowerShell as Administrator, restart if prompted, then open Ubuntu. Follow the Linux instructions <em>inside Ubuntu</em>, including installing Nix or Python there. Keep the workspace in your Linux home (e.g. <code>~/my-proofs</code>), not under <code>/mnt/c</code>. Native Windows lacks the Unix file locks Proofs uses to protect active runs and has no supported code sandbox.</li>
+        </ul>
+        <p>
+          <strong>With Nix:</strong> Use the <a href="https://nixos.org/download/">Nix installer for your platform</a> if Nix is not already installed. If <code>nix develop</code> reports disabled features, use <code>nix --extra-experimental-features 'nix-command flakes' develop github:eoinmackall/proofs</code>. From a source clone, plain <code>nix develop</code> uses the local flake. To run one command without entering a shell, use <code>nix run github:eoinmackall/proofs -- --help</code>.
+        </p>
+        <p>
+          <strong>With pip:</strong> The base install includes <code>requests</code>, <code>rich</code>, and <code>orjson</code>. From the source checkout in the activated environment, <code>python -m pip install '.[fast,png]'</code> also installs NumPy for the breadth strategy and matplotlib for PNG export; HTML export needs neither. To try a checkout without installing it, an environment with Python 3.9+ and <code>requests</code> can run <code>PYTHONPATH="$HOME/proofs-src" python3 -m proofs --help</code>.
+        </p>
+
+        <h2 id="workspaces">Workspaces</h2>
+        <p>
+          Where Git looks up the directory tree for <code>.git</code>, Proofs looks for a marker <em>file</em> named <code>.proofs</code>. That directory is the workspace root. The two markers are independent: <code>proofs init</code> doesn’t run <code>git init</code>, and a local proof needs no Git repository. If you want history or collaborators, put the <a href="collaboration.html#streams">workspace under Git</a>, not your installed copy of Proofs.
+        </p>
+        <p>
+          A workspace can hold many conjectures. A bare name such as <code>parity</code> means <code>conjectures/parity</code> under the root, even if you run the command from a subdirectory. A path is relative to your shell as usual: from inside <code>conjectures/parity/</code>, <code>proofs run .</code> targets the same conjecture as <code>proofs run parity</code>. Outside the workspace, give the path to the conjecture directory or change back into the workspace before using a name.
+        </p>
+        <ul>
+          <li><strong>Once per workspace:</strong> <code>proofs init [DIR]</code> creates the root (current directory if omitted), the <code>.proofs</code> marker (<code>format = 2</code>), <code>conjectures/</code>, and a gitignored <code>.proofs-local.json</code> for this machine. Running it again at the root keeps your settings and conjectures and refreshes only the managed block of <code>.gitignore</code>. Don’t initialize a second workspace inside the first.</li>
+          <li><strong>Once per problem:</strong> <code>proofs new NAME</code> creates a new directory with an empty <code>conjecture.md</code>. This is the only file you need to fill in. <code>comments.md</code> is for private hints; <code>references/</code> and <code>references.md</code> (initially <code>[]</code>) are for source material and citable results. The <a href="reference.html#layout">rest of the directory layout</a> fills in as the run produces results.</li>
+        </ul>
+        <p>
+          Your contributor ID is a Proofs setting, not your Git login. <code>proofs config user.id</code> prints it. You can also set a name and email. The settings file is in <code>~/.config/proofs/config</code> (or <code>$XDG_CONFIG_HOME/proofs/config</code>), outside every workspace, but the identity you supply is recorded in the headers of the result files you share:
+        </p>
+<pre><code>proofs config --global user.name "Alice Example"
+proofs config --global user.email alice@example.com</code></pre>
+
+        <h2 id="backends">Backends &amp; Routing</h2>
+        <p>
+          A backend is how Proofs talks to a model; a route says which model handles a job, such as writing a proof or checking one. Start with one model for all jobs. The model options for <code>run</code> also work on <code>parse</code>, <code>verify</code>, and <code>repair</code>. Reading the graph with <code>status</code> or <code>export</code> needs no backend.
+        </p>
+
+        <h3>Single-model CLI usage</h3>
+        <p>
+          For an OpenAI-compatible service (including llama-server, vLLM, OpenRouter, and Gemini’s compatibility endpoint), give <code>--host</code> the API base URL including its version path. Proofs appends <code>chat/completions</code>; don’t append that yourself. <code>--model</code> names an already served model. Choose the command for your provider:
+        </p>
+<pre><code># Local llama-server with the alias qwen3-32b
+proofs run parity --host http://localhost:8080/v1 --model qwen3-32b</code></pre>
+<pre><code># Hosted OpenAI model; pass the key from the shell
+proofs run parity --host https://api.openai.com/v1 --model gpt-5 \
+  --api-key "$OPENAI_API_KEY"</code></pre>
+<pre><code># Native Anthropic Messages API; --host defaults to https://api.anthropic.com
+proofs run parity --backend anthropic --model claude-opus-4-6 \
+  --api-key "$ANTHROPIC_API_KEY"</code></pre>
+
+        <ul>
+          <li><strong>Choosing the protocol:</strong> Leave the backend on <code>auto</code> for most OpenAI-compatible servers. Proofs probes <code>/props</code> to recognize llama.cpp; otherwise it uses standard OpenAI fields. If a proxy hides the probe, select <code>--backend llamacpp</code> or <code>--backend openai</code> yourself. Select <code>anthropic</code> explicitly for the Messages API.</li>
+          <li><strong>Reading the record:</strong> The saved model name can differ from the name you requested. Proofs records the weights filename reported by llama-server or the model ID reported by a hosted service, using the requested name if the server reports none.</li>
+          <li><strong>Tuning calls:</strong> Start with the server’s defaults. Use <code>--effort</code> only with a level supported by your model, and <code>--temperature</code> only on non-Anthropic backends. See <a href="reference.html#cli-flags">CLI Flags</a> for the options.</li>
+        </ul>
+
+        <h3>Role-based model routing (<code>.proofs-local.json</code>)</h3>
+        <p>
+          To stop retyping flags, edit the workspace’s <code>.proofs-local.json</code>. Under <code>"llm.models"</code>, fill in the <code>host</code> and <code>model</code> of the <code>local</code> entry. Under <code>"llm.routes"</code>, set <code>"default": "local"</code>. Now <code>proofs run parity</code> uses that endpoint. For a hosted OpenAI-compatible service, fill in <code>openai_compatible</code> instead, including <code>api_key_env</code>, and make it the default. Unused entries and routes can stay blank.
+        </p>
+        <p>
+          You can give particular jobs a different model. Below are the two routing keys for a setup where a local model plans and a hosted model writes and checks proofs. <code>extract</code> converts an ill-formatted reply to JSON; <code>compact</code> summarizes reasoning when a reply runs out of room. Unless routed separately, these stages use the role’s own model.
+        </p>
+
+<pre><code>{
+  "llm.models": {
+    "local": {
+      "host": "http://localhost:8080/v1",
+      "model": "qwen3-32b",
+      "ctx_budget": 65536
+    },
+    "strong": {
+      "backend": "anthropic",
+      "model": "claude-opus-4-6",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "effort": "high",
+      "ctx_budget": 200000
+    }
+  },
+  "llm.routes": {
+    "default": "local",
+    "prover": "strong",
+    "verifier_*": "strong",
+    "extract": "local",
+    "compact": "local",
+    "fallback": "local"
+  }
+}</code></pre>
+
+        <div class="callout rose">
+          <div class="callout-title">API Keys Stay Out of Config Files</div>
+          <p>
+            Put the <em>name</em> of an environment variable in <code>api_key_env</code>, never the key itself. For the example above, export <code>ANTHROPIC_API_KEY</code> in the shell that starts Proofs. Proofs refuses an inline <code>api_key</code> field; even a gitignored file can end up in a backup or archive.
+          </p>
+        </div>
+
+        <ul>
+          <li><strong>One-off changes:</strong> The conjecture’s local file overrides the workspace’s. CLI model flags replace the <em>default</em>, not roles explicitly routed elsewhere. With the entries above, adding <code>--route prover=local</code> changes just the prover for this command.</li>
+          <li><strong>Verifier consistency</strong>: each certificate names one verifying model. In this example, <code>"verifier_*": "strong"</code> routes the three numbered verifiers to <code>strong</code>. The unrouted <code>coding_verifier</code> follows them. If you explicitly assign different models to two verifiers, the run stops at startup.</li>
+          <li><strong>Per-call fallback</strong> (<code>--with-fallback</code>): if a model exhausts quota or fails all retries, that single call fails over to <code>llm.routes.fallback</code> (or <code>default</code>). The next call tries its primary model again; a verification check restarts cleanly on the fallback so its certificate names one model.</li>
+        </ul>
+
+        <h3 id="context-wall">Context Limits</h3>
+        <p>
+          A model’s context window has to fit both the question (including earlier lemmas) and its answer. <code>--ctx-budget TOKENS</code>, or <code>ctx_budget</code> on a named model, sets their combined budget for one call. It does not enlarge the model’s window. Where the server reports a lower limit, Proofs uses that instead.
+        </p>
+        <ul>
+          <li><strong>Reading an answer:</strong> Agents are asked for JSON. Proofs first parses the reply locally. For a role such as the planner, it can make an <code>extract</code> call if the reply does not parse. The prover is an exception: Proofs keeps its text rather than asking another model to rephrase a proof.</li>
+          <li><strong>Continuing a partial answer</strong>: if a reply reaches the token limit, Proofs summarizes the model’s reasoning but keeps the answer so far word for word. The model can then continue where it stopped. <code>llm.max_compaction_passes</code> limits how often this can happen (default <code>2</code>).</li>
+          <li><strong>If the proof still does not fit</strong>: the reviser uses the summary and partial proof to suggest a smaller lemma or correct the statement.</li>
+          <li><strong>If the server refuses the request:</strong> A context-length error with a reported ceiling is not a truncated answer. Set the budget to that ceiling and resume. If the prompt <em>alone</em> is too large, reduce the <a href="miscellaneous.html#lemma-window">lemma window</a> or use a model with more room; retrying the same request won’t help.</li>
+        </ul>
+
+        <nav class="pager" aria-label="Pagination">
+          <a class="pager-link" href="index.html">
+            <span class="pager-dir">← Previous</span>
+            <span class="pager-title">Home</span>
+          </a>
+          <a class="pager-link next" href="structure.html">
+            <span class="pager-dir">Next →</span>
+            <span class="pager-title">Structure</span>
+          </a>
+        </nav>
+
+        <footer class="site-footer">
+          <span>Proofs · GPL-3.0-or-later</span>
+          <a href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">github.com/eoinmackall/proofs</a>
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <script src="assets/app.js" defer></script>
+</body>
+</html>

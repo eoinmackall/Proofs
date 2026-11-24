@@ -44,6 +44,6 @@ class PlainUI:
 
     @contextlib.contextmanager
     def paused(self) -> Iterator[None]:
-        """Around anything that reads the terminal (the human menu, a
+        """Around anything that reads the terminal (the manual menu, a
         pasted proof, a y/N): a live renderer stops drawing for it."""
         yield

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Proofs — Multi-Agent Theorem Prover</title>
+  <meta name="description" content="Build proofs lemma by lemma with language models. Inspect each argument, follow its citations, and share results through Git.">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body class="home-page">
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <a class="brand" href="index.html">
+      <img src="assets/favicon.svg" alt="" width="28" height="28">
+      <span>Proofs</span>
+    </a>
+    <nav class="topbar-nav" aria-label="Primary">
+      <a href="index.html" class="active" aria-current="page">Home</a>
+      <a href="getting-started.html">Getting Started</a>
+      <a href="structure.html">Documentation</a>
+      <a href="reference.html">Reference</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <div class="search-wrap topbar-search">
+      <input id="doc-search" class="search-input" type="search" placeholder="Search docs…" autocomplete="off" aria-label="Search documentation">
+      <span class="search-kbd">/</span>
+      <div id="search-results" class="search-results" hidden></div>
+    </div>
+    <a class="github-link" href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>GitHub</span>
+    </a>
+  </header>
+
+  <main id="main" class="home-stage">
+    <section class="hero hero-home" aria-labelledby="home-title">
+      <div class="eyebrow">Multi-Agent Theorem Prover</div>
+      <h1 class="hero-wordmark" id="home-title">
+        <span class="sr-only">Proofs</span>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 527.6 256.6" class="hero-wordmark-svg" aria-hidden="true" focusable="false">
+          <defs>
+            <linearGradient id="proofs-wordmark-grad" x1="8%" y1="10%" x2="96%" y2="88%">
+              <stop offset="0%" stop-color="var(--wordmark-start)"/>
+              <stop offset="55%" stop-color="var(--wordmark-mid)"/>
+              <stop offset="100%" stop-color="var(--wordmark-end)"/>
+            </linearGradient>
+          </defs>
+          <path fill="url(#proofs-wordmark-grad)" d="M31.2 168.1Q20.3 168.1 15.2 164.1Q10 160.1 10 154.4Q10 150 13.2 148.1Q16.3 146.1 19.4 146.1Q20.9 146.1 22.6 147.2Q24.4 148.3 24.4 150.7Q24.4 152.6 22.7 154.2Q21 155.7 18.7 155.7Q17.4 155.7 16.2 155.5Q15 155.3 14 154.7L14 155.2Q14 159.6 18.3 162.4Q22.6 165.3 29.9 165.3Q36.3 165.3 42.1 163.1Q48 160.9 55 154.7Q62.1 148.5 71.8 136.6Q81.4 124.7 95.5 105.3Q89.9 101.6 89.9 96.5Q89.9 92 93.8 89.1Q97.7 86.2 102 86.2Q103.9 86.2 104.2 86.7Q104.5 87.2 104.5 87.2Q104.5 87.8 103.3 88Q98.7 88.7 96.3 91.6Q93.9 94.5 93.9 98.4Q93.9 100.7 97.2 102.9L98.6 101Q109.5 86.3 119.2 75.2Q129 64.1 138.7 55.3Q148.3 46.6 159 39.3L163.1 36.6Q157.4 33.1 148.5 31.3Q139.6 29.5 127.4 29.5Q108.3 29.5 91.2 34.9Q74.2 40.3 61.2 49Q48.2 57.8 41 68.2Q33.7 78.5 34 88.4Q34.3 96.6 38.8 99.8Q43.3 103 47.6 103Q54.8 103 62.1 98.6Q69.4 94.2 76.1 87.3Q82.7 80.4 88 72.7Q93.3 65 96.6 58.1Q99.8 51.3 100.3 47.2Q100.6 43.8 101.7 43.8Q102.7 43.8 102.7 46.9Q103 55.6 99.3 65.8Q95.6 75.9 88.4 85Q81.1 94.1 70.7 99.9Q60.3 105.7 47.3 105.7Q41.7 105.7 36.4 101.1Q31.1 96.5 30.9 89Q30.6 79.2 36 70.1Q41.4 61 51 53.2Q60.6 45.4 73 39.6Q85.5 33.8 99.4 30.6Q113.3 27.3 127.2 27.3Q139.7 27.3 149.5 29.2Q159.3 31.1 166.5 34.6Q172.7 31.1 177.5 29.5Q182.2 27.9 184.6 27.9Q186.5 27.9 186.6 28.9Q186.6 29.5 186.2 29.9Q185.7 30.3 184 30.5Q177.4 31.8 170.1 36.5Q178.2 41.3 182.2 48Q186.2 54.7 186.2 62.5Q186.2 71.8 180.8 80.5Q175.4 89.2 166.2 96.1Q157 103 145.4 107Q133.9 111.1 121.6 111.1Q113.7 111.1 107 109.7Q90.6 131.7 77 144.4Q63.4 157.2 52.1 162.7Q40.7 168.1 31.2 168.1ZM121.2 108.5Q129.2 108.5 138.4 105.2Q147.6 101.8 155.8 95.2Q163.9 88.6 169.1 78.8Q174.2 68.9 174.2 56Q174.2 45.4 166.5 39Q155.6 46.9 143.6 61.1Q131.6 75.3 118.2 94.1Q115.8 97.6 113.5 100.8Q111.2 104.1 108.9 107.2Q115.1 108.5 121.2 108.5ZM185.1 168.1Q179.5 168.1 176 165.2Q172.5 162.4 172.5 157.8Q172.5 149.8 184.2 138.5Q195.9 127.2 215.9 113.8Q205.7 112.1 198.4 110.4Q191 108.7 186.6 106.7Q184.6 110.7 180.8 116.5Q177 122.3 171.1 129Q167.1 133.7 165.1 135.6Q163.1 137.5 162.3 137.8Q161.6 138.2 161.5 138.4Q161.2 138.5 161.2 137.8Q161.1 137.1 161.2 136.7Q161.2 136.3 162.7 134.8Q164.2 133.3 169 127.3Q174 121 177.9 115.3Q181.8 109.6 183.9 105.3Q180.3 103 179.7 100.2Q178.9 95.4 181.6 91.5Q184.3 87.6 188.6 87.6Q193.9 87.6 193.9 92.2Q193.9 94.5 193 96.1Q192.1 97.7 191.2 99.2Q189.4 101.3 189.4 104.5Q189.4 105.5 192.9 106.7Q196.3 107.8 201.4 108.9Q206.4 109.9 211.3 110.7Q216.2 111.4 219 111.6Q220.9 111.7 221.4 112.2Q221.8 112.8 221.8 113.1Q221.8 114.1 218.9 116.4Q213.4 120.6 207.6 126.5Q201.8 132.5 196.8 138.8Q191.8 145.2 188.7 150.8Q185.6 156.4 185.6 160Q185.6 164.7 189.4 164.7Q194.3 164.7 200.1 161.4Q205.9 158.1 211.9 153.1Q217.8 148.1 223.1 142.8Q228.3 137.4 232.1 133.2Q235.9 128.9 237.4 127.3L239.4 129Q237.2 131.1 233.2 135.6Q229.1 140.2 223.7 145.8Q218.3 151.3 212 156.4Q205.6 161.5 198.8 164.8Q192 168.1 185.1 168.1ZM243.1 168.1Q234.7 168.1 230.7 164.2Q226.7 160.4 226.2 154.8Q225.9 148 229.1 140.2Q232.2 132.4 235.9 127.1Q240.8 120.2 247.8 113.8Q254.8 107.5 263.1 103.5Q271.5 99.4 280.3 99.4Q285.6 99.4 289.5 102.2Q293.3 104.9 293.7 110.9Q294.2 119.4 290.4 128.8Q286.6 138.1 280.1 146.1Q280.8 149 284.6 149Q288.3 149 292.7 146.1Q297.1 143.1 301.2 139.1Q305.4 135.1 308.4 131.7Q311.4 128.3 312.4 127.3L314.6 129Q312.7 130.8 309.2 134.6Q305.7 138.3 301.4 142.2Q297.2 146.2 292.8 149Q288.3 151.8 284.4 151.8Q279.6 151.8 277.9 148.8Q270.5 157.2 261.2 162.7Q252 168.1 243.1 168.1ZM245.7 165.1Q249.2 165.1 253.8 163.1Q258.4 161.1 263 157.8Q270.7 152.3 276.9 144.9L276.9 144.5Q276.9 138.3 280.2 134.7Q283.4 131 286.5 130Q291.4 119.8 290.9 111.7Q290.6 106.8 288.4 104.9Q286.1 103 283.4 103Q277.6 103 269.2 109.8Q260.7 116.7 250.3 129.6Q242.9 138.9 239.9 145.3Q237 151.7 237.4 156.4Q237.4 159.1 239.2 162.1Q241.1 165.1 245.7 165.1ZM318.3 168.1Q309.9 168.1 305.9 164.2Q301.9 160.4 301.4 154.8Q301.1 148 304.2 140.2Q307.4 132.4 311.1 127.1Q316 120.2 323 113.8Q330 107.5 338.4 103.5Q346.7 99.4 355.5 99.4Q360.8 99.4 364.6 102.2Q368.5 104.9 368.9 110.9Q369.4 119.4 365.6 128.8Q361.8 138.1 355.3 146.1Q356 149 359.8 149Q363.5 149 367.9 146.1Q372.3 143.1 376.5 139.1Q380.6 135.1 383.6 131.7Q386.6 128.3 387.6 127.3L389.8 129Q387.9 130.8 384.4 134.6Q380.9 138.3 376.7 142.2Q372.4 146.2 368 149Q363.5 151.8 359.6 151.8Q354.8 151.8 353.1 148.8Q345.7 157.2 336.5 162.7Q327.2 168.1 318.3 168.1ZM320.9 165.1Q324.4 165.1 329 163.1Q333.6 161.1 338.2 157.8Q345.9 152.3 352.1 144.9L352.1 144.5Q352.1 138.3 355.4 134.7Q358.6 131 361.7 130Q366.6 119.8 366.1 111.7Q365.8 106.8 363.6 104.9Q361.3 103 358.6 103Q352.8 103 344.4 109.8Q335.9 116.7 325.5 129.6Q318.1 138.9 315.1 145.3Q312.2 151.7 312.6 156.4Q312.6 159.1 314.5 162.1Q316.3 165.1 320.9 165.1ZM346.9 246.6Q342.8 246.6 340 243.9Q337.2 241.1 337.1 236.9Q336.9 232.8 338.6 227.6Q340.2 222.3 345.1 213.5Q349.9 204.7 359.1 190.2Q368.3 175.7 383.3 153.2L392.4 139.5Q389.4 134.8 388.3 130.1Q387.2 125.4 387.6 122.6Q388.1 119.4 389.9 117.4Q391.6 115.3 394.1 115.3Q396.4 115.3 398 116.9Q399.5 118.5 399.5 121.4Q399.5 123.6 397.5 126.7Q395.5 129.8 393 131.1Q393.4 133.3 394.7 136Q409.1 114 418.4 99.6Q427.7 85.2 433.2 76.5Q438.8 67.7 441.9 63Q444.9 58.2 446.7 55.6Q461 35.1 473.4 22.5Q485.7 10 493.3 10Q497.6 10 499.7 12.5Q501.8 15 501.9 18.6Q502.3 27.1 496.6 38.8Q491 50.6 481.2 63.8Q471.5 77.1 459.1 90.2Q446.8 103.3 433.6 114.6Q420.4 125.9 408 133.7L400.9 144.7Q403.1 146.6 405.9 147.8Q408.6 149 412 149.2Q424.3 150 432.8 146.2Q441.2 142.5 446.8 137.1Q452.4 131.6 455.8 127.4L458.1 129Q456.5 130.5 453 134.6Q449.4 138.6 443.8 142.9Q438.1 147.3 430.2 150.1Q422.3 152.8 411.9 151.7Q408.1 151.3 405 150.1Q401.9 148.9 399.4 147.1L395.3 153.5Q394 171 389.6 187.6Q385.2 204.2 378.6 217.6Q371.9 230.9 363.8 238.8Q355.7 246.6 346.9 246.6ZM411.6 128.1Q422.7 120.6 434.7 109.7Q446.7 98.7 458 86.1Q469.2 73.4 478.2 60.7Q487.3 48 492.5 36.9Q497.7 25.8 497.4 18Q497.3 15.2 496 13.7Q494.7 12.3 492.8 12.3Q490.7 12.3 487.4 14.8Q484.1 17.4 479 24.1Q473.8 30.8 465.8 43.4Q456.6 58 448.1 71.3Q439.6 84.6 430.8 98.3Q421.9 112.1 411.6 128.1ZM347.6 244.1Q351.9 244.1 358.6 238Q365.3 231.9 372.4 220.6Q379.4 209.2 384.8 193.5Q390.2 177.7 392 158.5Q382.7 172.6 374 185.8Q365.3 199 358.3 210.1Q351.3 221.1 347.2 228.9Q343.1 236.7 343.1 239.9Q343.1 241.5 344.4 242.8Q345.6 244.1 347.6 244.1ZM450.3 170.2Q447.2 170.2 442.3 169.4Q437.4 168.6 433.6 166Q429.7 163.4 429.7 157.9Q429.7 152.9 432.8 149.7Q435.8 146.4 439.5 144.8Q443.2 143.2 445 143.2Q449.1 143.2 449.1 147Q449 148.6 446.9 149.9Q444.7 151.3 442.1 151.3Q440.9 151.3 439.8 150.4Q438.6 149.6 437.9 149.2Q436.8 150.3 434.6 152.4Q432.3 154.6 432.3 158Q432.3 161.8 435.4 163.7Q438.4 165.5 442.2 166.1Q446 166.6 448 166.6Q452.2 166.6 458.5 163.2Q464.8 159.9 470.2 152Q475.7 144.1 477.3 130.5Q477.8 125.7 478.2 117.2Q478.7 108.7 481.4 100.9Q481.5 100.6 481.5 100Q477.7 104.7 473.3 110.1Q468.9 115.5 464.9 120.5Q460.8 125.5 457.9 129Q455.9 131.4 455 132.1Q454.1 132.8 454.2 132.8Q454.1 132.8 453.5 132.9Q452.8 132.9 452.4 132.2Q452.2 131.7 453.4 130.3Q454.5 128.9 455.8 127.3Q458.1 124.7 462.9 119Q467.7 113.3 473.1 106.8Q478.4 100.3 482.3 95.3Q482.9 92.3 484.1 89.9Q485.3 87.5 487.5 87.5Q491.5 87.5 491.5 90.8Q491.4 92.7 486.9 97.9Q484.2 101.1 484 102.1Q483.8 103 483.8 104.5Q483.7 108.1 484.6 113.5Q485.4 118.8 486.4 124.7Q487.4 130.5 487.7 135.8Q488 143.7 485.9 149.5Q487.5 149.7 488.6 149.7Q491.8 149.7 496 146.8Q500.1 143.9 504.2 139.9Q508.3 135.9 511.4 132.3Q514.4 128.7 515.4 127.3L517.6 129Q515.9 130.8 512.6 134.6Q509.3 138.3 505.1 142.4Q500.9 146.4 496.6 149.2Q492.2 152.1 488.3 152.1Q487.4 152.1 486.6 152.1Q485.8 152 485 151.9Q480.3 162.3 471.1 166.2Q461.9 170.2 450.3 170.2Z"/>
+        </svg>
+      </h1>
+      <p class="hero-tagline">
+        Give a language model a conjecture to work on, one lemma at a time. Read each argument and trace the earlier results it uses.
+      </p>
+
+      <div class="btn-row">
+        <a class="btn btn-primary" href="getting-started.html">Get Started</a>
+        <a class="btn btn-secondary" href="structure.html">How It Works</a>
+      </div>
+    </section>
+
+    <!--
+      Example graphs: export with
+        proofs export NAME -o docs/examples -n NAME --format html
+      and list each file in docs/examples/dags.json ({file, title, stats, size, command}).
+      Overwriting an existing file updates the viewer in place; Prev/Next appear once
+      the manifest lists more than one graph.
+    -->
+    <section id="example" class="home-section" aria-labelledby="example-title">
+      <h2 id="example-title" class="home-section-title">A real proof graph</h2>
+      <p class="home-section-lead">
+        Load the graph and select a dot to read a lemma’s statement and proof. Follow a line downward to a lemma it cites, or upward to one that uses it. A hollow dot is a suspended lemma: you can still read it, but a new proof cannot rely on it.
+      </p>
+
+      <div class="showcase-panel" aria-label="Example proof graph">
+        <div class="showcase-bar">
+          <div class="showcase-title">
+            <span id="dag-viewer-title">Semisimplicity</span>
+            <span id="dag-viewer-stats" class="showcase-stats">1,141 lemmas · 2,855 citations · 3 contributors</span>
+          </div>
+          <div class="showcase-controls">
+            <div class="dag-nav-group" role="group" aria-label="Switch example graph" hidden>
+              <button id="dag-prev" class="toggle-btn" type="button" aria-label="Previous graph">← Prev</button>
+              <span id="dag-viewer-count" class="dag-counter" aria-live="polite">1 / 1</span>
+              <button id="dag-next" class="toggle-btn" type="button" aria-label="Next graph">Next →</button>
+            </div>
+            <a id="dag-open-full" class="toggle-btn" href="examples/semisimplicity.html" target="_blank" rel="noopener noreferrer">Open in New Tab ↗</a>
+          </div>
+        </div>
+
+        <div class="dag-frame-wrap">
+          <div id="dag-poster" class="dag-poster">
+            <button id="dag-load" class="btn btn-primary" type="button">Load Interactive Graph</button>
+            <span id="dag-size" class="dag-poster-note">8.7 MB · math rendered with KaTeX, works offline</span>
+          </div>
+          <iframe id="dag-frame" class="dag-frame" title="Semisimplicity — interactive citation graph" hidden></iframe>
+        </div>
+
+        <div class="dag-footer-bar">
+          <span>Made with <code id="dag-viewer-command">proofs export semisimplicity -o examples -n semisimplicity --format html</code></span>
+        </div>
+      </div>
+    </section>
+
+    <footer class="home-footer">
+      <span>Proofs · GPL-3.0-or-later</span>
+      <a href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">github.com/eoinmackall/proofs</a>
+    </footer>
+  </main>
+
+  <script src="assets/app.js" defer></script>
+  <script src="assets/showcase.js" defer></script>
+</body>
+</html>

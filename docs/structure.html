@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Structure — Proofs Docs</title>
+  <meta name="description" content="Proofs as a pipeline: plan, generate lemmas, prove, verify, revise. Bring your own model, run workers in parallel, or take manual control.">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <button id="menu-toggle" class="menu-btn" type="button" aria-label="Toggle navigation" aria-expanded="false">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <a class="brand" href="index.html">
+      <img src="assets/favicon.svg" alt="" width="28" height="28">
+      <span>Proofs</span>
+    </a>
+    <nav class="topbar-nav" aria-label="Primary">
+      <a href="index.html">Home</a>
+      <a href="getting-started.html">Getting Started</a>
+      <a href="structure.html" class="active" aria-current="page">Documentation</a>
+      <a href="reference.html">Reference</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <a class="github-link" href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>GitHub</span>
+    </a>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar" aria-label="Documentation">
+      <div class="search-wrap">
+        <input id="doc-search" class="search-input" type="search" placeholder="Search docs…" autocomplete="off" aria-label="Search documentation">
+        <span class="search-kbd">/</span>
+        <div id="search-results" class="search-results" hidden></div>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Overview</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="index.html">Home</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Getting Started</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="getting-started.html#quickstart">Quickstart</a></li>
+          <li><a class="nav-link" href="getting-started.html#installation">Installation</a></li>
+          <li><a class="nav-link" href="getting-started.html#workspaces">Workspaces</a></li>
+          <li><a class="nav-link" href="getting-started.html#backends">Backends &amp; Routing</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Documentation</div>
+        <ul class="nav-list">
+          <li>
+            <a class="nav-link active" href="structure.html">Structure</a>
+            <ul class="nav-sub">
+              <li><a href="#pipeline">The Pipeline</a></li>
+              <li><a href="#byom">Bring Your Own Model</a></li>
+              <li><a href="#parallel-mode">Parallel Mode</a></li>
+              <li><a href="#manual-mode">Manual Mode</a></li>
+            </ul>
+          </li>
+          <li><a class="nav-link" href="verification.html">Verification</a></li>
+          <li><a class="nav-link" href="collaboration.html">Collaboration</a></li>
+          <li><a class="nav-link" href="miscellaneous.html">Miscellaneous</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Reference</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="reference.html">CLI &amp; Settings</a></li>
+        </ul>
+      </div>
+    </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+
+    <div class="main-wrap">
+      <main id="main" class="content">
+        <div class="eyebrow">Documentation</div>
+        <h1>Structure</h1>
+        <p class="lead">
+          A run does not ask for the whole proof in one answer. It starts from the claim in <code>conjecture.md</code> and tries to establish smaller claims, called lemmas. Each accepted lemma can cite earlier ones. These statements and citations form a directed acyclic graph (DAG): follow a proof’s citations far enough and you reach its starting points, not the proof you started from.
+        </p>
+
+        <h2 id="pipeline">The Pipeline</h2>
+        <p>
+          Take the <a href="getting-started.html#quickstart">parity conjecture</a>: if an integer’s square is even, the integer is even. A useful lemma would be “the square of an odd integer is odd.” A prover could write the integer as 2<em>k</em> + 1 and expand its square. Once that argument passes review, a later proof can cite the lemma and take its contrapositive instead of repeating the algebra.
+        </p>
+        <p>
+          Here is one iteration of a serial run. An <em>agent</em> is a role with a particular prompt, not necessarily a different model. The models propose the mathematics; Proofs assigns the IDs, checks that citations exist, and writes the records.
+        </p>
+
+        <ol>
+          <li>
+            <strong>Planner (<code>planner.md</code>):</strong> reads the conjecture, a <a href="miscellaneous.html#lemma-window">selection of usable lemmas</a>, and recent unsuccessful attempts. It proposes five possible next steps toward a proof or a counterexample. Each gets an ID now, but none is evidence yet: one candidate cannot assume another candidate is true.
+          </li>
+          <li>
+            <strong>Selection:</strong> in <code>--mode auto</code>, a serial run picks one candidate uniformly at random. Parallel workers take the oldest available candidate from a shared queue. In <a href="#manual-mode">manual mode</a>, you choose from a menu.
+          </li>
+          <li>
+            <strong>Prover (<code>prover.md</code>):</strong> drafts a proof and lists the lemmas (<code>cited_lemmas</code>), references (<code>cited_references</code>), and optional computations (<code>code_runs</code>) it relies on. Proofs checks the citations first. If one is unknown or suspended, the proof goes back to the prover.
+          </li>
+          <li>
+            <strong>Verifiers:</strong> the same model reviews the proof with three different prompts:
+            <ul>
+              <li><code>verifier_1</code>: overall logical soundness and computations.</li>
+              <li><code>verifier_2</code>: definitions, citation fidelity, and exact match to the target conclusion.</li>
+              <li><code>verifier_3</code>: algebraic manipulations, inequalities, edge cases, and case completeness.</li>
+              <li><code>coding_verifier.md</code> (4th check): added automatically when a proof rests on <code>run_code</code> scripts.</li>
+            </ul>
+            Each check sees the draft and the statements it cites, not the proofs of those statements. A single rejection sends the objection to the reviser. If all checks pass, Proofs records a <a href="verification.html#certificates">certificate</a> and saves the lemma in the graph. A “commit” in the run log means this write, not a Git commit.
+          </li>
+          <li>
+            <strong>Reviser (<code>reviser.md</code>):</strong> reviews a rejected proof, or a partial proof that reached the context limit, and chooses one of three actions:
+            <ul>
+              <li><code>keep</code> — keep the statement and tell the prover how to address each objection.</li>
+              <li><code>revise_statement</code> — concrete evidence shows the statement is false or badly posed; rewrite it cleanly under the same ID.</li>
+              <li><code>new_lemma</code> — try a smaller lemma first, with a new ID and a fresh attempt budget.</li>
+            </ul>
+            After <code>run.max_proof_attempts</code> rounds without acceptance (three by default), the planner sees the statement on its reject list and can try a different route. Rejecting a draft is not a disproof of the statement.
+          </li>
+        </ol>
+
+        <h3 id="settling">Settling a Conjecture</h3>
+        <p>
+          A useful lemma need not settle the original question. Even if the planner says “we’re done,” Proofs looks for an accepted proof of the actual target. It computes the answer from the current graph:
+        </p>
+        <ul>
+          <li>A candidate can request <code>"settles": "conjecture"</code>. Proofs pins its statement to the text in <code>conjecture.md</code>, so the reviser cannot weaken it to get a proof through. For <code>conjecture_negation</code>, the pinned text asks for an explicit counterexample and proof that it is one. You can request either target as a statement in manual mode.</li>
+          <li>The candidate gets the same review as any other. The run stops as settled if someone’s usable lemma states the pinned text (apart from whitespace normalization) and its dependencies are usable all the way down.</li>
+          <li>If the target changes or its only proof relies on a now-refuted lemma, the question is open again. If the graph supports <em>both</em> outcomes, Proofs warns rather than choosing one.</li>
+        </ul>
+
+        <h3 id="checkpointing">Checkpointing &amp; Resuming</h3>
+        <p>
+          You can stop a long run without losing the lemmas it has already added. Those belong to the conjecture. Work <em>in progress</em> belongs to the run: its local <code>checkpoints/&lt;user_id&gt;/&lt;run_id&gt;/</code> holds the plan, the stage reached on each unfinished lemma, and any completed verifier verdicts. The run ID is the 16-digit hex string in the startup banner.
+        </p>
+        <ul>
+          <li><strong>Pause and continue:</strong> Press Ctrl-C once and let Proofs finish any commit in progress. Repeat your run command to continue from the checkpoint. The iteration count continues too: if you stopped at <code>--max-iterations 1</code>, raise the limit to do more work.</li>
+          <li><strong>Choose a run:</strong> By default Proofs resumes your latest checkpoint for this conjecture. If another process holds its lock, a new run starts alongside it. Use <code>--resume RUN_ID</code> to select a particular checkpoint, or <code>--fresh</code> for a new plan and budget. Neither clears the shared graph.</li>
+          <li><strong>Switch models:</strong> A saved proof keeps the name of the model that wrote it. A completed verifier step can be reused only if the proof hash and verifying model still match; otherwise that step runs again.</li>
+        </ul>
+
+        <h2 id="byom">Bring Your Own Model</h2>
+        <p>
+          You don’t need a team of servers to run a team of agents. One local or hosted model can take each role in turn; the planner and the prover behave differently because they receive different instructions and evidence. Use separate models when there is a reason to, for example to reserve an expensive model for proof writing and review.
+        </p>
+        <ul>
+          <li><strong>Set a default:</strong> <code>--host</code> and <code>--model</code> select the model for every role not routed elsewhere. To reuse that choice or assign a role to another model, set the routes in <code>.proofs-local.json</code>. See <a href="getting-started.html#backends">Backends &amp; Routing</a> for a working example.</li>
+          <li><strong>Separate author from reviewer:</strong> A lemma records the model that wrote the proof; a certificate or refutation records the model that reviewed it. The verifier prompts must all go to the same model so that each certificate names one reviewer model. Collaborators can check it again with their own.</li>
+          <li><strong>Allow a substitute:</strong> <code>--with-fallback</code> lets a call try a different configured model if its usual endpoint exhausts quota or retries. This is a choice for that call, not a permanent change of reviewer.</li>
+        </ul>
+
+        <div class="callout">
+          <div class="callout-title">Bring Your Own Prompts, Too</div>
+          <p>
+            For a hint like “try the contrapositive,” use <a href="miscellaneous.html#comments"><code>comments.md</code></a>. To change the prover’s instructions themselves, copy <code>proofs/agents/prover.md</code> into the conjecture directory beside <code>conjecture.md</code> and edit that copy. It replaces the default prompt for this conjecture only.
+          </p>
+        </div>
+
+        <h2 id="parallel-mode">Parallel Mode (<code>--parallel N</code>)</h2>
+        <p>
+          Start in serial mode to follow one argument. If your endpoint can serve several requests at once, <code>--parallel N</code> lets workers pursue different lemmas on the same conjecture. An acceptance by one worker becomes available to the others. Planning and generation count toward the same cap of <code>N</code> simultaneous calls; a free worker takes the first task that’s due:
+        </p>
+        <ol>
+          <li><strong>Plan</strong> (<code>parallel_planner.md</code>): writes a strategic summary and ordered priorities at startup, on operator replan, or every <code>run.replan_every</code> (default <code>5</code>) commits—always from scratch from the current DAG and reject list.</li>
+          <li><strong>Generate</strong> (<code>parallel_lemma_generator.md</code>): restocks the shared buffer with up to <code>k</code> fresh candidate lemmas, reserving slots before calling the model so concurrent generators never overflow the buffer.</li>
+          <li><strong>Prove</strong>: claims the oldest unclaimed lemma under lock and runs the exact same proof engine as serial mode.</li>
+        </ol>
+
+        <p>With a <a href="getting-started.html#backends">default model route</a> configured, try two iterations per worker. Otherwise append the same model flags as for a serial run.</p>
+<pre><code>proofs run parity --parallel 4 --max-iterations 2</code></pre>
+
+        <h3>The <code>N+2k</code> Buffer &amp; Coding Loops</h3>
+        <ul>
+          <li>The buffer has room for the <code>N</code> lemmas being worked on and two batches of waiting candidates. For example, at a 64K context budget with four workers, a batch has four lemmas: twelve slots in total. Batch size <code>k</code> adjusts with the context budget and never exceeds <code>N</code>. A worker’s claim on a slot prevents another worker proving the same candidate.</li>
+          <li>Model concurrency and code execution have separate limits. With <code>--parallel 4</code>, <code>--tools python</code>, and one available <a href="miscellaneous.html#sandbox-limits"><code>code.jobs</code> slot</a>, only one worker can run scripts. That <strong>coding loop</strong> takes candidates marked <code>"computation": true</code>; the other three can still work on ordinary arguments.</li>
+          <li>Each worker has its own iteration budget. They share the list of rejected lemmas so the next planning step can avoid an approach another worker already tried.</li>
+        </ul>
+
+        <h2 id="manual-mode">Manual Mode</h2>
+        <p>
+          Use <code>--mode manual</code> when you have a route in mind and don’t want the next step chosen at random. You take over selection, not verification. For instance, if candidate 2 is the odd-square lemma, <code>2p</code> asks the prover to write its proof; <code>2</code> means you will supply the proof yourself. If a verifier rejects your proof, you see the objection and return to the menu; nothing is added.
+        </p>
+        <p>
+          In a terminal, press <code>h</code> during a model call to switch modes at the next selection. At the menu, type <code>a</code> to return to automatic selection. Use <code>--hotkey ''</code> to disable the listener. With <code>--parallel 3 --mode manual</code>, only worker 0 pauses for you; the others keep working.
+        </p>
+        <ul>
+          <li><code>1</code>–<code>9</code>: prove that candidate yourself—paste or type your proof (bracketed-paste supported; <code>Alt+Enter</code> or <code>Ctrl+J</code> for newlines, <code>Enter</code> submits) and supply citations as comma-separated IDs or prover JSON. Your proof goes through the exact same three verifiers before entering the DAG.</li>
+          <li><code>1p</code>–<code>9p</code>: ask the prover to tackle that candidate.</li>
+          <li><code>w</code> / <code>wp</code>: write your own lemma statement and either prove it yourself (<code>w</code>) or hand it to the prover (<code>wp</code>).</li>
+          <li><code>r</code>: discard the shortlist and send the planner back with optional notes.</li>
+          <li><code>q</code>: save the checkpoint cleanly and exit.</li>
+        </ul>
+
+        <nav class="pager" aria-label="Pagination">
+          <a class="pager-link" href="getting-started.html">
+            <span class="pager-dir">← Previous</span>
+            <span class="pager-title">Getting Started</span>
+          </a>
+          <a class="pager-link next" href="verification.html">
+            <span class="pager-dir">Next →</span>
+            <span class="pager-title">Verification</span>
+          </a>
+        </nav>
+
+        <footer class="site-footer">
+          <span>Proofs · GPL-3.0-or-later</span>
+          <a href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">github.com/eoinmackall/proofs</a>
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <script src="assets/app.js" defer></script>
+</body>
+</html>

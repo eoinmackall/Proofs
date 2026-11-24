@@ -11,7 +11,8 @@ A setting is resolved key by key, the first of these that sets it winning:
 
 The files are the ones the code limits live in (tools/run_code/limits.py
 reads their code.* keys); both are gitignored. proofs init writes the
-workspace's with every key at its default, so the machine's settings are
+workspace's with every key at its default and the routing keys as blank
+fields to fill in (ROUTING_TEMPLATE), so the machine's settings are
 there to edit from the start; a conjecture's holds only the keys it
 overrides, and need not exist. The keys:
 
@@ -86,6 +87,38 @@ KEYS = tuple(DEFAULTS)
 MODELS_KEY = "llm.models"
 ROUTES_KEY = "llm.routes"
 ROUTING_KEYS = (MODELS_KEY, ROUTES_KEY)
+
+# The routing keys as proofs init writes them, to be filled in rather than
+# written from scratch: two models, one for any server (backend auto: a
+# llama-server is recognised by its probe) and one for an OpenAI-compatible
+# API with a key, and every route. Everything is blank, and llm/routing.py
+# reads a blank value as unset, so the file works untouched (with --host
+# and --model) until a model's fields are filled in and a route names it.
+# The routes are the roles of loops/reasoning.py's ROLES (verifier_* covers
+# every verifier), the two stages, default and fallback.
+_BLANK_MODEL_FIELDS: Dict[str, Any] = {
+    "host": "", "model": "", "api_key_env": "",
+    "ctx_budget": None, "temperature": None, "effort": "",
+}
+ROUTING_TEMPLATE: Dict[str, Any] = {
+    MODELS_KEY: {
+        "local": {"backend": "auto", **_BLANK_MODEL_FIELDS},
+        "openai_compatible": {"backend": "openai", **_BLANK_MODEL_FIELDS},
+    },
+    ROUTES_KEY: {
+        "default": "",
+        "planner": "",
+        "prover": "",
+        "verifier_*": "",
+        "reviser": "",
+        "parser": "",
+        "parallel_planner": "",
+        "parallel_lemma_generator": "",
+        "extract": "",
+        "compact": "",
+        "fallback": "",
+    },
+}
 
 # The Settings field each key sets.
 FIELDS: Dict[str, str] = {

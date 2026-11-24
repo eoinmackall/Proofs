@@ -251,7 +251,8 @@ def init(directory: Path) -> Tuple[Path, bool]:
 
     Creates directory and its conjectures/, writes the .proofs marker and
     a .proofs-local.json holding the built-in code limits and run settings
-    (limits.DEFAULTS, settings.DEFAULTS) when it is missing, and writes or updates the proofs block of its
+    (limits.DEFAULTS, settings.DEFAULTS) and the model routes as blank
+    fields to fill in (settings.ROUTING_TEMPLATE) when it is missing, and writes or updates the proofs block of its
     .gitignore. Safe to re-run: an existing marker, limits file and
     conjectures are left alone, and only the block is rewritten. A directory inside
     another workspace is refused — a nested workspace is almost certainly a
@@ -272,7 +273,7 @@ def init(directory: Path) -> Tuple[Path, bool]:
     if not local.exists():
         local.write_text(
             json.dumps({**limits.DEFAULTS, **settings.DEFAULTS,
-                        **{k: {} for k in settings.ROUTING_KEYS}}, indent=2)
+                        **settings.ROUTING_TEMPLATE}, indent=2)
             + "\n",
             encoding="utf-8",
         )

@@ -10,7 +10,7 @@
     proofs prune DIR                  remove refuted lemmas [--with-dependents]
     proofs migrate [DIR]              convert a format-1 workspace to streams
     proofs status DIR LEMMA_ID        a lemma's closure: hashes, certificates
-    proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex|html|png
+    proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex|html|png [--theme THEME]
                                     write the DAG as LaTeX, an interactive graph or an image
     proofs limits DIR                 show the code limits in effect, and their sources
     proofs tools lock DIR             write DIR's tools.lock from its flake (maintainer)
@@ -472,9 +472,14 @@ def build_parser() -> argparse.ArgumentParser:
              "interactive citation graph; png: a static image of the graph.",
     )
     p.add_argument(
-        "--theme", choices=("light", "dark"), default=None,
-        help="The image's colours, for --format png (default light). The "
-             "HTML page follows the viewer's setting, with a toggle.",
+        "--theme", choices=export_command.THEMES["png"], default=None,
+        help="The colours. For --format png, the image's (default light): "
+             "light, dark, or the documentation site's palette — proofs "
+             "(its dark variant) or proofs-light. For --format html, the "
+             "theme the page opens in until the viewer picks another with "
+             "its Light / Dark / Theme switch (default proofs: the docs' "
+             "palette, following the viewer's OS setting); proofs-light is "
+             "for images only.",
     )
     p.set_defaults(func=_cmd_export, parser=p)
     return parser
@@ -827,9 +832,13 @@ def _cmd_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         )
     if args.lemma_id is not None and args.user is not None:
         parser.error("give a LEMMA_ID or --user, not both")
-    if args.theme is not None and args.fmt != "png":
-        parser.error("--theme is for --format png; the HTML page follows "
-                     "the viewer's setting, with a toggle")
+    if args.theme is not None and args.fmt == "latex":
+        parser.error("--theme is for --format html or png")
+    if args.theme is not None and args.theme not in export_command.THEMES[args.fmt]:
+        parser.error(
+            f"--theme {args.theme} is for --format png; the page's Theme "
+            f"(--theme proofs) follows the viewer's OS setting to light or "
+            f"dark on its own")
     root = _require_conjecture_dir(args.dir, args.user_id, args.workspace_root, parser)
     rc = export_command.export_entry(
         lemma_id=args.lemma_id,
@@ -839,7 +848,7 @@ def _cmd_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> No
         user_id=args.user_id,
         parser=parser,
         fmt=args.fmt,
-        theme=args.theme or "light",
+        theme=args.theme,
         name=args.name,
     )
     sys.exit(rc)

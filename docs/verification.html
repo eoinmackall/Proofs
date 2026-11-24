@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Verification — Proofs Docs</title>
+  <meta name="description" content="Merkle-hashed certificates, stochastic citation rechecks, refutations and suspension, and the verify, repair, prune and status commands.">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <button id="menu-toggle" class="menu-btn" type="button" aria-label="Toggle navigation" aria-expanded="false">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <a class="brand" href="index.html">
+      <img src="assets/favicon.svg" alt="" width="28" height="28">
+      <span>Proofs</span>
+    </a>
+    <nav class="topbar-nav" aria-label="Primary">
+      <a href="index.html">Home</a>
+      <a href="getting-started.html">Getting Started</a>
+      <a href="structure.html" class="active" aria-current="page">Documentation</a>
+      <a href="reference.html">Reference</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <a class="github-link" href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>GitHub</span>
+    </a>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar" aria-label="Documentation">
+      <div class="search-wrap">
+        <input id="doc-search" class="search-input" type="search" placeholder="Search docs…" autocomplete="off" aria-label="Search documentation">
+        <span class="search-kbd">/</span>
+        <div id="search-results" class="search-results" hidden></div>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Overview</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="index.html">Home</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Getting Started</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="getting-started.html#quickstart">Quickstart</a></li>
+          <li><a class="nav-link" href="getting-started.html#installation">Installation</a></li>
+          <li><a class="nav-link" href="getting-started.html#workspaces">Workspaces</a></li>
+          <li><a class="nav-link" href="getting-started.html#backends">Backends &amp; Routing</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Documentation</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="structure.html">Structure</a></li>
+          <li>
+            <a class="nav-link active" href="verification.html">Verification</a>
+            <ul class="nav-sub">
+              <li><a href="#certificates">Certificates</a></li>
+              <li><a href="#citation-rechecks">Stochastic Citation Rechecks</a></li>
+              <li><a href="#suspension">Refutations &amp; Suspension</a></li>
+              <li><a href="#verify-repair-prune">Verify, Repair, Prune &amp; Status</a></li>
+            </ul>
+          </li>
+          <li><a class="nav-link" href="collaboration.html">Collaboration</a></li>
+          <li><a class="nav-link" href="miscellaneous.html">Miscellaneous</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Reference</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="reference.html">CLI &amp; Settings</a></li>
+        </ul>
+      </div>
+    </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+
+    <div class="main-wrap">
+      <main id="main" class="content">
+        <div class="eyebrow">Documentation</div>
+        <h1>Verification</h1>
+        <p class="lead">
+          There are two questions to ask about a lemma: “Who checked this argument?” and “Can I still rely on what it cites?” A certificate answers the first; Proofs follows the citations to answer the second. Verification here means review of a written argument by a language model, not a formal proof checked by a kernel. You can read the argument and have your own model challenge it.
+        </p>
+
+        <h2 id="certificates">Certificates &amp; Merkle Hashes</h2>
+        <p>
+          A lemma ID stays the same across repairs. A <strong>Merkle hash</strong> identifies the particular argument the verifiers reviewed. Proofs computes it from the files rather than trusting a stored “verified” flag. Schematically, the inputs are:
+        </p>
+<pre><code>SHA-256({
+  statement_hash,                    # whitespace-normalized statement
+  proof_hash,                        # whitespace-normalized proof
+  sorted_cited_statement_hashes,     # cited lemmas' statements + cited references' formal statements
+  computations                       # script hashes, languages and recorded RESULTs
+})</code></pre>
+        <ul>
+          <li><strong>What a citation pins:</strong> Suppose the parity proof cites “the square of an odd integer is odd.” Replacing the proof of that lemma changes <em>its own</em> hash, but the parity proof still uses the same statement. Its certificate need not change. Narrow the cited statement to positive odd integers, though, and the parity proof must be checked again: it claimed to cover negative integers too.</li>
+          <li><strong>What a certificate records:</strong> After all verifier steps accept, the verifying run records the lemma ID, hash, contributor, model, and date. A certificate counts only if its hash still matches. One acceptance is one complete round of review, not one vote per verifier prompt.</li>
+          <li><strong>What gets saved:</strong> A run stores any cited scripts and the certificate before appending the accepted lemma. A collaborator can therefore inspect the argument and its evidence together.</li>
+        </ul>
+
+        <h2 id="citation-rechecks">Stochastic Citation Rechecks</h2>
+        <p>
+          Reviewing every earlier proof on every citation would mean doing the same work repeatedly. Instead, before saving a model-written proof that passed review, <code>proofs run</code> samples each distinct lemma it cites directly. With the default base of 2, a cited lemma with one acceptance has a 1/2 chance of another check; after two acceptances, 1/4. In general the chance is <code>p<sup>−d</sup></code>, where <code>p</code> is the configured base and <code>d</code> counts acceptances for the current hash. This is a chance of <em>being checked</em>, not an estimate of mathematical correctness.
+        </p>
+        <ul>
+          <li>Set <code>run.citation_recheck_base</code> in local settings, or pass <code>--citation-recheck-base 1</code> to select every direct lemma citation. Use <code>-1</code> to turn sampling off. References from the literature are not sampled.</li>
+          <li>If a recheck rejects a proof, the refutation is against the <em>cited</em> lemma. Proofs still saves the new proof, but suspends it and every other lemma that depends on the refuted result. If the verifier gives no verdict, the run pauses instead; resuming retries the missing check.</li>
+          <li>Rechecks do not cascade transitively and do not automatically re-execute scripts; for a complete dependency audit, run <code>proofs verify DIR LEMMA_ID --full</code>.</li>
+        </ul>
+
+        <h2 id="suspension">Refutations &amp; Suspension</h2>
+        <p>
+          A verifier’s rejection of a <em>draft</em> is feedback for the reviser. Rejection of a <em>stored proof</em> by <code>verify</code>, <code>repair</code>, or a citation recheck writes a <strong>refutation</strong> under the conjecture’s <code>refutations/</code>. Read it to see which step was challenged and why. It objects to this proof, not necessarily to the truth of the statement. If the hash changes, the objection goes stale; later verifiers can still read the reason.
+        </p>
+        <p>
+          A <strong>suspended</strong> lemma is still in the files. You can inspect or repair it, but planners and provers cannot build on it. Proofs computes suspension when it reads the graph. Any of the following is enough:
+        </p>
+        <ul>
+          <li>It holds no valid certificate (<code>uncertified</code>).</li>
+          <li>A refutation matches its current hash (<code>refuted</code>).</li>
+          <li>It has conflicting fork versions or lies on a citation cycle.</li>
+          <li>It cites a missing reference, a missing lemma, or any suspended lemma.</li>
+        </ul>
+        <p>A lemma can therefore have a valid certificate and still be suspended. If the odd-square lemma is under challenge, the parity proof that cites it is unusable until that challenge is resolved. There is no “suspended” flag to edit by hand.</p>
+
+        <h2 id="verify-repair-prune">Verify, Repair, Prune &amp; Status</h2>
+        <p>
+          Start with <code>status</code>. Replace <code>LEMMA_ID</code> below with an ID from your run log or exported graph, such as <code>alice/3f9a2c1b4d5e6f70/7d1e90</code>. Status makes no model calls and changes no files. It shows dependencies first, so if a lemma is suspended only because of a citation, look earlier in the output for the underlying objection. Repairing that dependency can make the citing lemma usable again without another check of its own proof.
+        </p>
+<pre><code>proofs status parity LEMMA_ID</code></pre>
+        <p>
+          Use <code>verify</code> for a new opinion on the stored proof. Use <code>repair</code> when there is already an objection: it presents the objection to the verifiers and, if they uphold it, attempts a new proof under the same ID. Both commands need a <a href="getting-started.html#backends">model route or backend flags</a>. Choose the action that matches what you found:
+        </p>
+        <ul>
+          <li><code>proofs verify parity LEMMA_ID</code> checks just that argument. Add <code>--full</code> to check everything it relies on, dependencies first, stopping at the first rejection. <code>--parallel 3</code> runs up to three verifier checks on each lemma at once.</li>
+          <li><code>proofs verify parity --uncertified</code> works from the roots up on lemmas missing a valid certificate. It skips those blocked by a still-suspended dependency.</li>
+          <li><code>proofs repair</code> takes the path to a particular refutation JSON file. Alternatively, <code>proofs repair --all parity</code> tries the current refutations in dependency order. A repair that changes a statement also revisits affected proofs above it.</li>
+          <li>Reviewing a computation normally means reading the saved script and result. To reproduce a cited Python script on a conjecture with Python declared, use <code>proofs verify parity LEMMA_ID --tools python --run-code</code>. You see the script and must confirm before execution; see <a href="miscellaneous.html#computation-contract">the computation contract</a>.</li>
+        </ul>
+        <p>
+          <code>proofs prune parity</code> is cleanup, not a way to fix a proof. It removes still-refuted lemmas, compacts repaired versions and duplicate certificates, and clears stale scratch files. Normally, lemmas that cited a removed one stay in the graph, suspended. <code>--with-dependents</code> deletes those lemmas too. Commit or back up the workspace first if you want to retain that history.
+        </p>
+
+        <div class="callout">
+          <div class="callout-title">Exit Codes for Automation</div>
+          <p>
+            For <code>verify</code> and <code>repair</code>, <code>0</code> means the requested checks completed without a failure, <code>1</code> means a proof was rejected or a repair failed, and <code>3</code> means a verifier gave no verdict. A missing reply does not create a refutation; an outage is not evidence against a proof.
+          </p>
+        </div>
+
+        <nav class="pager" aria-label="Pagination">
+          <a class="pager-link" href="structure.html">
+            <span class="pager-dir">← Previous</span>
+            <span class="pager-title">Structure</span>
+          </a>
+          <a class="pager-link next" href="collaboration.html">
+            <span class="pager-dir">Next →</span>
+            <span class="pager-title">Collaboration</span>
+          </a>
+        </nav>
+
+        <footer class="site-footer">
+          <span>Proofs · GPL-3.0-or-later</span>
+          <a href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">github.com/eoinmackall/proofs</a>
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <script src="assets/app.js" defer></script>
+</body>
+</html>

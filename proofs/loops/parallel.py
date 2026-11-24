@@ -14,7 +14,7 @@ urgent task there is (ParallelState.next_task):
   prove     claim the oldest lemma in the buffer, run the shared proof
             engine (run_proof_loop) on it, record the outcome
 
-When --mode human, loop 0 is the operator's loop: each fresh start goes
+When --mode manual, loop 0 is the operator's loop: each fresh start goes
 to the menu with the buffer as its candidate list — the parallel version
 of the serial shortlist menu — and the hotkey toggles it between the menu
 and automation exactly as in the serial run. It takes plan and generate
@@ -50,7 +50,7 @@ from ..core.dag import (
 )
 from ..core.interrupts import _commit_section
 from ..validity.steps import VERIFIER_AGENTS
-from .human import _operator_citation_check, _verify_operator_proof, choose
+from .manual import _operator_citation_check, _verify_operator_proof, choose
 from .json_repair import parse_json_or_none
 from .mode import check_mode_toggle
 from . import strategies
@@ -83,7 +83,7 @@ def batch_size(ctx_budget: int, loops: int) -> int:
     return max(1, min(k, loops))
 
 
-_QUIT = object()  # sentinel: the human loop asked the run to stop
+_QUIT = object()  # sentinel: the manual loop asked the run to stop
 
 
 class LemmaBuffer:
@@ -254,7 +254,7 @@ class LemmaBuffer:
         return oldest["lemma"]
 
     def claim_id(self, loop_id: str, lemma_id: str) -> Optional[Dict[str, Any]]:
-        """Claim a named lemma — the human loop's pick. Same atomicity as
+        """Claim a named lemma — the manual loop's pick. Same atomicity as
         claim_oldest(): None when the id is not in the buffer unclaimed."""
         claimed = None
         with self.cond:
@@ -480,7 +480,7 @@ class ParallelState:
     # -- the scheduler -----------------------------------------------------
 
     def next_task(
-        self, loop_id: str, code: bool, human: bool,
+        self, loop_id: str, code: bool, manual: bool,
         on_wait: Callable[[], None] = lambda: None,
     ) -> Optional[Tuple[str, Any]]:
         """The worker's next task, the most urgent first; None on a stop.
@@ -494,7 +494,7 @@ class ParallelState:
                                batch; focus is the priority it is pointed
                                at when other generate tasks are running,
                                else None
-          ("menu", None)       the human loop's pick, once there is a plan
+          ("menu", None)       the manual loop's pick, once there is a plan
                                and none is being written
           ("prove", lemma)     the oldest lemma this worker may claim,
                                claimed
@@ -527,7 +527,7 @@ class ParallelState:
                                 focus = self._focus_locked()
                                 self.generators[loop_id] = focus if focus is not None else 0
                                 return ("generate", (n, focus))
-                    if human:
+                    if manual:
                         # Once the plan being written, if any, is in, and
                         # the buffer has a lemma or none is on its way.
                         if self.plan is not None and not self.planning and (
@@ -1294,7 +1294,7 @@ def _log_claim(ctx, loop_id: str, claimed: Dict[str, Any], verbose: bool) -> Non
            else "the oldest in the buffer."), verbose)
 
 
-def _parallel_human_step(
+def _parallel_manual_step(
     ctx,
     state: ParallelState,
     loop_id: str,
@@ -1304,7 +1304,7 @@ def _parallel_human_step(
     ref_ids: Set[str],
     verifier_sys: Dict[str, str],
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
-    """One human planning step: the buffer on the menu, as the serial run
+    """One manual planning step: the buffer on the menu, as the serial run
     puts the planner's shortlist. Loops until the operator commits to a
     lemma, hands the loop to automation, asks for a re-plan, or quits — the
     action is returned with the lemma, if any — and a quit stops the whole
@@ -1469,17 +1469,17 @@ def _parallel_worker(
     generate tasks' prompts: planner_sys, generator_sys, comments_block and
     ref_block.
 
-    Loop 0 is the operator's while --mode human: each lemma it proves is
+    Loop 0 is the operator's while --mode manual: each lemma it proves is
     picked at the menu (the buffer is the shortlist), and the hotkey still
     toggles it between the menu and automation. The engine's callbacks are
     the loop's share of the shared state: on_round publishes the resumable
     position, on_proof commits a lemma to the DAG, and a lemma that spends
     every prover round joins the shared reject list under its lock."""
-    is_human = lambda: loop_index == 0 and ctx.run.mode == "human"
+    is_manual = lambda: loop_index == 0 and ctx.run.mode == "manual"
     ctx.ui.log(
         f"{loop_id} starts"
-        + (" (the human loop — it asks before each lemma)."
-           if is_human() else " (automatic)."),
+        + (" (the manual loop — it asks before each lemma)."
+           if is_manual() else " (automatic)."),
         verbose,
     )
     while state.running():
@@ -1539,7 +1539,7 @@ def _parallel_worker(
                 # The siblings take the plan and generate tasks from here.
                 break
             task = state.next_task(
-                loop_id, ctx.loop.code_loop, is_human(),
+                loop_id, ctx.loop.code_loop, is_manual(),
                 on_wait=lambda: ctx.status(role="waiting for work", lemma="",
                                            attempt=""),
             )
@@ -1557,7 +1557,7 @@ def _parallel_worker(
                               needed, focus)
                 continue
             if kind == "menu":
-                action, lemma = _parallel_human_step(
+                action, lemma = _parallel_manual_step(
                     ctx,
                     state, loop_id, verbose, conjecture,
                     references, ref_ids, verifier_sys,
@@ -1664,7 +1664,7 @@ def run_parallel(ctx, parallel_loops: int, verbose: bool = True) -> Dict[str, An
     loops, and the scheduler that hands each worker its next task — a
     plan, a batch of candidates, or a lemma to prove — so that the run
     never has more than N model calls in flight. Loop 0 is the operator's
-    while --mode human. Returns the DAG, as run_loop does."""
+    while --mode manual. Returns the DAG, as run_loop does."""
 
     conjecture = load_file(ctx.paths.conjecture_file)
     if not conjecture:

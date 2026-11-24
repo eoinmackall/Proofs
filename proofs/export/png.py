@@ -13,9 +13,12 @@ rather than a traceback.
 
 The image is drawn at SCALE pixels a layout unit, and shrunk to fit when
 that would make it larger than 3840x2160 (MAX_WIDTH, MAX_HEIGHT): a small
-DAG gives a small image, a large one a monitor-size image. The theme is light unless --theme dark asks otherwise: an
-image has no viewer preference to follow, so the choice is made when it is
-drawn.
+DAG gives a small image, a large one a monitor-size image. The theme is
+light unless --theme asks for dark, proofs (the documentation site's
+palette, its dark variant) or proofs-light (its light one): an image has no
+viewer preference to follow, so the choice is made when it is drawn. A
+lemma that settles the conjecture is ringed twice in the ink and always
+labelled with what it settles.
 """
 
 from __future__ import annotations
@@ -47,6 +50,9 @@ BOTTOM = 160.0
 LABEL = 20.0
 LEGEND = 26.0
 EDGE_PX = 1.2
+# A settling lemma's two rings: their offsets past its radius, and width.
+SETTLE_RINGS = (6.0, 12.0)
+SETTLE_PX = 2.6
 
 
 def _lemmas(count: int) -> str:
@@ -83,17 +89,22 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
     nodes = graph["nodes"]
     edges = graph["edges"]
     # The legend: a dot and "user (n lemmas)" per colour, then the hollow
-    # ring for a suspended lemma when there is one.
+    # ring for a suspended lemma and the double ring for a settling one,
+    # when there is one. Each entry is (colour, text, mark), mark "fill",
+    # "hollow" or "settle".
     users = graph["users"]
     shown = users[:len(g.CATEGORICAL[theme])]
-    entries = [(g.colour(theme, k), f"{u['id']} ({_lemmas(u['count'])})", False)
+    entries = [(g.colour(theme, k), f"{u['id']} ({_lemmas(u['count'])})", "fill")
                for k, u in enumerate(shown)]
     if len(users) > len(shown):
         rest = sum(u["count"] for u in users[len(shown):])
         entries.append((g.OTHER[theme],
-                        f"{len(users) - len(shown)} other users ({_lemmas(rest)})", False))
+                        f"{len(users) - len(shown)} other users ({_lemmas(rest)})", "fill"))
     if any(nd["suspended"] for nd in nodes):
-        entries.append((t["ink2"], "suspended", True))
+        entries.append((t["ink2"], "suspended", "hollow"))
+    for kind in ("proved", "disproved"):
+        if any(nd.get("settles") == kind for nd in nodes):
+            entries.append((t["ink2"], g.SETTLES_TEXT[kind], "settle"))
     step = LEGEND * 1.6
     top = max(TOP, step * len(entries) + 100)
 
@@ -148,6 +159,15 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
                         for nd in nodes],
             linewidths=[1.6 * PT if nd["suspended"] else 1.0 * PT for nd in nodes],
             zorder=2))
+        settling = [i for i, nd in enumerate(nodes) if nd.get("settles")]
+        if settling:
+            rings = [(i, off) for i in settling for off in SETTLE_RINGS]
+            diam = [2 * (rad[i] + off) for i, off in rings]
+            ax.add_collection(EllipseCollection(
+                diam, diam, [0] * len(rings), units="xy",
+                offsets=[(X(nodes[i]["x"]), Y(nodes[i]["y"])) for i, _ in rings],
+                offset_transform=ax.transData, facecolors="none",
+                edgecolors=t["settle"], linewidths=SETTLE_PX * PT, zorder=2.5))
 
     # The permanent labels, placed greedily the way html.py places them:
     # the first of three steps away from the node that overlaps no label
@@ -157,11 +177,18 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
     for i in g.labelled(graph):
         nd = nodes[i]
         x, y0 = X(nd["x"]), Y(nd["y"])
-        top_row = nd["row"] == graph["rows"] - 1 and nd["cited_by"] == 0
-        text = g.short_id(nd["id"]) + ("" if top_row else f" ({nd['cited_by']})")
+        settles = nd.get("settles")
+        # A settling lemma's label goes above its rings, in the ink.
+        top_row = bool(settles) or (nd["row"] == graph["rows"] - 1
+                                    and nd["cited_by"] == 0)
+        if settles:
+            text = f"{g.short_id(nd['id'])} · {g.SETTLES_TEXT[settles]}"
+        else:
+            text = g.short_id(nd["id"]) + ("" if top_row else f" ({nd['cited_by']})")
         w = 0.62 * LABEL * len(text) + 10
+        reach = rad[i] + (SETTLE_RINGS[-1] if settles else 0.0)
         for k in range(3):
-            off = rad[i] + 12 + k * h
+            off = reach + 12 + k * h
             y = y0 - off if top_row else y0 + off
             box = (x - w / 2, y - h if top_row else y, w, h)
             if any(b[0] < box[0] + box[2] and box[0] < b[0] + b[2]
@@ -171,7 +198,7 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
             boxes.append(box)
             ax.text(x, y, text, ha="center", va="bottom" if top_row else "top",
                     fontsize=LABEL * PT, zorder=3, family="monospace",
-                    color=t["ink2"],
+                    color=t["ink"] if settles else t["ink2"],
                     bbox={"facecolor": t["surface"], "edgecolor": "none",
                           "alpha": 0.85, "pad": 2})
             break
@@ -190,10 +217,19 @@ def render_to(path: Union[str, os.PathLike], graph: Mapping[str, Any], *,
                     va="bottom", **style)
 
     y = 50.0
-    for col, text, hollow in entries:
-        ax.scatter([50], [y], s=(LEGEND * 0.55 * PT) ** 2, zorder=3,
-                   facecolors=t["surface"] if hollow else col, edgecolors=col,
-                   linewidths=2 * PT)
+    for col, text, mark in entries:
+        if mark == "settle":
+            # A small filled dot inside the two rings, as on the graph.
+            ax.scatter([50], [y], s=(LEGEND * 0.3 * PT) ** 2, zorder=3,
+                       facecolors=col, edgecolors="none")
+            for d in (LEGEND * 0.55, LEGEND * 0.85):
+                ax.scatter([50], [y], s=(d * PT) ** 2, zorder=3,
+                           facecolors="none", edgecolors=t["settle"],
+                           linewidths=1.6 * PT)
+        else:
+            ax.scatter([50], [y], s=(LEGEND * 0.55 * PT) ** 2, zorder=3,
+                       facecolors=t["surface"] if mark == "hollow" else col,
+                       edgecolors=col, linewidths=2 * PT)
         ax.text(72, y, text, va="center", fontsize=LEGEND * PT,
                 family="monospace", color=t["ink"])
         y += step

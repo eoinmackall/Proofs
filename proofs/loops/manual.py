@@ -1,4 +1,4 @@
-"""Human mode: the menu the planning step puts to the operator, and the
+"""Manual mode: the menu the planning step puts to the operator, and the
 operator's own proof, checked by the verifiers like any other.
 
 The menu (menu) runs at exactly one point in the loop — the planning step —
@@ -175,7 +175,7 @@ def _verify_operator_proof(
 
 
 def choose(ctx, *args: Any, **kwargs: Any) -> Choice:
-    """The human menu (menu), with the status board told the
+    """The manual menu (menu), with the status board told the
     loop is waiting on the operator, and a live renderer paused while they
     read and type."""
     ctx.status(role="waiting for you", lemma="", attempt="")

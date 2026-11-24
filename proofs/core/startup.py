@@ -120,7 +120,7 @@ that leaves less than COMPACT_MIN_ROOM even so is never sent: reason()
 returns "too_large", and each caller does something other than send it
 again.
 
-In --mode human the picker is a person, and picking is two decisions rather
+In --mode manual the picker is a person, and picking is two decisions rather
 than one: which lemma, and who proves it. A number and Enter means you prove
 that candidate yourself: you paste or type your proof and its citations, and
 the three verifiers check it exactly as they check the prover's — accepted, it
@@ -140,7 +140,7 @@ for why one of these is a keystroke and the other is a line of input.
 Usage
 -----
     proofs run conjectures/algebra_example --host http://localhost:8081 --model qwen3.8-27b
-    proofs run conjectures/algebra_example --host http://localhost:8081 --model qwen3.8-27b --mode human
+    proofs run conjectures/algebra_example --host http://localhost:8081 --model qwen3.8-27b --mode manual
     proofs parse conjectures/algebra_example
     proofs verify algebra_example alice/3f9a2c1b4d5e6f70/42 --full
     proofs repair conjectures/algebra_example/refutations/alice--3f9a2c1b4d5e6f70--42--bob--20250102T030405Z.json
@@ -287,15 +287,15 @@ def main(
         metavar="N",
         help=(
             "Run N proof loops in parallel, steered by one planner and one "
-            "lemma generator sharing one DAG. The human mode, when set, "
+            "lemma generator sharing one DAG. The manual mode, when set, "
             "takes the place of one of the loops (loop-0). "
             "Bare --parallel is N=1."
         ),
     )
     parser.add_argument(
-        "--mode", choices=("auto", "human"), default=DEFAULT_MODE,
+        "--mode", choices=("auto", "manual"), default=DEFAULT_MODE,
         help="auto: the loop picks a lemma from the planner's shortlist and "
-             "runs unattended (default). human: the shortlist is put to you at "
+             "runs unattended (default). manual: the shortlist is put to you at "
              "every planning step. Switchable mid-run either way.",
     )
     parser.add_argument(
@@ -398,14 +398,14 @@ def main(
         enabled=bool(args.hotkey),
         on_press=lambda: ctx.ui.log(
             f"\nMode change queued: "
-            f"{'automatic' if ctx.run.mode == 'human' else 'manual'} "
+            f"{'automatic' if ctx.run.mode == 'manual' else 'manual'} "
             f"from the next planning step."
         ),
     ).start()
     if ctx.run.mode == "auto" and ctx.run.hotkey.hint():
         ctx.ui.log(f"mode=auto {ctx.run.hotkey.hint()}", args.verbose)
-    elif ctx.run.mode == "human":
-        ctx.ui.log("mode=human — you pick the lemma at every planning step.", args.verbose)
+    elif ctx.run.mode == "manual":
+        ctx.ui.log("mode=manual — you pick the lemma at every planning step.", args.verbose)
 
     # Ctrl-C writes the checkpoint from the safe-boundary state in
     # ctx.run.live_state and exits 130; a second Ctrl-C force-quits. Installed

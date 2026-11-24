@@ -1,10 +1,10 @@
-"""The auto/human mode and the hotkey that toggles it mid-run."""
+"""The auto/manual mode and the hotkey that toggles it mid-run."""
 
 from __future__ import annotations
 
 # "auto" runs unattended: a lemma is picked from the shortlist at random
 # (serial) or taken oldest-first from the buffer (parallel).
-# "human" stops at every planning step. Set from --mode, then mutated by the
+# "manual" stops at every planning step. Set from --mode, then mutated by the
 # hotkey and the menu, so it is genuinely a run-time toggle rather than a
 # launch-time one.
 DEFAULT_MODE = "auto"
@@ -32,7 +32,7 @@ def check_mode_toggle(ctx, verbose: bool = True) -> None:
     """
     if not ctx.run.hotkey.take():
         return
-    ctx.run.mode = "auto" if ctx.run.mode == "human" else "human"
+    ctx.run.mode = "auto" if ctx.run.mode == "manual" else "manual"
     ctx.ui.log(
         "\nAutomation resumed; planning runs unattended from here."
         if ctx.run.mode == "auto"

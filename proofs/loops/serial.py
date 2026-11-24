@@ -19,7 +19,7 @@ from ..core.dag import (
 from ..core.interrupts import _commit_section
 from ..validity.steps import VERIFIER_AGENTS
 from ..workspace import settings as settings_mod
-from .human import _operator_citation_check, _verify_operator_proof, choose
+from .manual import _operator_citation_check, _verify_operator_proof, choose
 from .json_repair import parse_json_or_none
 from .mode import check_mode_toggle
 from .prompts import (
@@ -169,7 +169,7 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
     ctx.run.live_state["in_flight"] = in_flight
     ctx.run.live_state["plan"] = plan
     # The operator's reason for rejecting the last shortlist ('replan' at
-    # the human menu), for the next planner call only: it is not a
+    # the manual menu), for the next planner call only: it is not a
     # rejected lemma, and it is not checkpointed.
     operator_note = ""
 
@@ -376,7 +376,7 @@ def run_loop(ctx, verbose: bool = True) -> Dict[str, Any]:
             # was chosen by a person or at random, which is what keeps
             # --mode auto honest as a control.
             next_lemma: Optional[Dict[str, Any]] = None
-            if ctx.run.mode == "human":
+            if ctx.run.mode == "manual":
                 check = _operator_citation_check(dag, ref_ids, suspended)
                 choice = choose(
                     ctx,

@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Collaboration — Proofs Docs</title>
+  <meta name="description" content="How Proofs coordinates many contributors without a server: append-only per-run streams shared through Git and deterministic fork resolution.">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <button id="menu-toggle" class="menu-btn" type="button" aria-label="Toggle navigation" aria-expanded="false">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <a class="brand" href="index.html">
+      <img src="assets/favicon.svg" alt="" width="28" height="28">
+      <span>Proofs</span>
+    </a>
+    <nav class="topbar-nav" aria-label="Primary">
+      <a href="index.html">Home</a>
+      <a href="getting-started.html">Getting Started</a>
+      <a href="structure.html" class="active" aria-current="page">Documentation</a>
+      <a href="reference.html">Reference</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <a class="github-link" href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>GitHub</span>
+    </a>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar" aria-label="Documentation">
+      <div class="search-wrap">
+        <input id="doc-search" class="search-input" type="search" placeholder="Search docs…" autocomplete="off" aria-label="Search documentation">
+        <span class="search-kbd">/</span>
+        <div id="search-results" class="search-results" hidden></div>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Overview</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="index.html">Home</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Getting Started</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="getting-started.html#quickstart">Quickstart</a></li>
+          <li><a class="nav-link" href="getting-started.html#installation">Installation</a></li>
+          <li><a class="nav-link" href="getting-started.html#workspaces">Workspaces</a></li>
+          <li><a class="nav-link" href="getting-started.html#backends">Backends &amp; Routing</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Documentation</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="structure.html">Structure</a></li>
+          <li><a class="nav-link" href="verification.html">Verification</a></li>
+          <li>
+            <a class="nav-link active" href="collaboration.html">Collaboration</a>
+            <ul class="nav-sub">
+              <li><a href="#distributed-design">Distributed Design</a></li>
+              <li><a href="#streams">Append-Only Git Streams</a></li>
+              <li><a href="#forks">Reproofs &amp; Forks</a></li>
+            </ul>
+          </li>
+          <li><a class="nav-link" href="miscellaneous.html">Miscellaneous</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Reference</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="reference.html">CLI &amp; Settings</a></li>
+        </ul>
+      </div>
+    </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+
+    <div class="main-wrap">
+      <main id="main" class="content">
+        <div class="eyebrow">Documentation</div>
+        <h1>Collaboration</h1>
+        <p class="lead">
+          Share the workspace, not the Proofs installation. Git carries the conjecture, lemmas, and reviews between collaborators; there is no central proof database. You can use a different model from the person who started a conjecture and pick up from their accepted results.
+        </p>
+
+        <h2 id="distributed-design">Distributed Design</h2>
+        <p>
+          Suppose Alice proves that an odd integer has an odd square. After Bob pulls her files, his next run can cite that lemma by its ID. He doesn’t need her model, checkpoint, or terminal session. Three things make this possible:
+        </p>
+        <ul>
+          <li><strong>Stable names:</strong> Each ID includes a contributor, a run, and six hex digits, for example <code>alice/3f9a2c1b4d5e6f70/7d1e90</code>. It means the same lemma in every clone; Bob doesn’t renumber Alice’s results when he adds his own.</li>
+          <li><strong>Separate writers, one graph:</strong> Each run appends to its own files. At startup Proofs reads all runs for this conjecture into one graph, then adds its own new results. A running process doesn’t see another process’s writes live. Stop, pull, and resume to pick up new work.</li>
+          <li><strong>Checkable evidence:</strong> Certificates name the reviewer and model. Every clone with the same files computes the same <a href="verification.html#suspension">suspension state</a>; nobody has to merge a “solved” flag. For another opinion, Bob can run <code>proofs verify parity LEMMA_ID --full</code> with his own model.</li>
+        </ul>
+
+        <h2 id="streams">Git-Coordinated Append-Only Streams</h2>
+        <p>
+          <strong>Starting a shared project:</strong> From the <a href="getting-started.html#workspaces">workspace root</a>, initialize Git if needed and commit the marker, ignore rules, and conjecture. For the quickstart workspace, that first commit could be:
+        </p>
+<pre><code>cd ~/my-proofs
+git init
+git add .proofs .gitignore conjectures/parity
+git commit -m "Start the parity conjecture"</code></pre>
+        <p>
+          Push this repository to a remote you control using ordinary Git. A collaborator clones <em>that repository</em> and changes into it. The committed <code>.proofs</code> already makes the clone a workspace. Bob sets his identity once with <code>proofs config --global user.id bob</code> and supplies his own model flags or routes. Running <code>proofs init</code> at the root will create the ignored local settings template if it’s missing.
+        </p>
+        <p>
+          <strong>Adding results:</strong> On a branch tracking the shared remote, pull before you start. Here <code>parity</code> has a <a href="getting-started.html#backends">default model route</a> configured. After the run stops, inspect what you’re about to share; Proofs never commits, pushes, or pulls for you.
+        </p>
+<pre><code>git pull
+proofs run parity --max-iterations 3
+git add conjectures/parity
+git diff --cached --stat
+git commit -m "Add parity lemmas and certificates"
+git push</code></pre>
+        <p>The marker and ignore rules live at the workspace root. Inside a conjecture directory, share the mathematical records, not the files needed only to resume a particular process:</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Path</th><th>Written by</th><th>Committed</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>.proofs</code>, managed <code>.gitignore</code> block</td><td><code>proofs init</code></td><td>Yes</td></tr>
+              <tr><td><code>conjecture.md</code>, <code>references.md</code></td><td>Conjecture maintainer</td><td>Yes</td></tr>
+              <tr><td><code>flake.nix</code>, <code>flake.lock</code>, <code>tools.lock</code></td><td>Maintainer, if the conjecture uses <a href="miscellaneous.html#tool-versions">code tools</a></td><td>Yes</td></tr>
+              <tr><td><code>dags/&lt;user&gt;/&lt;run&gt;/000001.jsonl</code></td><td>That run (lemmas &amp; reproofs, ≤40 MB per file)</td><td>Yes</td></tr>
+              <tr><td><code>certificates/&lt;user&gt;/&lt;run&gt;/000001.jsonl</code></td><td>That run (acceptances)</td><td>Yes</td></tr>
+              <tr><td><code>computations/&lt;user&gt;/&lt;run&gt;/</code>, <code>code/&lt;user&gt;/&lt;run&gt;/</code></td><td>That run (script executions &amp; SHA-256 scripts)</td><td>Yes</td></tr>
+              <tr><td><code>refutations/*.json</code></td><td><code>verify</code>, <code>repair</code>, or citation rechecks</td><td>Yes</td></tr>
+              <tr><td><code>checkpoints/&lt;user&gt;/&lt;run&gt;/</code>, <code>scratch/</code></td><td>Local run state, locks, live scripts</td><td>No</td></tr>
+              <tr><td><code>references/</code>, <code>comments.md</code>, <code>.proofs-local.json</code></td><td>User-local sources, notes, machine settings</td><td>No</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>
+          A stream is a sequence of JSON Lines files: each starts with a header naming the contributor and run, followed by one record per line. Two contributors normally add different files, so Git can keep both. Maintenance is the exception: <code>prune</code> rewrites streams. Coordinate pruning with other writers. If a merge leaves a conflict marker in a stream, Proofs stops and names the file and line rather than guessing which records to keep.
+        </p>
+
+        <h2 id="forks">Reproofs &amp; Fork Resolution</h2>
+        <p>
+          What if Alice and Bob both repair the same lemma before seeing the other’s change? If both write a new proof, each <code>repair</code> appends a <code>reproof</code> under the original lemma ID in the repairer’s own stream. Its <code>supersedes</code> field names the version it replaces. Git may merge both files cleanly, yet the lemma now has two successor versions. This is a <strong>fork</strong> in the lemma’s history, not a Git branch. Proofs compares the statements rather than preferring the last writer:
+        </p>
+        <ul>
+          <li><strong>Agreeing statements</strong>: if the latest versions differ only in their proofs or in whitespace, any certified version can represent the lemma. If several qualify, the smallest lemma hash breaks the tie. <code>proofs prune</code> keeps the winning certified version and drops the rest.</li>
+          <li><strong>Conflicting statements:</strong> If one successor weakens the hypotheses while the other keeps them, a citation to the ID is ambiguous. Proofs suspends the lemma, reports the conflicting file and line locations, and leaves them alone even during pruning. Review the statements together, keep the intended version, and commit the resolution before building on it.</li>
+        </ul>
+
+        <nav class="pager" aria-label="Pagination">
+          <a class="pager-link" href="verification.html">
+            <span class="pager-dir">← Previous</span>
+            <span class="pager-title">Verification</span>
+          </a>
+          <a class="pager-link next" href="miscellaneous.html">
+            <span class="pager-dir">Next →</span>
+            <span class="pager-title">Miscellaneous</span>
+          </a>
+        </nav>
+
+        <footer class="site-footer">
+          <span>Proofs · GPL-3.0-or-later</span>
+          <a href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">github.com/eoinmackall/proofs</a>
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <script src="assets/app.js" defer></script>
+</body>
+</html>

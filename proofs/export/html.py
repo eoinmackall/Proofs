@@ -6,8 +6,14 @@ every edge into and out of it (one colour — what it cites is always below
 it, what cites it above) and shows its statement; clicking pins it in a
 side panel with its proof, what it cites and what cites it, and an option
 to highlight its full chain. Wheel or pinch zooms, dragging pans, the
-search box finds a lemma by id or hex suffix. Light and dark themes follow
-the viewer's OS setting, with a toggle.
+search box finds a lemma by id or hex suffix. A lemma that settles the
+conjecture is ringed twice and always labelled.
+
+Three themes, on a Light / Dark / Theme switch: neutral light, neutral
+dark, and Theme — the documentation site's palette (docs/assets/style.css),
+dark or light by the viewer's OS setting the way the site itself is. The
+page opens in the one --theme names (default Theme) and remembers the
+viewer's pick, per browser, when the browser allows it.
 
 Everything the page needs is inside it: the layout and the lemmas' text as
 JSON, the page's own script and stylesheet (export/page/), and KaTeX
@@ -32,7 +38,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
-__all__ = ["render"]
+__all__ = ["THEMES", "render"]
+
+# The switch's themes, as data-theme values, with their button labels.
+THEMES = {"light": "Light", "dark": "Dark", "proofs": "Theme"}
 
 _HERE = Path(__file__).parent
 _PAGE = _HERE / "page"
@@ -98,16 +107,20 @@ def render(
     lemmas: Mapping[str, Mapping[str, Any]],
     conjecture_name: str,
     scope: str,
+    theme: str = "proofs",
 ) -> str:
     """The page for graph (graph.layout's result) with labels (graph.labelled's
-    nodes), lemmas mapping each id to its node with its proof."""
+    nodes), lemmas mapping each id to its node with its proof, opening in
+    theme (a THEMES key)."""
+    if theme not in THEMES:
+        raise ValueError(f"the page's theme is one of {', '.join(THEMES)}, not {theme!r}")
     nodes = []
     for nd in graph["nodes"]:
         node = lemmas.get(nd["id"]) or {}
         nodes.append({
             "id": nd["id"], "o": nd["owner"], "row": nd["row"],
             "x": nd["x"], "y": nd["y"], "r": nd["r"], "n": nd["cited_by"],
-            "s": nd["suspended"], "ext": nd["external"],
+            "s": nd["suspended"], "res": nd.get("settles"), "ext": nd["external"],
             "refs": _cited_refs(node),
             "st": str(node.get("statement") or "").strip(),
             "pf": str(node.get("proof") or "").strip(),
@@ -117,12 +130,16 @@ def render(
         "users": graph["users"], "nodes": nodes, "edges": graph["edges"],
         "labels": labels, "strip": any(nd["row"] < 0 for nd in graph["nodes"]),
     }
+    switch = "".join(
+        f'<button type="button" data-theme="{key}" '
+        f'aria-pressed="{"true" if key == theme else "false"}">{label}</button>'
+        for key, label in THEMES.items())
     k = _katex()
     title = html.escape(conjecture_name)
     return "\n".join([
         "<!doctype html>",
         _notices(),
-        '<html lang="en">',
+        f'<html lang="en" data-theme="{theme}">',
         "<head>",
         '<meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
@@ -139,7 +156,7 @@ def render(
         'aria-label="Find a lemma" autocomplete="off">',
         '<datalist id="ids"></datalist>',
         '<button id="fit" title="Fit the graph to the window (0)">Fit</button>',
-        '<button id="theme" aria-label="Toggle light and dark theme">Dark</button>',
+        f'<div id="theme" class="seg" role="group" aria-label="Colour theme">{switch}</div>',
         "</header>",
         "<main>",
         '<div id="stage"><canvas id="base"></canvas><canvas id="over"></canvas>'

@@ -1,6 +1,14 @@
-/* The interactive citation graph (export/html.py). Colours are tokens:
-   light by default, dark under the viewer's OS setting unless the page's
-   toggle stamped data-theme="light", and dark whenever it stamped "dark". */
+/* The interactive citation graph (export/html.py). Colours are tokens,
+   one set per theme on <html data-theme>, which html.py writes and the
+   page's Light / Dark / Theme switch changes:
+     light    neutral light (also the fallback with no data-theme)
+     dark     neutral dark
+     proofs   the documentation site's palette (docs/assets/style.css):
+              midnight slate by default, its light variant under a light
+              OS setting — the same rule the site follows.
+   The --u0..--u7 slots match graph.py's CATEGORICAL, which png.py draws
+   with: change both together. --settle rings a lemma that settles the
+   conjecture: the ink, never a hue, since a hue on a node means its user. */
 :root {
   color-scheme: light;
   --page: #f9f9f7;
@@ -13,30 +21,14 @@
   --edge-alpha: 0.10;
   --wash: rgba(252, 252, 251, 0.82);
   --hl: rgba(11, 11, 11, 0.85);
+  --settle: #0b0b0b;
   --chip: #f0efec;
+  --on: #0b0b0b;
+  --on-ink: #fcfcfb;
   --u0: #2a78d6; --u1: #eb6834; --u2: #1baf7a; --u3: #eda100;
   --u4: #e87ba4; --u5: #008300; --u6: #4a3aa7; --u7: #e34948;
   --other: #898781;
   --shadow: 0 6px 24px rgba(11, 11, 11, 0.12);
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    color-scheme: dark;
-    --page: #0d0d0d;
-    --surface: #1a1a19;
-    --ink: #ffffff;
-    --ink2: #c3c2b7;
-    --muted: #898781;
-    --hairline: rgba(255, 255, 255, 0.10);
-    --edge-ink: #ffffff;
-    --edge-alpha: 0.12;
-    --wash: rgba(26, 26, 25, 0.84);
-    --hl: rgba(255, 255, 255, 0.85);
-    --chip: #2c2c2a;
-    --u0: #3987e5; --u1: #d95926; --u2: #199e70; --u3: #c98500;
-    --u4: #d55181; --u5: #008300; --u6: #9085e9; --u7: #e66767;
-    --shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
-  }
 }
 :root[data-theme="dark"] {
   color-scheme: dark;
@@ -50,10 +42,58 @@
   --edge-alpha: 0.12;
   --wash: rgba(26, 26, 25, 0.84);
   --hl: rgba(255, 255, 255, 0.85);
+  --settle: #ffffff;
   --chip: #2c2c2a;
+  --on: #ffffff;
+  --on-ink: #1a1a19;
   --u0: #3987e5; --u1: #d95926; --u2: #199e70; --u3: #c98500;
   --u4: #d55181; --u5: #008300; --u6: #9085e9; --u7: #e66767;
+  --other: #898781;
   --shadow: 0 6px 24px rgba(0, 0, 0, 0.5);
+}
+:root[data-theme="proofs"] {
+  color-scheme: dark;
+  --page: #0D131D;
+  --surface: #121925;
+  --ink: #F3EEE4;
+  --ink2: #BDBDBD;
+  --muted: #92A2B8;
+  --hairline: #243146;
+  --edge-ink: #DCEBFA;
+  --edge-alpha: 0.12;
+  --wash: rgba(18, 25, 37, 0.84);
+  --hl: rgba(243, 238, 228, 0.9);
+  --settle: #F3EEE4;
+  --chip: #1D2739;
+  --on: #2C639E;
+  --on-ink: #F3EEE4;
+  --u0: #3B7AC0; --u1: #E0457D; --u2: #BE8428; --u3: #1FA67E;
+  --u4: #8C6FE0; --u5: #2FA3C4; --u6: #E5683B; --u7: #B85CC9;
+  --other: #6F7D92;
+  --shadow: 0 12px 32px rgba(2, 9, 18, 0.45);
+}
+@media (prefers-color-scheme: light) {
+  :root[data-theme="proofs"] {
+    color-scheme: light;
+    --page: #FBFAF7;
+    --surface: #FFFFFF;
+    --ink: #18202C;
+    --ink2: #4F5866;
+    --muted: #646D7C;
+    --hairline: #E3DED4;
+    --edge-ink: #1B2B45;
+    --edge-alpha: 0.10;
+    --wash: rgba(255, 255, 255, 0.84);
+    --hl: rgba(24, 32, 44, 0.85);
+    --settle: #18202C;
+    --chip: #F1EEE7;
+    --on: #2C639E;
+    --on-ink: #FFFFFF;
+    --u0: #2C639E; --u1: #C2386A; --u2: #A87316; --u3: #16936A;
+    --u4: #6B4FD0; --u5: #1F86A6; --u6: #D2582A; --u7: #A04AB5;
+    --other: #8A93A1;
+    --shadow: 0 10px 28px rgba(30, 36, 48, 0.10);
+  }
 }
 
 * { box-sizing: border-box; }
@@ -91,6 +131,17 @@ header input, header button {
 header input { width: min(320px, 60vw); }
 header button { cursor: pointer; }
 header button:hover { background: var(--chip); }
+/* The theme switch: three buttons joined, the current one filled. */
+.seg { display: inline-flex; }
+header .seg button { border-radius: 0; margin-left: -1px; }
+header .seg button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+header .seg button:last-child { border-radius: 0 6px 6px 0; }
+header .seg button[aria-pressed="true"] {
+  background: var(--on);
+  border-color: var(--on);
+  color: var(--on-ink);
+  position: relative;
+}
 
 main { position: relative; flex: 1; min-height: 0; }
 #stage { position: absolute; inset: 0; background: var(--surface); touch-action: none; }
@@ -111,6 +162,14 @@ main { position: relative; flex: 1; min-height: 0; }
 #legend div { display: flex; align-items: center; gap: 8px; }
 .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
 .dot.hollow { background: transparent !important; border: 2px solid var(--ink2); }
+/* A settling lemma's double ring, drawn with rings of surface between. */
+.dot.settle {
+  width: 6px; height: 6px; margin: 0 4px;
+  background: var(--ink2);
+  box-shadow: 0 0 0 1.5px var(--wash), 0 0 0 2.5px var(--settle),
+              0 0 0 4px var(--wash), 0 0 0 5px var(--settle);
+}
+#legend .settled { margin: 4px 0 2px; }
 #legend .note { color: var(--ink2); margin-top: 4px; }
 
 #tip {
@@ -168,6 +227,7 @@ main { position: relative; flex: 1; min-height: 0; }
   color: var(--ink2);
   margin-left: 6px;
 }
+.badge.settle { border-color: var(--settle); color: var(--ink); font-weight: 600; }
 .links { display: flex; flex-wrap: wrap; gap: 4px; }
 .links button, .links span {
   font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;

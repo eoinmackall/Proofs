@@ -95,7 +95,7 @@ def _null_hotkey() -> Any:
 class RunState:
     """What the whole process shares and mutates while it runs."""
 
-    # "auto" or "human"; the hotkey and the menu retarget it mid-run.
+    # "auto" or "manual"; the hotkey and the menu retarget it mid-run.
     mode: str = "auto"
     # The mode toggle (ui.input.HotKey); a listener that never fires
     # until proofs run starts one.

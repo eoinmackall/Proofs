@@ -25,7 +25,7 @@ from .reasoning import (
 # and on a non-streaming call that is the whole generation.
 
 # How many lemmas the planner shortlists per iteration. Raising this costs
-# planner tokens and, in human mode, attention; five is about as many
+# planner tokens and, in manual mode, attention; five is about as many
 # candidates as can be compared without re-reading the conjecture.
 PLANNER_CANDIDATES = 5
 
@@ -81,7 +81,7 @@ def rejected_block(ctx, rejected: List[Dict[str, str]]) -> str:
 
 
 def replan_note(shown: List[Dict[str, Any]], notes: List[str]) -> str:
-    """The operator's 'replan' at the human menu, as the next planning call
+    """The operator's 'replan' at the manual menu, as the next planning call
     reads it: the statements that were turned down, and why."""
     statements = [str(c.get("statement") or "") for c in shown]
     return (

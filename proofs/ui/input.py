@@ -1,9 +1,9 @@
 """Terminal input: the hotkey that flips a run between automation and
-manual selection, and the readers the human menu (loops/human.py) uses.
+manual selection, and the readers the manual menu (loops/manual.py) uses.
 
 Two mechanisms, kept separate because they solve opposite problems:
 
-  * The MENU (loops/human.py) is line-oriented and reads with input()
+  * The MENU (loops/manual.py) is line-oriented and reads with input()
     (ask). It runs at exactly one point in the loop — the planning step —
     and only when the loop has already stopped and is waiting for a
     person, so ordinary cooked-mode input is exactly right: you get
@@ -26,7 +26,7 @@ character typed at the prompt.
 
 Everything degrades quietly. No tty (nohup, a pipe, CI), no termios (Windows
 falls back to msvcrt; anything else gets no listener at all): the hotkey
-reports itself unavailable, `--mode human` still works, and `--mode auto`
+reports itself unavailable, `--mode manual` still works, and `--mode auto`
 behaves exactly as it did before this module existed.
 """
 

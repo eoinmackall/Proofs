@@ -174,7 +174,8 @@ def add_backend_flags(parser: argparse.ArgumentParser) -> None:
             "such as verifier_*, the extract or compact stage, or the "
             "fallback of --with-fallback) to the "
             "model NAME in llm.models, for this command; repeatable. Every "
-            "verifier must route to one model."
+            "verifier must route to one model: routing any of them (e.g. "
+            "verifier_*) routes the rest, coding_verifier included."
         ),
     )
 

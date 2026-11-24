@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Miscellaneous — Proofs Docs</title>
+  <meta name="description" content="Declare sandboxed Sage and Python tools, choose lemma window strategies, leave private planner comments, and parse references.">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <button id="menu-toggle" class="menu-btn" type="button" aria-label="Toggle navigation" aria-expanded="false">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <a class="brand" href="index.html">
+      <img src="assets/favicon.svg" alt="" width="28" height="28">
+      <span>Proofs</span>
+    </a>
+    <nav class="topbar-nav" aria-label="Primary">
+      <a href="index.html">Home</a>
+      <a href="getting-started.html">Getting Started</a>
+      <a href="structure.html" class="active" aria-current="page">Documentation</a>
+      <a href="reference.html">Reference</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <a class="github-link" href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>GitHub</span>
+    </a>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar" aria-label="Documentation">
+      <div class="search-wrap">
+        <input id="doc-search" class="search-input" type="search" placeholder="Search docs…" autocomplete="off" aria-label="Search documentation">
+        <span class="search-kbd">/</span>
+        <div id="search-results" class="search-results" hidden></div>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Overview</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="index.html">Home</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Getting Started</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="getting-started.html#quickstart">Quickstart</a></li>
+          <li><a class="nav-link" href="getting-started.html#installation">Installation</a></li>
+          <li><a class="nav-link" href="getting-started.html#workspaces">Workspaces</a></li>
+          <li><a class="nav-link" href="getting-started.html#backends">Backends &amp; Routing</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Documentation</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="structure.html">Structure</a></li>
+          <li><a class="nav-link" href="verification.html">Verification</a></li>
+          <li><a class="nav-link" href="collaboration.html">Collaboration</a></li>
+          <li>
+            <a class="nav-link active" href="miscellaneous.html">Miscellaneous</a>
+            <ul class="nav-sub">
+              <li><a href="#declaring-tools">Declaring Tools</a></li>
+              <li><a href="#lemma-window">Lemma Window Strategies</a></li>
+              <li><a href="#comments">Comments</a></li>
+              <li><a href="#references">References</a></li>
+            </ul>
+          </li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Reference</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="reference.html">CLI &amp; Settings</a></li>
+        </ul>
+      </div>
+    </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+
+    <div class="main-wrap">
+      <main id="main" class="content">
+        <div class="eyebrow">Documentation</div>
+        <h1>Miscellaneous</h1>
+        <p class="lead">
+          Most conjectures can start with just a statement. Add a tool when an argument needs an exact computation, a reference when there is a published result worth citing, or a planner note when you have an idea but not a proof. None is required for the first run.
+        </p>
+
+        <h2 id="declaring-tools">Declaring Tools</h2>
+        <p>
+          By default the prover writes text; it can look up lemmas but cannot execute a script. Use <code>--tools python</code>, <code>--tools sage</code>, or <code>--tools all</code> to let the prover, reviser, and verifiers call <code>run_code</code> with tools declared by this conjecture. The flag does not install anything. Each script starts in a fresh process: it cannot depend on a variable left over from an earlier calculation.
+        </p>
+        <h3 id="tool-versions">Declaring tool versions (<code>flake.nix</code> &amp; <code>tools.lock</code>)</h3>
+        <p>
+          The maintainer declares the environment in a <code>flake.nix</code> beside <code>conjecture.md</code>. This is a different flake from the one that installs Proofs: it describes what the mathematics may rely on. This example provides Sage and Python with SymPy on <code>x86_64-linux</code>; choose the appropriate system for your environment.
+        </p>
+
+<pre><code>{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  outputs = { self, nixpkgs }:
+    let
+      system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
+      python = pkgs.python3.withPackages (ps: [ ps.sympy ]);
+    in {
+      devShells.${system}.default = pkgs.mkShell { packages = [ pkgs.sage python ]; };
+      proofsTools = {
+        tools = {
+          sage.version = pkgs.sage.version;
+          python.version = pkgs.python3.version;
+          python.packages.sympy = pkgs.python3Packages.sympy.version;
+        };
+        policy.result_bytes = 65536;
+      };
+    };
+}</code></pre>
+        <p>
+          After adding the flake (stage it first if using Git), run <code>proofs tools lock parity</code> from the workspace and commit the flake and lock files. A collaborator needs the declared executables on <code>PATH</code> at the matching versions, not Nix itself. <code>proofs tools check parity</code> checks those executables and tries the sandbox. If you use <code>nix develop ./conjectures/parity</code> to supply them, review the flake first: its shell hook runs outside the script sandbox.
+        </p>
+        <h3 id="computation-contract">The computation contract (<code>coding.md</code> &amp; <code>coding_verifier.md</code>)</h3>
+        <p>
+          The proof must explain why a finite calculation settles its claim. For example, testing a hundred squares does not prove the parity conjecture. But once the proof shows that the parity of a square depends only on the residue modulo 2, checking both residues is exhaustive. A Python script for that step could be:
+        </p>
+<pre><code>for r in range(2):
+    assert (r * r) % 2 == r
+print('RESULT: {"residues_checked": 2}')</code></pre>
+        <ul>
+          <li>Every script puts its checks in <code>assert</code> statements and ends by printing exactly one line <code>RESULT: &lt;json&gt;</code> (bounded by <code>policy.result_bytes</code>, default 64 KB).</li>
+          <li>Provers cite computations in prose as <code>[code:&lt;id&gt;]</code> and list them in <code>code_runs</code>. Proofs reads the script and its <code>RESULT</code> from the run’s scratch directory rather than trusting the model’s account. It saves the script in <code>code/&lt;user&gt;/&lt;run&gt;/&lt;sha256&gt;.&lt;ext&gt;</code> and the execution record in <code>computations/</code>. Both the script hash and the result contribute to the lemma’s Merkle hash.</li>
+          <li>A fourth verifier (<code>coding_verifier.md</code>) audits the mathematical reduction, loop bounds, exact arithmetic (<code>ZZ</code>, <code>QQ</code>, finite fields—no floating point, no <code>proof=False</code> or Monte Carlo claims), and assertions.</li>
+          <li>Verifiers may run code only to <em>justify a rejection</em> (e.g., finding a counterexample to a step), never to excuse an incomplete proof.</li>
+          <li>To reproduce a cited script, use <code>proofs verify parity LEMMA_ID --tools python --run-code</code> for the Python example (substitute the ID from the graph; use <code>--tools sage</code> for Sage scripts). Read the displayed script before confirming. A failed assertion or a different <code>RESULT</code> writes a refutation; running out of local resources is inconclusive.</li>
+        </ul>
+
+        <h3 id="sandbox-limits">Sandbox &amp; machine limits</h3>
+        <p>
+          The CLI needs to reach a model server, but a script checking two residues does not need the network, your API keys, or access to your papers. On Linux, a run with <code>--tools</code> uses <strong>bubblewrap</strong> to separate these permissions:
+        </p>
+        <ul>
+          <li><strong>Outer sandbox (<code>proofs</code> itself)</strong>: retains network access for LLM APIs, sees the filesystem read-only with <code>$HOME</code> hidden (except its config and package code), and writes only inside the workspace.</li>
+          <li><strong>Inner sandbox (per script):</strong> A script has a temporary working directory, no network, and no access to your home or workspace. It gets a minimal environment, not your shell’s API keys, and runs in an isolated PID namespace so a timeout can stop its children too.</li>
+          <li><strong>On macOS:</strong> Proofs uses <code>sandbox-exec</code> for each script, without an outer sandbox for the CLI. This backend has not yet been tested on a Mac. On Windows, use <a href="getting-started.html#installation">WSL 2</a> and check that bubblewrap can start in your distribution.</li>
+          <li>If the sandbox check fails, you can still run without <code>--tools</code>. Do not treat <code>--unsandboxed-code</code> as an installation fix: it lets model-written scripts run with your own file and network access.</li>
+        </ul>
+
+        <p>
+          A shared tool version does not imply a shared memory budget. Run <code>proofs limits parity</code> to see this machine’s limits and where each came from. If the requested jobs and their memory plus the reserve exceed physical RAM, reduce <code>code.jobs</code> or <code>code.memory</code> in the gitignored <code>.proofs-local.json</code>. Leave enough reserve for a local model server.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>code.timeout</code></td><td><code>600</code></td><td>Seconds one script execution may run before termination.</td></tr>
+              <tr><td><code>code.memory</code></td><td><code>8G</code></td><td>Total memory ceiling across all processes in one execution.</td></tr>
+              <tr><td><code>code.jobs</code></td><td><code>1</code></td><td>Machine-wide concurrent code job slots shared across all <code>proofs</code> processes.</td></tr>
+              <tr><td><code>code.threads</code></td><td><code>1</code></td><td>Threads granted to OpenMP / BLAS / Sage inside a script.</td></tr>
+              <tr><td><code>code.max_tasks</code></td><td><code>32</code></td><td>Process/thread cap guarding against fork bombs (keep above <code>code.threads</code>).</td></tr>
+              <tr><td><code>code.output_cap</code></td><td><code>1M</code></td><td>Maximum bytes of stdout/stderr captured per execution.</td></tr>
+              <tr><td><code>code.reserve_memory</code></td><td><code>4G</code></td><td>Memory reserved for <code>proofs</code> and local servers; runs refuse overcommit unless <code>--code-overcommit</code>.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="lemma-window">Lemma Window Strategies</h2>
+        <p>
+          The graph can grow far larger than a model’s prompt. The <strong>lemma window</strong> selects which usable statements an agent sees up front; it does not delete or invalidate anything outside it. Start with <code>recent</code> to build on the latest work, try <code>relevance</code> to surface an older result related to the target, or use <code>breadth</code> to explore less similar lines of argument. <code>--strategy</code> chooses the rule and <code>--window-size N</code> the size (default 30, <code>-1</code> for all that fit). Proofs shrinks the selection when it needs room for the answer.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Strategy</th><th>Selection Rule</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>recent</code> <em>(default)</em></td>
+                <td>The <code>--lemmas-all</code> newest lemmas (anyone's) plus your <code>--my-lemmas</code> newest (default ⌊N/2⌋ each, deduplicated) ordered by <code>proved_at</code>.</td>
+              </tr>
+              <tr>
+                <td><code>random,BETA</code></td>
+                <td>Depth-weighted random sample with weight <code>(depth + 1)<sup>β/(1-β)</sup></code>: <code>β = 0</code> is uniform, <code>β = 1</code> picks the deepest lemmas.</td>
+              </tr>
+              <tr>
+                <td><code>depth,JITTER</code></td>
+                <td>Focuses on <em>sinks</em> (lemmas no unsuspended lemma cites yet): <code>jitter = 0</code> takes the deepest sinks; <code>jitter = 1</code> samples sinks uniformly.</td>
+              </tr>
+              <tr>
+                <td><code>breadth</code></td>
+                <td>Picks one sink at a time, favoring those with the fewest ancestors in common with earlier picks. MinHash estimates the overlap; <code>numpy</code> speeds up the estimate if installed.</td>
+              </tr>
+              <tr>
+                <td><code>relevance</code></td>
+                <td>Queries the in-memory FTS5 search index against the lemma being proved (prover/reviser), the latest plan (planner), or the conjecture.</td>
+              </tr>
+              <tr>
+                <td><code>popular</code></td>
+                <td>Lemmas cited by the most unsuspended lemmas.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 id="dag-tools">Search &amp; lookup tools</h3>
+        <p>
+          A small window need not strand a useful lemma. An agent can search for a result by topic, then look up a hit by ID to get its exact statement and check its hypotheses. These are read-only graph tools; you do not need to enable <code>--tools python</code> or give the model a shell. With <code>--tool-mode auto</code>, Proofs tries the server’s native tool calls first and switches to JSON if the server refuses them:
+        </p>
+        <ul>
+          <li><code>search_lemmas</code>: searches all unsuspended lemmas outside the prompt using an in-memory SQLite <strong>FTS5</strong> BM25 index (built in the background on first use and updated live on commit). Supports phrase/word queries, citation traversal via <code>cites</code> and <code>cited_by</code>, and pagination (capped at <code>tools.max_search</code>, default <code>5</code>).</li>
+          <li><code>lookup_lemmas</code>: reads full lemma statements by ID—for chasing citations in <code>cited_lemmas</code> or inspecting search hits (up to <code>tools.max_lookup</code>, default <code>10</code> per call).</li>
+        </ul>
+
+        <h2 id="comments">Private Planner Comments (<code>comments.md</code>)</h2>
+        <p>
+          To steer the parity run, you might put “Try the contrapositive: what can the square of an odd integer look like?” in <code>conjectures/parity/comments.md</code>. The planner reads the notes at startup and weighs them as suggestions, not hypotheses it can assume. Restart the run to pick up edits. “Private” means Git ignores the file: its text is still sent to the planner’s model. It is not sent to the prover, reviser, or verifiers.
+        </p>
+
+        <h2 id="references">References &amp; <code>proofs parse</code></h2>
+        <p>
+          If a proof should be able to cite a theorem from the literature, a hint in <code>comments.md</code> is not enough. Put the source text (for example <code>.tex</code>, <code>.md</code>, or <code>.txt</code>, not a PDF) in the conjecture’s <code>references/</code> directory. As maintainer, run <code>proofs parse parity</code> with your <a href="getting-started.html#backends">model route or flags</a>. The parser sends the sources to its model and extracts individual statements, not whole papers.
+        </p>
+        <p>
+          Review the extracted hypotheses and source locations against the original before committing <code>references.md</code>. Despite its name it contains a JSON array. Collaborators pull this file, not your gitignored source directory, and do not need to rerun the parser.
+        </p>
+        <ul>
+          <li><strong>Stable citations:</strong> the parser assigns each result an ID such as <code>ref_1</code>. Parsing again reuses the ID when the formal statement matches and does not remove earlier results.</li>
+          <li><strong>Who sees what:</strong> for collections under 100 entries, planners and revisers see a short description (<code>slogan</code>) and ID for each result. Provers see the formal statements and list their sources in <code>cited_references</code>. Verifiers see the statements of the cited references only.</li>
+        </ul>
+
+        <nav class="pager" aria-label="Pagination">
+          <a class="pager-link" href="collaboration.html">
+            <span class="pager-dir">← Previous</span>
+            <span class="pager-title">Collaboration</span>
+          </a>
+          <a class="pager-link next" href="reference.html">
+            <span class="pager-dir">Next →</span>
+            <span class="pager-title">CLI &amp; Settings</span>
+          </a>
+        </nav>
+
+        <footer class="site-footer">
+          <span>Proofs · GPL-3.0-or-later</span>
+          <a href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">github.com/eoinmackall/proofs</a>
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <script src="assets/app.js" defer></script>
+</body>
+</html>

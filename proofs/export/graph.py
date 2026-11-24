@@ -21,6 +21,15 @@ The layout is layered, dependencies at the bottom:
     colour  the user whose run proved it (owner_of), in a fixed order:
             users by lemma count, most first, so a user keeps its colour
             between exports of the same DAG unless the counts reorder.
+    settles a lemma that settles the conjecture (resolution.find) is
+            marked "proved" or "disproved", for the renderers to ring and
+            always label.
+
+Four themes, each a categorical palette and chart chrome: "light" and
+"dark", neutral; "proofs" and "proofs-light", the documentation site's
+palette (docs/assets/style.css: midnight slate, cerulean and rose — dark
+by default, light under a light OS setting), so a graph embedded in the
+site or shown beside it reads as part of it.
 
 Coordinates are abstract units — x in [0, width], y in [0, height], y
 growing downward — that each renderer scales to its own surface. Nothing
@@ -35,7 +44,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
 from ..core.dag import owner_of
 
-__all__ = ["CATEGORICAL", "THEMES", "colour", "labelled", "layout", "short_id"]
+__all__ = ["CATEGORICAL", "SETTLES_TEXT", "THEMES", "colour", "labelled", "layout",
+           "short_id"]
 
 # Abstract units: the horizontal distance between neighbours' centres in a
 # row (at least: big neighbours are pushed further apart, GAP between their
@@ -50,25 +60,46 @@ R_PER = 2.2
 R_MAX = 30.0
 SWEEPS = 8
 
-# The categorical slots (the dataviz reference palette: CVD-validated in
-# both modes, in this order). Users past the eighth share the "other"
-# colour rather than a generated hue.
+# The categorical slots, in this order. Users past the eighth share the
+# "other" colour rather than a generated hue. "light" and "dark" are the
+# dataviz reference palette; the two "proofs" palettes start from the
+# docs' cerulean (#2C639E), rose (#B8305F / #F04D86), green and amber and
+# were stepped until they pass the same checks (lightness band, chroma
+# floor, adjacent-pair CVD separation >= 8, contrast >= 3:1) against the
+# docs' surfaces, #121925 and #FFFFFF. The page's stylesheet
+# (page/graph.css) carries the same values: change both together.
 CATEGORICAL = {
     "light": ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
               "#e87ba4", "#008300", "#4a3aa7", "#e34948"],
     "dark": ["#3987e5", "#d95926", "#199e70", "#c98500",
              "#d55181", "#008300", "#9085e9", "#e66767"],
+    "proofs": ["#3B7AC0", "#E0457D", "#BE8428", "#1FA67E",
+               "#8C6FE0", "#2FA3C4", "#E5683B", "#B85CC9"],
+    "proofs-light": ["#2C639E", "#C2386A", "#A87316", "#16936A",
+                     "#6B4FD0", "#1F86A6", "#D2582A", "#A04AB5"],
 }
-OTHER = {"light": "#898781", "dark": "#898781"}
-# The chart chrome both renderers draw with.
+OTHER = {"light": "#898781", "dark": "#898781",
+         "proofs": "#6F7D92", "proofs-light": "#8A93A1"}
+# The chart chrome both renderers draw with. settle is the double ring
+# around a lemma that settles the conjecture: the ink, never a hue, since
+# a hue on a node means its user.
 THEMES = {
     "light": {"surface": "#fcfcfb", "ink": "#0b0b0b", "ink2": "#52514e",
               "muted": "#898781", "edge": "#0b0b0b", "edge_alpha": 0.10,
-              "highlight": "#0b0b0b"},
+              "highlight": "#0b0b0b", "settle": "#0b0b0b"},
     "dark": {"surface": "#1a1a19", "ink": "#ffffff", "ink2": "#c3c2b7",
              "muted": "#898781", "edge": "#ffffff", "edge_alpha": 0.12,
-             "highlight": "#ffffff"},
+             "highlight": "#ffffff", "settle": "#ffffff"},
+    "proofs": {"surface": "#121925", "ink": "#F3EEE4", "ink2": "#BDBDBD",
+               "muted": "#92A2B8", "edge": "#DCEBFA", "edge_alpha": 0.12,
+               "highlight": "#F3EEE4", "settle": "#F3EEE4"},
+    "proofs-light": {"surface": "#FFFFFF", "ink": "#18202C", "ink2": "#4F5866",
+                     "muted": "#646D7C", "edge": "#1B2B45", "edge_alpha": 0.10,
+                     "highlight": "#18202C", "settle": "#18202C"},
 }
+# What a settling lemma's label and legend entry say, by resolution kind.
+SETTLES_TEXT = {"proved": "proves the conjecture",
+                "disproved": "disproves the conjecture"}
 
 
 def short_id(lemma_id: str) -> str:
@@ -111,16 +142,19 @@ def layout(
     order: Sequence[str],
     lemmas: Mapping[str, Mapping[str, Any]],
     suspended: Optional[Set[str]] = None,
+    settles: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """The laid-out graph of the lemmas in order (dependency order, as
     export_entry settles it). A citation of a lemma outside order is not
     an edge (it is kept in the node's "external" list); one that would
     run upward — only a citation cycle, which _post_order cuts — is kept
-    as an edge but not used for the rows.
+    as an edge but not used for the rows. settles maps the lemmas that
+    settle the conjecture to their kind, "proved" or "disproved".
 
     Returns {"nodes", "edges", "users", "rows", "width", "height"}:
     nodes in order, each {"id", "owner" (index into users), "row" (-1 for
-    the strip), "x", "y", "r", "cited_by" (count), "suspended"}; edges as
+    the strip), "x", "y", "r", "cited_by" (count), "suspended", "settles"
+    (the kind, or None)}; edges as
     [citer index, cited index]; users as [{"id", "count"}], the colour
     order.
     """
@@ -188,6 +222,7 @@ def layout(
     # one and a half rows under it.
     height = ROW * max(n_rows - 1, 0) + (1.5 * ROW if strip else 0.0)
     suspended = suspended or set()
+    settles = settles or {}
     nodes = []
     for i, lid in enumerate(ids):
         y = ROW * (n_rows - 1 - row[i]) if row[i] >= 0 else height
@@ -201,6 +236,7 @@ def layout(
             "r": round(rad[i], 2),
             "cited_by": k,
             "suspended": lid in suspended,
+            "settles": settles.get(lid),
             "external": external[i],
         })
     edges = [[i, c] for i in range(n) for c in cites[i]]
@@ -215,13 +251,17 @@ def layout(
 
 
 def labelled(graph: Mapping[str, Any], most_cited: int = 3, top: int = 3) -> List[int]:
-    """The nodes worth a permanent label: the most_cited most-cited (when
-    anything cites them), and the top row's lemmas when it has at most top
-    of them — the results everything else builds toward."""
+    """The nodes worth a permanent label: first any lemma that settles the
+    conjecture, always; then the most_cited most-cited (when anything
+    cites them), and the top row's lemmas when it has at most top of them
+    — the results everything else builds toward. The renderers place
+    labels greedily in this order, so a settling lemma's is never crowded
+    out."""
     nodes = graph["nodes"]
+    out = [i for i, nd in enumerate(nodes) if nd.get("settles")]
     ranked = sorted((i for i, nd in enumerate(nodes) if nd["cited_by"]),
                     key=lambda i: (-nodes[i]["cited_by"], nodes[i]["id"]))
-    out = ranked[:most_cited]
+    out += [i for i in ranked[:most_cited] if i not in out]
     top_row = [i for i, nd in enumerate(nodes)
                if nd["row"] == graph["rows"] - 1 and graph["rows"] > 1]
     if len(top_row) <= top:

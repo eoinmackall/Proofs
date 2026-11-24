@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CLI &amp; Settings — Proofs Docs</title>
+  <meta name="description" content="Every proofs subcommand and flag, .proofs-local.json settings with defaults, export formats, and the workspace layout.">
+  <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="topbar">
+    <button id="menu-toggle" class="menu-btn" type="button" aria-label="Toggle navigation" aria-expanded="false">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <a class="brand" href="index.html">
+      <img src="assets/favicon.svg" alt="" width="28" height="28">
+      <span>Proofs</span>
+    </a>
+    <nav class="topbar-nav" aria-label="Primary">
+      <a href="index.html">Home</a>
+      <a href="getting-started.html">Getting Started</a>
+      <a href="structure.html">Documentation</a>
+      <a href="reference.html" class="active" aria-current="page">Reference</a>
+    </nav>
+    <div class="topbar-spacer"></div>
+    <a class="github-link" href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8a8 8 0 0 0 5.47 7.59c.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.65 7.65 0 0 1 4 0c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8 8 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      <span>GitHub</span>
+    </a>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar" aria-label="Documentation">
+      <div class="search-wrap">
+        <input id="doc-search" class="search-input" type="search" placeholder="Search docs…" autocomplete="off" aria-label="Search documentation">
+        <span class="search-kbd">/</span>
+        <div id="search-results" class="search-results" hidden></div>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Overview</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="index.html">Home</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Getting Started</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="getting-started.html#quickstart">Quickstart</a></li>
+          <li><a class="nav-link" href="getting-started.html#installation">Installation</a></li>
+          <li><a class="nav-link" href="getting-started.html#workspaces">Workspaces</a></li>
+          <li><a class="nav-link" href="getting-started.html#backends">Backends &amp; Routing</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Documentation</div>
+        <ul class="nav-list">
+          <li><a class="nav-link" href="structure.html">Structure</a></li>
+          <li><a class="nav-link" href="verification.html">Verification</a></li>
+          <li><a class="nav-link" href="collaboration.html">Collaboration</a></li>
+          <li><a class="nav-link" href="miscellaneous.html">Miscellaneous</a></li>
+        </ul>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-group-label">Reference</div>
+        <ul class="nav-list">
+          <li>
+            <a class="nav-link active" href="reference.html">CLI &amp; Settings</a>
+            <ul class="nav-sub">
+              <li><a href="#subcommands">Subcommands</a></li>
+              <li><a href="#cli-flags">CLI Flags</a></li>
+              <li><a href="#settings">.proofs-local.json Settings</a></li>
+              <li><a href="#exports">Exports &amp; Status Board</a></li>
+              <li><a href="#layout">Directory Layouts</a></li>
+            </ul>
+          </li>
+        </ul>
+      </div>
+    </aside>
+    <div id="sidebar-backdrop" class="sidebar-backdrop"></div>
+
+    <div class="main-wrap">
+      <main id="main" class="content">
+        <div class="eyebrow">Reference</div>
+        <h1>CLI &amp; Settings</h1>
+        <p class="lead">
+          Use this page once you have a <a href="getting-started.html#workspaces">workspace</a>. <code>run</code>, <code>parse</code>, <code>verify</code>, and <code>repair</code> call a model. To read what has already been recorded, use <code>status</code> to see which reviews still apply or <code>export</code> to read the proof and its citations; neither needs a running server.
+        </p>
+
+        <h2 id="subcommands">Subcommands</h2>
+        <p>
+          For commands on a conjecture, <code>DIR</code> is its bare name inside a workspace (e.g. <code>parity</code>) or a path to the directory containing <code>conjecture.md</code>. <code>LEMMA_ID</code> is a full ID from the run log or HTML graph (e.g. <code>alice/3f9a2c1b4d5e6f70/7d1e90</code>), not a filename or just the last six digits. <code>init</code> and <code>migrate</code> take a <em>workspace</em> directory instead.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Subcommand</th><th>Description</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>proofs config [--global] KEY [VALUE]</code></td><td>Read, set, or remove <code>user.id</code>, <code>user.name</code>, and <code>user.email</code> in <code>~/.config/proofs/config</code>. Use <code>--list</code> to see current values.</td></tr>
+              <tr><td><code>proofs init [DIR]</code></td><td>Initialize a workspace: creates <code>conjectures/</code>, <code>.proofs</code>, <code>.proofs-local.json</code> (defaults, plus blank model entries and routes to fill in), and updates the managed <code>.gitignore</code> block.</td></tr>
+              <tr><td><code>proofs new NAME</code></td><td>Create <code>conjectures/NAME/</code> with a blank statement and notes, an empty <code>references/</code> directory, and <code>references.md</code> initialized to <code>[]</code>. An existing name is refused.</td></tr>
+              <tr><td><code>proofs run DIR [FLAGS]</code></td><td>Run the serial or <code>--parallel N</code> proving loop on a conjecture.</td></tr>
+              <tr><td><code>proofs parse DIR [FLAGS]</code></td><td>Maintainer tool: parse local <code>references/</code> files into committed <code>references.md</code>.</td></tr>
+              <tr><td><code>proofs verify DIR LEMMA_ID [--full]</code></td><td>Check a stored lemma. Add <code>--full</code> to check everything it depends on, <code>--tools ... --run-code</code> to rerun its scripts, or <code>--parallel N</code> to run verifier checks in parallel.</td></tr>
+              <tr><td><code>proofs verify DIR --uncertified</code></td><td>Verify every suspended lemma whose only fault is a missing certificate, from the roots up.</td></tr>
+              <tr><td><code>proofs repair PATH_TO_REFUTATION</code></td><td>Re-verify or re-prove a refuted lemma and repair affected dependents up the DAG.</td></tr>
+              <tr><td><code>proofs repair --all DIR</code></td><td>Repair lemmas with a refutation that still applies. Start with their dependencies and try each lemma at most once.</td></tr>
+              <tr><td><code>proofs prune DIR [--with-dependents]</code></td><td>Remove refuted lemmas, compact reproof chains, merge duplicate certificates, and clear stale scratch.</td></tr>
+              <tr><td><code>proofs status DIR LEMMA_ID</code></td><td>Print the lemma's citation closure: Merkle hashes, stream files, certificates, computations, suspension, and settlement.</td></tr>
+              <tr><td><code>proofs export DIR [LEMMA_ID] -o OUT --format ...</code></td><td>Export the whole DAG, one <code>--user</code>, or a lemma's closure as <code>latex</code>, interactive <code>html</code>, or <code>png</code>.</td></tr>
+              <tr><td><code>proofs limits DIR</code></td><td>Display active <code>code.*</code> limits and which config layer each value came from.</td></tr>
+              <tr><td><code>proofs tools lock|check DIR</code></td><td><code>lock</code> writes <code>tools.lock</code> from <code>flake.nix</code> via <code>nix eval</code>; <code>check</code> verifies installed tools and sandbox availability.</td></tr>
+              <tr><td><code>proofs migrate [DIR]</code></td><td>Rewrite a legacy format-1 workspace as format-2 streams. Commit or back up the workspace first and review the rewritten files before sharing.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="cli-flags">CLI Flags</h2>
+        <p>
+          Put run options <em>after</em> the conjecture name. For the full options of the proving loop, use <code>proofs run parity --help</code> in the workspace; for a verifier, use <code>proofs verify --help</code>. The numeric limits with corresponding config keys (such as <code>--max-iterations</code>) are in the <a href="#settings">settings table</a> below.
+        </p>
+        <div class="filter-bar">
+          <input class="filter-input" type="search" placeholder="Filter flags (e.g. --parallel, --route, --tools)…" data-filter-target="#flags-table" data-filter-count="flags-count" aria-label="Filter CLI flags">
+          <span id="flags-count" class="filter-count"></span>
+        </div>
+
+        <div class="table-wrap">
+          <table id="flags-table">
+            <thead>
+              <tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>--host URL</code></td><td>from routing</td><td>API base URL including version path (e.g. <code>http://localhost:8080/v1</code>, <code>https://api.openai.com/v1</code>). Defaults to <code>https://api.anthropic.com</code> with <code>--backend anthropic</code>.</td></tr>
+              <tr><td><code>--model NAME</code></td><td>from routing</td><td>Model ID or llama-server alias for the default route.</td></tr>
+              <tr><td><code>--api-key KEY</code></td><td>none</td><td>Bearer token / API key for hosted providers. Omit for local servers or use <code>api_key_env</code> in <code>llm.models</code>.</td></tr>
+              <tr><td><code>--backend DIALECT</code></td><td><code>auto</code></td><td><code>auto</code>, <code>llamacpp</code>, <code>openai</code>, or <code>anthropic</code>.</td></tr>
+              <tr><td><code>--ctx-budget TOKENS</code></td><td><code>65536</code></td><td>Maximum tokens for the prompt and reply combined. A lower limit reported by the server takes precedence.</td></tr>
+              <tr><td><code>--temperature T</code></td><td>server default</td><td>Sampling temperature for the <code>--model</code> model (unsupported on <code>anthropic</code>).</td></tr>
+              <tr><td><code>--effort LEVEL</code></td><td>server default</td><td>Reasoning effort (<code>low</code>/<code>medium</code>/<code>high</code>/<code>xhigh</code>/<code>max</code> on Anthropic; <code>none</code>–<code>xhigh</code> on OpenAI-compat).</td></tr>
+              <tr><td><code>--route ROLE=NAME</code></td><td>none</td><td>Repeatable. Route a role, glob (<code>verifier_*</code>), stage (<code>extract</code>, <code>compact</code>), or <code>fallback</code> to a model in <code>llm.models</code>. Routing any verifier routes the rest, <code>coding_verifier</code> included.</td></tr>
+              <tr><td><code>--with-fallback</code></td><td>off</td><td>If a call runs out of quota or retries, try it on <code>llm.routes.fallback</code> (or <code>default</code>). The next call uses its usual model.</td></tr>
+              <tr><td><code>--parallel [N]</code></td><td>off</td><td>On <code>run</code>: N workers share one graph (omitting N selects one parallel-mode worker). On <code>verify</code>/<code>repair</code>: N is required after the flag; up to N checks run at once on the same lemma.</td></tr>
+              <tr><td><code>--mode {auto,manual}</code></td><td><code>auto</code></td><td>Automated candidate selection, or <a href="structure.html#manual-mode">manual mode</a> (<code>manual</code>): an interactive menu.</td></tr>
+              <tr><td><code>--hotkey KEY</code></td><td><code>h</code></td><td>Keystroke toggling automatic/manual mode mid-run (<code>''</code> disables).</td></tr>
+              <tr><td><code>--strategy NAME[,DIAL]</code></td><td><code>recent</code></td><td>Lemma window selection: <code>recent</code>, <code>random,BETA</code>, <code>depth,JITTER</code>, <code>breadth</code>, <code>relevance</code>, or <code>popular</code>.</td></tr>
+              <tr><td><code>--window-size N</code></td><td><code>30</code></td><td>Max proved lemmas shown in full (<code>-1</code> for all).</td></tr>
+              <tr><td><code>--lemmas-all N</code> / <code>--my-lemmas N</code></td><td><code>⌊N/2⌋</code></td><td>Override the two pools of <code>--strategy recent</code>.</td></tr>
+              <tr><td><code>--tool-mode {auto,json}</code></td><td><code>auto</code></td><td>Native server tool calls with automatic JSON fallback, or JSON protocol from the start.</td></tr>
+              <tr><td><code>--tools LIST</code></td><td>off</td><td>Enable sandboxed <code>run_code</code> for declared tools (<code>sage</code>, <code>python</code>, or <code>all</code>).</td></tr>
+              <tr><td><code>--run-code</code></td><td>off</td><td>On <code>verify</code>, show the saved scripts and ask before re-executing them. Requires <code>--tools</code> with the tools those scripts need.</td></tr>
+              <tr><td><code>--code-*</code> / <code>--code-overcommit</code> / <code>--unsandboxed-code</code></td><td>see <code>limits</code></td><td>Override machine code limits, bypass memory overcommit check, or disable sandboxing.</td></tr>
+              <tr><td><code>--fresh</code> / <code>--resume RUN_ID</code></td><td>auto-resume</td><td>Start a fresh run ID or resume a specific run from its checkpoint.</td></tr>
+              <tr><td><code>--ui {auto,live,plain}</code></td><td><code>auto</code></td><td>Compact Rich live status board vs. scrolling plain log lines.</td></tr>
+              <tr><td><code>--verbose</code> / <code>--no-verbose</code></td><td>on</td><td>Toggle console logging.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="settings"><code>.proofs-local.json</code> Settings</h2>
+        <p>
+          For a lasting change on this machine, edit the workspace’s <code>.proofs-local.json</code>. For just one conjecture, use the same filename beside its <code>conjecture.md</code> and include only the keys that differ. Keys like <code>"run.max_iterations"</code> are literal JSON keys, not nested objects. Neither file belongs in Git. For example, this entire conjecture-level file gives the run a three-iteration budget:
+        </p>
+<pre><code>{
+  "run.max_iterations": 3
+}</code></pre>
+        <p>
+          With a default route set, <code>proofs run parity --max-iterations 5</code> overrides that value for one invocation, without editing either file. A resumed run counts iterations already spent toward the five. For the integer settings below, <code>-1</code> means no limit unless noted otherwise. See <a href="miscellaneous.html#sandbox-limits">machine limits</a> for <code>code.*</code> keys and <a href="getting-started.html#backends">routing</a> for model entries.
+        </p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Key</th><th>Default</th><th>CLI Flag</th><th>Meaning</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>run.max_iterations</code></td><td><code>-1</code></td><td><code>--max-iterations</code></td><td>Iterations before stopping (per worker in parallel mode); <code>-1</code> runs until settled or interrupted.</td></tr>
+              <tr><td><code>run.max_proof_attempts</code></td><td><code>3</code></td><td><code>--max-proof-attempts</code></td><td>Prover rounds per lemma before giving up.</td></tr>
+              <tr><td><code>run.max_rejected_lemmas</code></td><td><code>4</code></td><td><code>--max-rejected-lemmas</code></td><td>Recent rejected statements shown to planning agents (<code>0</code> hides; bounded, no <code>-1</code>).</td></tr>
+              <tr><td><code>run.max_loop_restarts</code></td><td><code>3</code></td><td><code>--max-loop-restarts</code></td><td>Parallel mode: consecutive restarts of a crashed worker before retiring it.</td></tr>
+              <tr><td><code>run.replan_every</code></td><td><code>5</code></td><td><code>--replan-every</code></td><td>Parallel mode: lemmas committed under a plan before replanning. With <code>-1</code>, replan only on request.</td></tr>
+              <tr><td><code>run.citation_recheck_base</code></td><td><code>2</code></td><td><code>--citation-recheck-base</code></td><td>Base <code>p</code> for <code>p<sup>-d</sup></code> direct citation audits (<code>1</code> always, <code>-1</code> off).</td></tr>
+              <tr><td><code>tools.max_rounds</code></td><td><code>8</code></td><td><code>--max-tool-rounds</code></td><td>Tool rounds per call for <code>search_lemmas</code> / <code>lookup_lemmas</code>.</td></tr>
+              <tr><td><code>tools.code_rounds</code></td><td><code>8</code></td><td><code>--max-code-rounds</code></td><td>Tool rounds per call when <code>run_code</code> is offered.</td></tr>
+              <tr><td><code>tools.max_lookup</code></td><td><code>10</code></td><td><code>--max-lookup</code></td><td>Max lemmas returned per <code>lookup_lemmas</code> call.</td></tr>
+              <tr><td><code>tools.max_search</code></td><td><code>5</code></td><td><code>--max-search</code></td><td>Max lemmas returned per <code>search_lemmas</code> call.</td></tr>
+              <tr><td><code>llm.max_retries</code></td><td><code>3</code></td><td><code>--max-retries</code></td><td>Retry attempts on transient model call errors.</td></tr>
+              <tr><td><code>llm.max_compaction_passes</code></td><td><code>2</code></td><td><code>--max-compaction-passes</code></td><td>Maximum times to summarize the reasoning and continue a reply that reaches the context limit.</td></tr>
+              <tr><td><code>llm.models</code> / <code>llm.routes</code></td><td>blank template</td><td><code>--route</code></td><td>Define models by name and choose which roles and stages use them. <code>proofs init</code> creates <code>local</code> and <code>openai_compatible</code> entries with preset backends. Blank fields and routes (<code>""</code> or <code>null</code>) count as unset.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h2 id="exports">Exports &amp; Live Status Board</h2>
+        <p>
+          Export makes a snapshot; it does not change the workspace records. Give <code>-o</code> a directory (created if needed) and <code>-n</code> a filename without a path. For example, the following writes <code>out/parity.html</code>; open that file locally, or send it to someone who does not have Proofs installed:
+        </p>
+<pre><code>proofs export parity -o out -n parity --format html</code></pre>
+        <p>
+          Without <code>-n</code>, a whole-graph export is <code>proof</code> plus the format’s extension. Give a lemma ID after the conjecture name to export just its argument and everything it cites. Alternatively, <code>--user alice</code> selects Alice’s lemmas, not other contributors’ lemmas they cite. Choose the format according to what you want to read:
+        </p>
+        <ul>
+          <li><code>--format latex</code> (<code>.tex</code>): dependency-ordered lemmas, cross-referenced citations, references section, and a verbatim Computations appendix with SHA-256 hashes and recorded <code>RESULT</code>s.</li>
+          <li><code>--format html</code> (<code>.html</code>): an interactive citation graph with KaTeX included, so it works offline. Rows show depth, colors identify contributors, and larger dots indicate more citations. Hollow dots mark suspended lemmas, and a double ring marks the lemma that settles the conjecture, always labelled with whether it proves or disproves it. You can pan, zoom, find a lemma by ID, trace a chain of citations, or switch between Light, Dark and Theme, which uses this site’s palette and follows your OS setting. <code>--theme light|dark|proofs</code> picks the one it opens in (default <code>proofs</code>).</li>
+          <li><code>--format png</code> (<code>.png</code>): static citation graph rendered via <code>matplotlib</code> (up to 3840×2160, <code>--theme light|dark|proofs|proofs-light</code>, where <code>proofs</code> is this site’s palette and <code>proofs-light</code> its light variant).</li>
+        </ul>
+        <p>
+          During a run, the live board answers a different question from <code>proofs status</code>: what is each worker doing <em>now</em>? <code>--ui auto</code> uses it on an interactive terminal with <code>rich</code> installed. A verifier row with an increasing elapsed time means the request is in progress, not that a verdict has been issued. Use <code>--ui plain</code> for a scrolling record of all events rather than the most recent ones.
+        </p>
+
+        <h2 id="layout">Workspace &amp; Repository Layouts</h2>
+        <p>
+          The program repository contains the CLI (<code>proofs/cli/</code>) and default prompts (<code>proofs/agents/</code>). You do not edit those to add a problem. Below is the separate workspace for the parity example <em>after some runs</em>. Don’t worry if <code>dags/</code>, <code>certificates/</code>, or the optional code files don’t exist immediately after <code>proofs new</code>.
+        </p>
+<pre><code># Workspace root (e.g. ~/my-proofs/)
+.proofs                                  # workspace marker (format = 2)
+.gitignore                               # managed proofs ignore block + your rules
+.proofs-local.json                       # gitignored: machine limits, settings &amp; llm.models/routes
+conjectures/
+  parity/
+    conjecture.md                        # required: conjecture statement
+    dags/&lt;user&gt;/&lt;run&gt;/000001.jsonl       # committed: append-only lemmas &amp; reproofs
+    certificates/&lt;user&gt;/&lt;run&gt;/*.jsonl    # committed: acceptances
+    computations/&lt;user&gt;/&lt;run&gt;/*.jsonl    # committed: code execution records
+    code/&lt;user&gt;/&lt;run&gt;/&lt;sha256&gt;.sage      # committed: scripts cited by proofs
+    refutations/*.json                   # committed: active/stale refutations
+    references.md                        # committed: parsed theorem collection
+    flake.nix, flake.lock, tools.lock    # optional, committed: reproducible code tools
+    references/                          # gitignored: maintainer-local source papers
+    comments.md                          # gitignored: private planner notes
+    checkpoints/&lt;user&gt;/&lt;run&gt;/            # gitignored: atomic checkpoints &amp; locks
+    scratch/&lt;user&gt;/&lt;run&gt;/                # gitignored: in-flight scripts</code></pre>
+
+        <nav class="pager" aria-label="Pagination">
+          <a class="pager-link" href="miscellaneous.html">
+            <span class="pager-dir">← Previous</span>
+            <span class="pager-title">Miscellaneous</span>
+          </a>
+          <a class="pager-link next" href="index.html">
+            <span class="pager-dir">Back to Start →</span>
+            <span class="pager-title">Home</span>
+          </a>
+        </nav>
+
+        <footer class="site-footer">
+          <span>Proofs · GPL-3.0-or-later</span>
+          <a href="https://github.com/eoinmackall/proofs" target="_blank" rel="noopener noreferrer">github.com/eoinmackall/proofs</a>
+        </footer>
+      </main>
+    </div>
+  </div>
+
+  <script src="assets/app.js" defer></script>
+</body>
+</html>

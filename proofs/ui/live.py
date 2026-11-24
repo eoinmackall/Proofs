@@ -22,7 +22,7 @@ call is waiting on the server; nothing is streamed from the model. Only
 that redraw writes to the terminal while the block is up — a log() just
 records the line, and a stray print from anywhere is caught (_Sink) and
 recorded the same way — so no two threads ever race to move the cursor.
-Anything that reads the terminal (the human menu, a pasted proof, a y/N)
+Anything that reads the terminal (the manual menu, a pasted proof, a y/N)
 runs inside paused(), which takes the block off the screen until it is done.
 
 rich is imported here only: a run without it (or not on a terminal) uses

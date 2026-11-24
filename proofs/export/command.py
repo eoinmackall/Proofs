@@ -9,6 +9,7 @@ import argparse
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ..core import resolution
 from ..core.context import Context
 from ..core.dag import _citation_closure, _dependency_order, load_file, owner_of
 from ..tools.run_code import computations
@@ -18,6 +19,12 @@ from . import graph, html, latex, png
 FORMATS = ("latex", "html", "png")
 # The file extension each format writes.
 EXTENSIONS = {"latex": ".tex", "html": ".html", "png": ".png"}
+# --theme, by format. The page's "proofs" is the docs' palette following
+# the viewer's OS setting, as the docs site does; an image has no viewer
+# to follow, so it names the variant: "proofs" (dark, the site's default)
+# or "proofs-light".
+THEMES = {"html": ("light", "dark", "proofs"),
+          "png": ("light", "dark", "proofs", "proofs-light")}
 
 
 def file_name(default: str, name: Optional[str], fmt: str) -> str:
@@ -57,15 +64,17 @@ def export_entry(
     user_id: str,
     parser: argparse.ArgumentParser,
     fmt: str,
-    theme: str = "light",
+    theme: Optional[str] = None,
     name: Optional[str] = None,
 ) -> int:
     """proofs export NAME [LEMMA_ID] [--user USER_ID] --format FORMAT:
     write the chosen lemmas into out_dir (-o/--out, created if it is not
     there: the export is the user's artifact, not the project's data) as
     fmt — "latex", the document in dependency order (latex.py); "html",
-    the interactive citation graph (html.py); "png", the static image of
-    it in the given theme (png.py). The file is named name (-n/--name,
+    the interactive citation graph (html.py), opening in the given theme
+    (light, dark or proofs; default proofs, which follows the viewer's OS
+    setting); "png", the static image of it in the given theme (light,
+    dark, proofs or proofs-light; default light) (png.py). The file is named name (-n/--name,
     see file_name) or, without it, after what is exported.
 
     With neither lemma_id nor owner it is the complete DAG; with owner, the
@@ -110,7 +119,8 @@ def export_entry(
     out_path = Path(out_dir) / file_name(default, name, fmt)
     if fmt != "latex":
         return _export_graph(ctx, dag, order, scope, paths.root.name,
-                             out_path, fmt, theme, parser)
+                             load_file(paths.conjecture), out_path, fmt,
+                             theme, parser)
     # The scripts the exported lemmas rest on, for the appendix: latex.py
     # renders from data, so they are read here.
     run_lines = computations.load_runs(paths.root)
@@ -146,18 +156,36 @@ def export_entry(
     return 0
 
 
+def _settles(ctx: Context, dag, order, conjecture: str) -> Dict[str, str]:
+    """The exported lemmas that settle the conjecture, with the kind,
+    "proved" or "disproved": resolution.find over the complete DAG, the
+    test a run makes, so the picture marks exactly what proofs status
+    reports. A DAG holding both kinds marks both, and says so."""
+    found = resolution.find(dag.lemmas, dag.suspension().suspended, conjecture)
+    if len({r.kind for r in found}) > 1:
+        ctx.ui.log(
+            "The DAG both proves and disproves the conjecture ("
+            + "; ".join(r.lemma_id for r in found)
+            + "): at least one of these proofs is wrong. Both are marked.")
+    exported = set(order)
+    return {r.lemma_id: r.kind for r in found if r.lemma_id in exported}
+
+
 def _export_graph(ctx: Context, dag, order, scope: str, conjecture_name: str,
-                  out: Path, fmt: str, theme: str,
+                  conjecture: str, out: Path, fmt: str, theme: Optional[str],
                   parser: argparse.ArgumentParser) -> int:
     """The citation graph of the lemmas in order, as the interactive page
     or the image. A suspended lemma is drawn hollow, so the picture says
-    which results are not to be relied on yet."""
+    which results are not to be relied on yet; a lemma that settles the
+    conjecture is ringed and always labelled, so it says what is done."""
     lemmas = dag.lemmas
     suspended = {lid for lid in order if lid in dag.suspension()}
-    laid_out = graph.layout(order, lemmas, suspended)
+    settles = _settles(ctx, dag, order, conjecture)
+    laid_out = graph.layout(order, lemmas, suspended, settles)
     if fmt == "png":
         try:
-            png.render_to(out, laid_out, title=conjecture_name, theme=theme)
+            png.render_to(out, laid_out, title=conjecture_name,
+                          theme=theme or "light")
         except png.MissingDependency as e:
             parser.error(str(e))
     else:
@@ -168,8 +196,11 @@ def _export_graph(ctx: Context, dag, order, scope: str, conjecture_name: str,
             lemmas={lid: {**lemmas[lid], "proof": proofs[lid]} for lid in order},
             conjecture_name=conjecture_name,
             scope=scope,
+            theme=theme or "proofs",
         )
         latex.write(out, page)
+    for lid, kind in settles.items():
+        ctx.ui.log(f"Marked {lid}: it {graph.SETTLES_TEXT[kind]}.")
     ctx.ui.log(
         f"Exported the citation graph of {len(order)} lemma(s) "
         f"({len(laid_out['edges'])} citation(s)) to {out}."

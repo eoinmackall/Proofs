@@ -50,11 +50,15 @@
     C = {
       surface: v("--surface"), ink: v("--ink"), ink2: v("--ink2"),
       muted: v("--muted"), edgeInk: v("--edge-ink"), edgeAlpha: parseFloat(v("--edge-alpha")) || 0.1,
-      wash: v("--wash"), hl: v("--hl"),
+      wash: v("--wash"), hl: v("--hl"), settle: v("--settle"),
       users: [0, 1, 2, 3, 4, 5, 6, 7].map((i) => v("--u" + i)), other: v("--other"),
     };
   }
   const userColour = (o) => (o < 8 ? C.users[o] : C.other);
+  // A lemma that settles the conjecture: its kind ("proved", "disproved")
+  // in d.res, ringed twice at these offsets past its radius, and labelled.
+  const SETTLE_RINGS = [3.5, 7];
+  const SETTLES_TEXT = { proved: "proves the conjecture", disproved: "disproves the conjecture" };
   const userVar = (o) => (o < 8 ? `var(--u${o})` : "var(--other)");
 
   // ----------------------------------------------------------------- view
@@ -243,12 +247,15 @@
   }
 
   // Nodes batched by (owner, suspended): one path, one fill and one ring
-  // stroke per batch. Off-screen nodes are skipped.
+  // stroke per batch; then the settling lemmas' double rings, in one
+  // stroke. Off-screen nodes are skipped.
   function paintNodes(c, list) {
-    const batches = new Map();
+    const batches = new Map(), rings = [];
     for (const i of list) {
       const d = N[i], x = sx(d), y = sy(d), r = rs(d);
-      if (x < -r || x > W + r || y < -r || y > H + r) continue;
+      const reach = r + (d.res ? SETTLE_RINGS[1] + 1 : 0);
+      if (x < -reach || x > W + reach || y < -reach || y > H + reach) continue;
+      if (d.res) rings.push(x, y, r);
       const key = d.o * 2 + (d.s ? 1 : 0);
       if (!batches.has(key)) batches.set(key, []);
       batches.get(key).push(x, y, r);
@@ -264,6 +271,18 @@
       c.fill();
       c.strokeStyle = hollow ? col : C.surface;
       c.lineWidth = hollow ? 1.6 : 1;
+      c.stroke();
+    }
+    if (rings.length) {
+      c.beginPath();
+      for (let j = 0; j < rings.length; j += 3) {
+        for (const off of SETTLE_RINGS) {
+          c.moveTo(rings[j] + rings[j + 2] + off, rings[j + 1]);
+          c.arc(rings[j], rings[j + 1], rings[j + 2] + off, 0, 2 * Math.PI);
+        }
+      }
+      c.strokeStyle = C.settle;
+      c.lineWidth = 1.5;
       c.stroke();
     }
   }
@@ -288,12 +307,16 @@
   // The permanent labels (graph.labelled), placed greedily: each at the
   // first of three steps away from its node (above for a top-row lemma,
   // below otherwise) that overlaps no label already placed, or not at all.
+  // A settling lemma's comes first (graph.labelled puts it there), above
+  // its rings, in the ink, saying what it settles.
   function permanentLabels(c) {
     const boxes = [], h = 16;
     c.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
     for (const i of D.labels) {
-      const d = N[i], top = isTop(d), r = rs(d);
-      const text = shortId(d.id) + (top ? "" : ` (${d.n})`);
+      const d = N[i], top = isTop(d) || !!d.res;
+      const r = rs(d) + (d.res ? SETTLE_RINGS[1] : 0);
+      const text = d.res ? `${shortId(d.id)} · ${SETTLES_TEXT[d.res]}`
+        : shortId(d.id) + (top ? "" : ` (${d.n})`);
       const w = c.measureText(text).width + 8, x = sx(d);
       for (let step = 0; step < 3; step++) {
         const off = r + 6 + step * h, y = top ? sy(d) - off : sy(d) + off;
@@ -301,7 +324,7 @@
         if (boxes.some((b) => b[0] < box[0] + box[2] && box[0] < b[0] + b[2] &&
                               b[1] < box[1] + box[3] && box[1] < b[1] + b[3])) continue;
         boxes.push(box);
-        label(c, text, x, y, top, C.ink2, 12);
+        label(c, text, x, y, top, d.res ? C.ink : C.ink2, 12);
         break;
       }
     }
@@ -377,13 +400,15 @@
     c.fillRect(0, 0, W, H);
     strokeEdges(c, edges, C.hl, 1.4);
     paintNodes(c, nodes.sort((a, b) => N[a].r - N[b].r));
-    const d = N[f];
+    // The focus ring, outside a settling lemma's own rings.
+    const d = N[f], fr = rs(d) + (d.res ? SETTLE_RINGS[1] + 3.5 : 3);
     c.beginPath();
-    c.arc(sx(d), sy(d), rs(d) + 3, 0, 2 * Math.PI);
+    c.arc(sx(d), sy(d), fr, 0, 2 * Math.PI);
     c.strokeStyle = C.hl;
     c.lineWidth = 2;
     c.stroke();
-    label(c, shortId(d.id), sx(d), sy(d) - rs(d) - 7, true, C.ink, 12);
+    label(c, d.res ? `${shortId(d.id)} · ${SETTLES_TEXT[d.res]}` : shortId(d.id),
+          sx(d), sy(d) - fr - 4, true, C.ink, 12);
   }
 
   // ----------------------------------------------------------- hit testing
@@ -516,6 +541,7 @@
   function meta(i) {
     const d = N[i], m = el("div", "meta");
     m.textContent = `${D.users[d.o].id} · cites ${cites[i].length} · cited by ${citers[i].length}`;
+    if (d.res) m.append(el("span", "badge settle", SETTLES_TEXT[d.res]));
     if (d.s) m.append(el("span", "badge", "suspended"));
     return m;
   }
@@ -720,28 +746,35 @@
   search.addEventListener("change", find);
   search.addEventListener("keydown", (e) => { if (e.key === "Enter") find(); });
 
-  // Theme: the OS setting unless the toggle chose, remembered per viewer
-  // when the browser allows it.
+  // Theme: Light, Dark, or Theme (the docs' palette, "proofs", light or
+  // dark by the OS setting). The page opens in the one html.py stamped on
+  // <html data-theme> unless the viewer picked another before, remembered
+  // per browser when it allows it.
   const THEME_KEY = "proofs-graph-theme";
-  const dark = window.matchMedia("(prefers-color-scheme: dark)");
-  const themeBtn = $("theme");
-  const effective = () => document.documentElement.dataset.theme || (dark.matches ? "dark" : "light");
+  const root = document.documentElement;
+  const themeBtns = [...$("theme").querySelectorAll("button")];
+  const themes = themeBtns.map((b) => b.dataset.theme);
   function applyTheme() {
-    themeBtn.textContent = effective() === "dark" ? "Light" : "Dark";
+    for (const b of themeBtns) b.setAttribute("aria-pressed", String(b.dataset.theme === root.dataset.theme));
     readColours();
     if (W > 0) rerender();
   }
   try {
     const saved = localStorage.getItem(THEME_KEY);
-    if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
-  } catch (e) { /* storage unavailable: follow the OS */ }
-  themeBtn.addEventListener("click", () => {
-    const next = effective() === "dark" ? "light" : "dark";
-    document.documentElement.dataset.theme = next;
-    try { localStorage.setItem(THEME_KEY, next); } catch (e) { /* not remembered */ }
-    applyTheme();
+    if (themes.includes(saved)) root.dataset.theme = saved;
+  } catch (e) { /* storage unavailable: the exported theme */ }
+  for (const b of themeBtns) {
+    b.addEventListener("click", () => {
+      root.dataset.theme = b.dataset.theme;
+      try { localStorage.setItem(THEME_KEY, b.dataset.theme); } catch (e) { /* not remembered */ }
+      applyTheme();
+    });
+  }
+  // Theme follows the OS setting: a change repaints it (the stylesheet has
+  // already switched its tokens).
+  window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+    if (root.dataset.theme === "proofs") applyTheme();
   });
-  dark.addEventListener("change", applyTheme);
 
   // ---------------------------------------------------------------- legend
   const legend = $("legend");
@@ -763,6 +796,12 @@
   if (N.some((d) => d.s)) {
     const row = el("div");
     row.append(el("span", "dot hollow"), el("span", "", "suspended"));
+    legend.append(row);
+  }
+  for (const kind of ["proved", "disproved"]) {
+    if (!N.some((d) => d.res === kind)) continue;
+    const row = el("div", "settled");
+    row.append(el("span", "dot settle"), el("span", "", SETTLES_TEXT[kind]));
     legend.append(row);
   }
   legend.append(el("div", "note",

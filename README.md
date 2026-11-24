@@ -5,7 +5,7 @@ A Python program that drives a small team of LLM agents to iteratively prove
 **planner → prover → verifier → reviser** — and accumulate a proof
 as a DAG of lemmas. Which planned lemma is proved next is not an agent's
 call: in `--mode auto` it is picked at random (serial) or taken oldest-first
-from a queue (parallel); in `--mode human` the operator picks at the menu.
+from a queue (parallel); in `--mode manual` the operator picks at the menu.
 
 The system is distributed and coordinated through git. Several people can
 work on one conjecture: every run appends its lemmas to an append-only stream
@@ -36,7 +36,7 @@ Each iteration:
    so no two candidates can collide and none is screened out.
 2. **Selection** picks exactly one candidate:
    - `--mode auto`: one candidate is picked uniformly at random.
-   - `--mode human`: a menu appears. Type a number and Enter to prove that
+   - `--mode manual`: a menu appears. Type a number and Enter to prove that
      lemma yourself: paste or type your proof and its citations, and it
      goes through the same three verifiers as the prover's (see
      [Proving a lemma yourself](#proving-a-lemma-yourself)). Type `Np` to
@@ -79,7 +79,7 @@ candidate attempts it by naming which way in its `settles` field:
   counterexample.
 
 The planner (or, in parallel mode, the lemma generator) attempts the
-conjecture by proposing a candidate with `settles` set; at the human menu,
+conjecture by proposing a candidate with `settles` set; at the manual menu,
 write a lemma whose statement is just `conjecture` or
 `conjecture_negation`. Its statement
 is always written by the code, not by the model: the verbatim text of
@@ -302,11 +302,20 @@ JSON. Routes live in the gitignored `.proofs-local.json` files, beside the
     "default":    "local",
     "prover":     "strong",
     "verifier_*": "strong",
-    "coding_verifier": "strong",
     "extract":    "local"
   }
 }
 ```
+
+`proofs init` writes both keys ready to fill in: two model entries,
+`local` (backend `auto`, for a llama-server or any server the probe
+recognises) and `openai_compatible` (backend `openai`, for a hosted
+OpenAI-compatible API), with every field blank, and every route blank.
+A blank value (`""` or `null`) is unset, so the file works as it stands
+(with `--host`/`--model`). To use a model, fill in its `model` (and `host`,
+and `api_key_env` if it takes a key), rename the entry if you like, and
+put its name in the routes you want; leave the rest blank. An entry left
+blank defines no model, and routing a role to one is refused at startup.
 
 A model entry takes the fields the server flags do: `host` and `model`
 (required; `host` defaults to `https://api.anthropic.com` for an `anthropic`
@@ -338,8 +347,11 @@ of a call can be routed apart from its role: `extract`, the extraction that
 copies a reply into JSON, and `compact`, the summarising pass of a call that
 [hit the context wall](#when-a-call-hits-the-context-wall); unrouted, each
 goes to the role's own model. Every verifier must route to one model for
-now — a certificate records one model for the whole check — and a split is
-refused at startup.
+now — a certificate records one model for the whole check — so the
+verifiers follow each other: a verifier no route names takes the model the
+routed ones share, not the `default`. One route such as `verifier_*`
+(which by itself would miss `coding_verifier`) therefore sets all four; a
+split, with verifiers routed to different models, is refused at startup.
 
 Routes are resolved key by key, the last of these that sets one winning:
 
@@ -452,7 +464,7 @@ One command, twelve subcommands:
 | Subcommand | Takes | Does |
 | --- | --- | --- |
 | `proofs config KEY [VALUE]` | a config key, an optional value | Gets or sets the user's config, git-style: `user.id`, `user.name`, `user.email`. |
-| `proofs init [DIR]` | a directory (default `.`) | Makes `DIR` a proofs workspace: creates `DIR/conjectures/`, writes the `.proofs` marker (`format = 2`) and a `.proofs-local.json` holding the default code limits and run settings (and empty model routes), and writes or updates the proofs block of `DIR/.gitignore` (between `# >>> proofs >>>` and `# <<< proofs <<<`; lines outside it are never touched). Safe to re-run; refuses a `DIR` inside another workspace. |
+| `proofs init [DIR]` | a directory (default `.`) | Makes `DIR` a proofs workspace: creates `DIR/conjectures/`, writes the `.proofs` marker (`format = 2`) and a `.proofs-local.json` holding the default code limits and run settings (and the model routes as blank fields to fill in), and writes or updates the proofs block of `DIR/.gitignore` (between `# >>> proofs >>>` and `# <<< proofs <<<`; lines outside it are never touched). Safe to re-run; refuses a `DIR` inside another workspace. |
 | `proofs new NAME` | a directory name | Lays out a blank conjecture, `conjectures/NAME/` under the workspace root: an empty `references/` directory, an empty `conjecture.md` and `comments.md`, and a `references.md` holding the empty collection `[]`. Refuses a `NAME` that already exists. |
 | `proofs run DIR` | `DIR`, then the loop's options | Runs the proof loop on the conjecture. |
 | `proofs parse DIR` | `DIR`, then the parser's options | The maintainer's tool: parses `DIR`'s `references/` into the committed `references.md`. |
@@ -465,7 +477,7 @@ One command, twelve subcommands:
 | `proofs status DIR LEMMA_ID` | a conjecture, a lemma id | Lists the lemma's citation closure: each lemma's hash, stream file, valid certificates with how many times each was issued, and suspension; then whether the conjecture is settled. |
 | `proofs limits DIR` | a conjecture directory | Prints the [code limits](#limits) in effect on this machine and where each comes from. |
 | `proofs tools lock\|check DIR` | a conjecture directory | `lock`: the maintainer's tool — writes `tools.lock` from the conjecture's `flake.nix`. `check`: whether each declared tool is on PATH at its version, and whether the sandbox starts. See [Code tools](#code-tools-sage-python). |
-| `proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex\|html\|png [--theme light\|dark]` | a conjecture, an optional lemma id or user, the output directory, an optional file name, the format | Writes the DAG into OUT_DIR as a LaTeX document in dependency order, an interactive citation graph, or a static image of it. |
+| `proofs export DIR [LEMMA_ID] [--user USER_ID] -o OUT_DIR [-n NAME] --format latex\|html\|png [--theme THEME]` | a conjecture, an optional lemma id or user, the output directory, an optional file name, the format | Writes the DAG into OUT_DIR as a LaTeX document in dependency order, an interactive citation graph, or a static image of it. |
 
 Every command works inside a **workspace**, the directory `proofs init`
 marks with a `.proofs` file. A bare `NAME` always means `conjectures/NAME`
@@ -493,17 +505,24 @@ picks what it writes:
   file that opens offline. Lemmas sit in rows by the longest citation chain
   beneath them — so everything a lemma cites is below it and everything
   citing it above — coloured by user, sized by how often they are cited,
-  hollow when suspended. Hovering a lemma highlights its edges and shows its
+  hollow when suspended. A lemma that settles the conjecture (the same test
+  `proofs status` makes) is ringed twice, always labelled "proves the
+  conjecture" or "disproves the conjecture", and badged in its side panel.
+  Hovering a lemma highlights its edges and shows its
   statement; clicking pins it in a side panel with its proof, what it cites
   and what cites it, and can highlight its full chain. Wheel or pinch to
-  zoom, drag to pan, search by id. Light and dark themes follow the
-  viewer's setting, with a toggle. KaTeX renders the math: it is vendored,
+  zoom, drag to pan, search by id. A Light / Dark / Theme switch picks the
+  colours: neutral light, neutral dark, or Theme — the documentation site's
+  palette (slate, cerulean and rose), dark or light by the viewer's OS
+  setting the way the site is. The page opens in `--theme light`, `dark` or
+  `proofs` (Theme, the default) and remembers the viewer's pick. KaTeX renders the math: it is vendored,
   unmodified, in `proofs/export/vendor/katex` (script and stylesheet MIT,
   fonts SIL OFL 1.1) and inlined into the file, with both licences in a
   comment at the top of the page.
 - `png` (`.png`): the same picture as a static image, sized to the graph
-  up to 3840×2160 and scaled down to fit past that, light unless
-  `--theme dark`. It needs matplotlib — in the Nix environment, `pip
+  up to 3840×2160 and scaled down to fit past that, light unless `--theme`
+  names `dark`, `proofs` (the docs' palette, dark variant) or
+  `proofs-light`. It needs matplotlib — in the Nix environment, `pip
   install '.[png]'` otherwise.
 
 Every run acts as a **user**, named by a `user.id` that names its streams,
@@ -536,7 +555,7 @@ proofs init
 # --host and --model name the model every run, parse, verify and repair
 # talks to, unless .proofs-local.json routes one (see Model routing)
 proofs run algebra_example --host http://localhost:8081/v1 --model qwen3.8-27b
-proofs run algebra_example --host http://localhost:8081/v1 --model qwen3.8-27b --mode human
+proofs run algebra_example --host http://localhost:8081/v1 --model qwen3.8-27b --mode manual
 proofs run algebra_example --host http://localhost:8081/v1 --model qwen3.8-27b --parallel 2
 proofs run conjectures/algebra_example --host http://localhost:8081/v1 --model qwen3.8-27b
 
@@ -617,10 +636,10 @@ server options.
 | `--unsandboxed-code` | off | Run code without the sandbox (where bubblewrap is unavailable). Scripts then run with your permissions, network and files. |
 | `--fresh` | off | Start a new run, with an empty checkpoint, instead of continuing your most recent one. The DAG is kept. See [Cancelling a run](#cancelling-a-run-ctrl-c-and-resuming). |
 | `--resume RUN_ID` | off | Continue the given run from its checkpoint. |
-| `--parallel [N]` | off | Run N workers in parallel around one shared DAG; each plans, generates candidate lemmas or proves, as the run needs, so the run never makes more than N model calls at once. Bare `--parallel` is N=1. `--mode human`, when set, takes the place of one of the workers (loop-0). See [Parallel mode](#parallel-mode). |
+| `--parallel [N]` | off | Run N workers in parallel around one shared DAG; each plans, generates candidate lemmas or proves, as the run needs, so the run never makes more than N model calls at once. Bare `--parallel` is N=1. `--mode manual`, when set, takes the place of one of the workers (loop-0). See [Parallel mode](#parallel-mode). |
 | `--ctx-budget N` | 65536 | The most one call may take, prompt plus generation, in tokens: each loop's share of the server (a parallel run holds up to N × this), and how long a model may think before its trace is compacted. Never sent to the server; each call's `max_tokens` is sized from it. The server's own window (llama.cpp's `-c` per slot, vLLM's `--max-model-len`, SGLang's `--context-length`), where the probe reads it, caps it. Where nothing is read, budgeting above the server's window is caught at once from the server's 400, which names its real limit and the `--ctx-budget` to re-run with. A model in `llm.models` takes a `ctx_budget` field instead (it was `num_ctx`). |
-| `--mode {auto,human}` | `auto` | Automated selection vs. human menu at the planning step. |
-| `--hotkey KEY` | `h` | Keystroke that toggles auto/human mid-run (pass `''` to disable). |
+| `--mode {auto,manual}` | `auto` | Automated selection vs. manual menu at the planning step. |
+| `--hotkey KEY` | `h` | Keystroke that toggles auto/manual mid-run (pass `''` to disable). |
 | `--verbose / --no-verbose` | on | Console logging. |
 | `--ui {auto,live,plain}` | `auto` | `live` keeps a compact [status board](#the-status-board) at the bottom of the terminal: the last few log lines and a row per agent; `plain` prints every log line instead, with no board; `--no-verbose` prints neither. `auto` is live on a terminal (with `--verbose` and `rich` installed), plain otherwise. |
 
@@ -878,7 +897,7 @@ killed by the kernel instead of the machine running out.
 
 ### Modes and the hotkey
 
-`--mode auto` runs unattended. `--mode human` puts you in the driver's seat
+`--mode auto` runs unattended. `--mode manual` puts you in the driver's seat
 at the planning step. You can cross between them mid-run, in either
 direction, without restarting:
 
@@ -1197,7 +1216,7 @@ Every worker reads and writes the same DAG.
 
 ```sh
 proofs run conjectures/algebra_example --parallel 2
-proofs run conjectures/algebra_example --parallel 3 --mode human
+proofs run conjectures/algebra_example --parallel 3 --mode manual
 ```
 
 A bare `--parallel` is N=1: one worker that plans, generates and proves in
@@ -1297,9 +1316,9 @@ attempts go to one shared reject list that the planner and the generator
 both read, so a route one loop found dead is dead for the whole
 run.
 
-### Human mode and the hotkey
+### Manual mode and the hotkey
 
-`--mode human` takes the place of **loop-0**: the operator sits at loop-0's
+`--mode manual` takes the place of **loop-0**: the operator sits at loop-0's
 menu while loops 1..N-1 run unattended. The menu shows the shared buffer —
 each lemma marked with the loop that has claimed it — and everything the
 serial menu can do works the same: prove a lemma yourself (the verifiers
@@ -1308,7 +1327,7 @@ pipeline, write your own, or reject the buffer and send the planner back
 (the menu returns once the new plan is in; a plan another worker was
 writing at that moment is dropped for yours, which carries your notes). Loop-0 still takes plan and
 generate tasks like any other worker, between its lemmas. The hotkey and the
-menu's `a` still hand loop-0 between human and automatic mid-run; the other
+menu's `a` still hand loop-0 between manual and automatic mid-run; the other
 loops are always automatic. Quitting from
 the menu stops the whole run, not just
 loop-0 — the other loops' in-flight lemmas go into the checkpoint and resume
@@ -1384,8 +1403,8 @@ proofs/
     verifiers.py       # one verification step
     serial.py          # the serial run
     parallel.py        # the parallel run: buffer, scheduler, N workers
-    human.py           # human mode: the menu, the operator's own proof
-    mode.py            # the auto/human toggle
+    manual.py          # manual mode: the menu, the operator's own proof
+    mode.py            # the auto/manual toggle
     verify.py, repair.py  # proofs verify, proofs repair
   validity/            # the rules of verification: plain data in, decisions out
     steps.py           # what verification consists of
@@ -1425,7 +1444,7 @@ proofs/
     plain.py           # line-by-line output
     live.py            # the live terminal block (rich): the status board under the log
     status.py          # the status board: what each agent is doing
-    input.py           # terminal input: the hotkey, the human menu's readers
+    input.py           # terminal input: the hotkey, the manual menu's readers
 pyproject.toml             # the package and the `proofs` console script
 flake.nix                  # Nix dev shell, package and app (`nix run .`)
 ```
@@ -1466,7 +1485,7 @@ directory, and is created if it is not there):
 - it writes `DIR/.proofs`, which records the layout version, `format = 2`;
 - it writes `DIR/.proofs-local.json`, this machine's [code limits](#limits)
   and [run settings](#settings), set to the built-in defaults for you to
-  edit, and empty [model routes](#model-routing);
+  edit, and the [model routes](#model-routing) as blank fields to fill in;
 - it writes the proofs block of `DIR/.gitignore`: the rules that keep each
   user's local files — `references/`, `comments.md`, checkpoints, lock and
   temp files, `.env` — out of git. The block sits between
@@ -1585,7 +1604,7 @@ agents than fit, the ones longest at what they are doing are shown first,
 and the rest are counted by role on a last line (`+58 more: 41 prover,
 12 verifier, 5 waiting`). Nothing is streamed from the model, so the time
 column is what moves during a long call. The block steps aside while the
-human menu, a pasted proof or a y/N is on screen. When the run ends the
+manual menu, a pasted proof or a y/N is on screen. When the run ends the
 block is cleared and the log lines it last showed are printed. `--ui plain`
 turns it off; it is off anyway when the output is not a terminal, and when
 `rich` is not installed (`nix develop` provides it).

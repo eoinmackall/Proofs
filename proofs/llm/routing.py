@@ -31,7 +31,14 @@ from a file: a gitignored file is still one `git add -f`, backup or
 tarball away from being shared, so a file that holds one is refused.
 
 A route maps a role, or a glob over the roles (verifier_*), to a model's
-name. "default" serves every role nothing else routes. Two stages can be
+name. "default" serves every role nothing else routes.
+
+A blank value ("" or null) is unset: a blank field of a model entry is
+left out, a model entry with nothing but its backend filled in defines no
+model (and routing a role to it is an error), and a blank route routes
+nothing. proofs init writes the file that way, every route and two model
+entries present but blank (settings.ROUTING_TEMPLATE), so the file works
+as it stands and is filled in rather than written from scratch. Two stages can be
 routed apart from their role: "extract", the schema extraction that copies
 a role's prose into JSON, and "compact", the summarising pass of a call
 that hit the context wall; unrouted, each goes to its role's model.
@@ -67,7 +74,10 @@ retry behaviour it has without the flag.
 
 Some roles must share a model (Models.build's same_model groups): the
 loops pass every verifier, since a certificate records one model for the
-whole check.
+whole check. A group's members follow each other: when the members some
+layer routes agree, the rest take their model rather than the default, so
+"verifier_*" also routes coding_verifier, and one route sets every
+verifier. Members routed to different models are refused.
 
 Nothing here knows the loops: the roles are passed in, and the state the
 loops learn about a model as they go (whether it takes native tool calls,
@@ -123,6 +133,18 @@ _ENV_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _GLOB_CHARS = frozenset("*?[")
 
 
+def _blank(value: Any) -> bool:
+    """A value left unfilled: null, or a string of nothing but spaces."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def unfilled(raw: Any) -> bool:
+    """An llm.models entry nothing but its backend has been filled in for,
+    like the ones proofs init writes: it defines no model."""
+    return isinstance(raw, dict) and all(
+        _blank(v) for k, v in raw.items() if k != "backend")
+
+
 class RoutingError(ValueError):
     """The routing config is unusable: a malformed entry, a route to a
     model that is not defined, a role no route reaches."""
@@ -163,9 +185,11 @@ class ModelSpec:
         return None
 
 
-def parse_model(name: str, raw: Any, source: str) -> ModelSpec:
-    """The ModelSpec a file's llm.models entry describes; RoutingError for
-    anything malformed."""
+def check_entry(name: str, raw: Any, source: str) -> Dict[str, Any]:
+    """The structural checks every llm.models entry gets, blank or not: its
+    name, its shape, its field names and its backend. Returns raw without
+    its blank fields ("" or null, as proofs init writes them: unset);
+    RoutingError for anything malformed."""
     where = f"{source}: llm.models.{name}"
     if not isinstance(name, str) or not _NAME_RE.match(name):
         raise RoutingError(
@@ -190,12 +214,22 @@ def parse_model(name: str, raw: Any, source: str) -> ModelSpec:
             f"{where}: unknown field(s) {', '.join(unknown)}; the fields are "
             f"{' '.join(_FIELDS)}"
         )
+    raw = {k: v for k, v in raw.items() if not _blank(v)}
     backend = raw.get("backend", "auto")
     if backend not in BACKENDS:
         raise RoutingError(
             f"{where}: backend must be one of {', '.join(BACKENDS)}, "
             f"not {backend!r}"
         )
+    return raw
+
+
+def parse_model(name: str, raw: Any, source: str) -> ModelSpec:
+    """The ModelSpec a file's llm.models entry describes; RoutingError for
+    anything malformed."""
+    where = f"{source}: llm.models.{name}"
+    raw = check_entry(name, raw, source)
+    backend = raw.get("backend", "auto")
     host = raw.get("host", DEFAULT_HOSTS.get(backend))
     for required, value in (("host", host), ("model", raw.get("model"))):
         if not isinstance(value, str) or not value.strip():
@@ -462,12 +496,21 @@ class Models:
         resolve to one model, why saying what depends on that. Offline:
         nothing is connected. RoutingError for anything unusable."""
         specs: Dict[str, ModelSpec] = {}
+        blank_models: Dict[str, str] = {}   # name -> source, entries left blank
         for source, layer in model_layers:
             if not isinstance(layer, dict):
                 raise RoutingError(
                     f"{source}: llm.models must be an object mapping a name "
                     f"to a model")
             for name, raw in layer.items():
+                if unfilled(raw):
+                    # A template entry no one has filled in: it defines no
+                    # model, and never replaces a lower layer's entry. It is
+                    # still checked, so a misspelt field or backend is not
+                    # mistaken for a placeholder.
+                    check_entry(name, raw, source)
+                    blank_models.setdefault(name, source)
+                    continue
                 specs[name] = parse_model(name, raw, source)
         flag_spec = flags.spec()
         layers = list(route_layers)
@@ -490,21 +533,29 @@ class Models:
             exact: Dict[str, str] = {}
             globbed: Dict[str, Tuple[str, str]] = {}   # role -> (glob, name)
             for key, target in layer.items():
-                if not isinstance(target, str) or not target:
+                # A blank route ("" or null, as proofs init writes every
+                # one) routes nothing; its key must still be a route.
+                blank = _blank(target)
+                if not blank and not isinstance(target, str):
                     raise RoutingError(
                         f"{source}: llm.routes.{key} must name a model")
                 if key == DEFAULT_ROUTE:
-                    default = (target, source)
+                    if not blank:
+                        default = (target, source)
                 elif key == FALLBACK_ROUTE:
-                    fallback = (target, source)
+                    if not blank:
+                        fallback = (target, source)
                 elif key in roles or key in STAGES:
-                    exact[key] = target
+                    if not blank:
+                        exact[key] = target
                 elif _GLOB_CHARS & set(key):
                     matched = [r for r in roles if fnmatch.fnmatchcase(r, key)]
                     if not matched:
                         raise RoutingError(
                             f"{source}: route {key!r} matches no role; the "
                             f"roles are {', '.join(roles)}")
+                    if blank:
+                        continue
                     for r in matched:
                         if r in globbed and globbed[r][1] != target:
                             raise RoutingError(
@@ -523,6 +574,19 @@ class Models:
                 exact.setdefault(r, target)
             for key, target in exact.items():
                 routes[key] = (target, source)
+
+        # A role that must share a model with others follows them: when the
+        # routed members of a same_model group agree, the group's unrouted
+        # members take that model instead of the default. So "verifier_*"
+        # (or "verifier_1" alone) routes coding_verifier too, and one route
+        # sets the whole group. Members routed apart are refused below.
+        for group, _why in same_model:
+            routed = [routes[r] for r in group if r in routes]
+            if routed and len({target for target, _s in routed}) == 1:
+                target, source = routed[0]
+                for r in group:
+                    if r in roles and r not in routes:
+                        routes[r] = (target, source)
 
         unrouted = [r for r in roles if r not in routes]
         if unrouted and default is None:
@@ -546,6 +610,11 @@ class Models:
                     "one with llm.routes.fallback (or --route "
                     "fallback=NAME), or a default")
         for target, source in checked:
+            if target not in specs and target in blank_models:
+                raise RoutingError(
+                    f"{source}: route to {target!r}, but llm.models.{target} "
+                    f"({blank_models[target]}) is still blank: fill in its "
+                    f"model, and its host unless its backend is anthropic")
             if target not in specs:
                 defined = ", ".join(n for n in specs if n != FLAG_MODEL)
                 raise RoutingError(
